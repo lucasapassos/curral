@@ -16,7 +16,8 @@
       ],
       "limits": {
         "timeout": "30s",
-        "max_rows": 10000
+        "max_rows": 10000,
+        "max_concurrency": 2
       }
     },
     "etl": {

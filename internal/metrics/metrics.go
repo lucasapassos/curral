@@ -33,6 +33,7 @@ type Metrics struct {
 	reloads   *prometheus.CounterVec
 	lockouts  *prometheus.CounterVec
 	blocked   *prometheus.CounterVec
+	throttled prometheus.Counter
 	policy    *policyCollector
 }
 
@@ -86,11 +87,14 @@ func New(src Sources) *Metrics {
 		blocked: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "curral_auth_blocked_total", Help: "Requests refused (429) because their client or user is locked out, by scope.",
 		}, []string{"scope"}),
+		throttled: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "curral_queries_throttled_total", Help: "Queries refused (429) because the user or group was at its max_concurrency.",
+		}),
 		reloads: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "curral_config_reloads_total", Help: "Users/policy reloads (SIGHUP) by result (ok, error).",
 		}, []string{"result"}),
 	}
-	reg.MustRegister(m.requests, m.decisions, m.stage, m.rows, m.bytes, m.authFail, m.reloads, m.lockouts, m.blocked,
+	reg.MustRegister(m.requests, m.decisions, m.stage, m.rows, m.bytes, m.authFail, m.reloads, m.lockouts, m.blocked, m.throttled,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	if src.Load != nil {
@@ -209,6 +213,12 @@ func (m *Metrics) ObserveQuery(q Query) {
 func (m *Metrics) Reload(result string) {
 	if m != nil {
 		m.reloads.WithLabelValues(result).Inc()
+	}
+}
+
+func (m *Metrics) Throttled() {
+	if m != nil {
+		m.throttled.Inc()
 	}
 }
 

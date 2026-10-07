@@ -104,9 +104,10 @@ func TestLimits(t *testing.T) {
 		return f
 	}
 	for body, want := range map[string]Limits{
-		`limits := {"timeout": 1.5}`:                 {Timeout: 1500 * time.Millisecond},
-		`limits := {"max_rows": 7}`:                  {MaxRows: 7},
-		`limits := {"timeout": "2m", "max_rows": 1}`: {Timeout: 2 * time.Minute, MaxRows: 1},
+		`limits := {"timeout": 1.5}`:                                            {Timeout: 1500 * time.Millisecond},
+		`limits := {"max_rows": 7}`:                                             {MaxRows: 7},
+		`limits := {"timeout": "2m", "max_rows": 1}`:                            {Timeout: 2 * time.Minute, MaxRows: 1},
+		`limits := {"max_concurrency": 2, "concurrency_group": "role:analyst"}`: {MaxConcurrency: 2, ConcurrencyGroup: "role:analyst"},
 	} {
 		p, err := Load(ctx, "data.curral.allow", []string{write(body)}, "data.curral.limits")
 		if err != nil {
@@ -116,7 +117,8 @@ func TestLimits(t *testing.T) {
 			t.Errorf("%s: %+v %v", body, l, err)
 		}
 	}
-	for _, body := range []string{`limits := "x"`, `limits := {"timeout": "soon"}`, `limits := {"rows": 1}`, `limits := {"max_rows": -1}`} {
+	for _, body := range []string{`limits := "x"`, `limits := {"timeout": "soon"}`, `limits := {"rows": 1}`, `limits := {"max_rows": -1}`,
+		`limits := {"max_concurrency": -1}`, `limits := {"concurrency_group": ""}`, `limits := {"max_concurrency": "2"}`} {
 		p, _ := Load(ctx, "data.curral.allow", []string{write(body)}, "data.curral.limits")
 		if _, err := p.Limits(ctx, map[string]any{}); err == nil {
 			t.Errorf("%s: expected error", body)

@@ -49,9 +49,14 @@ type Server struct {
 	// TrustedProxies may set X-Forwarded-For; only then is it used to find
 	// the client address (for limits and audit).
 	TrustedProxies []netip.Prefix
-	Audit          *audit.Writer // nil disables auditing
-	AuditSQL       string        // redacted (default), full or hash
-	Version        string
+
+	// MaxConcurrencyPerUser applies when the policy sets no max_concurrency
+	// (0 = no per-user limit).
+	MaxConcurrencyPerUser int64
+	groups                groupSlots
+	Audit                 *audit.Writer // nil disables auditing
+	AuditSQL              string        // redacted (default), full or hash
+	Version               string
 
 	// Swapped atomically on reload; in-flight requests keep the version
 	// they started with.
@@ -85,6 +90,9 @@ func (s *Server) Reload(a *auth.Authenticator, p *policy.Policy, err error) {
 		s.Audit.Record(ev)
 	}
 }
+
+// errConcurrency means the caller already runs its share of queries.
+var errConcurrency = errors.New("too many concurrent queries for this user")
 
 // errAudit means the query was refused because it could not be audited.
 var errAudit = errors.New("audit log unavailable: query refused")
@@ -410,6 +418,8 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		auditE       error
 		reservation  *audit.Reservation
 		limits       policy.Limits
+		throttled    bool
+		heldGroup    string
 		execTimeout  time.Duration
 		timing       engine.Timing
 	)
@@ -448,6 +458,21 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 			return engine.ErrForbidden
 		}
 		allowed = true
+		// Fair share: a caller over its concurrency is refused right away.
+		if max := limits.MaxConcurrency; max > 0 || s.MaxConcurrencyPerUser > 0 {
+			if max == 0 {
+				max = s.MaxConcurrencyPerUser
+			}
+			group := limits.ConcurrencyGroup
+			if group == "" {
+				group = "user:" + p.Name
+			}
+			if !s.groups.tryAcquire(group, max) {
+				throttled = true
+				return fmt.Errorf("%w (limit %d for %s)", errConcurrency, max, group)
+			}
+			heldGroup = group
+		}
 		// Fail closed: nothing executes without room to record it.
 		if s.Audit != nil {
 			if reservation, auditE = s.Audit.Reserve(time.Second); auditE != nil {
@@ -457,6 +482,11 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		}
 		return nil
 	}
+	defer func() {
+		if heldGroup != "" {
+			s.groups.release(heldGroup)
+		}
+	}()
 	emit := func(cols []engine.Column, rs engine.Rows) error {
 		started = true
 		h := w.Header()
@@ -520,7 +550,7 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		if policyE != nil {
 			msg = "policy evaluation failed"
 		}
-		if status == http.StatusServiceUnavailable {
+		if status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests {
 			w.Header().Set("Retry-After", "1")
 		}
 		writeError(w, status, msg)
@@ -537,6 +567,10 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 	s.Log.Info("query", attrs...)
 
 	decision, decidedBy := decisionOf(err, allowed, policyCalled, policyE, auditE)
+	if throttled {
+		decision, decidedBy = "error", "concurrency"
+		s.Metrics.Throttled()
+	}
 	policyResult := ""
 	switch {
 	case allowed:
@@ -650,6 +684,12 @@ func limitsJSON(l policy.Limits) map[string]any {
 	if l.MaxRows > 0 {
 		m["max_rows"] = l.MaxRows
 	}
+	if l.MaxConcurrency > 0 {
+		m["max_concurrency"] = l.MaxConcurrency
+	}
+	if l.ConcurrencyGroup != "" {
+		m["concurrency_group"] = l.ConcurrencyGroup
+	}
 	return m
 }
 
@@ -699,6 +739,8 @@ func statusOf(err, policyErr error) int {
 		return http.StatusInternalServerError
 	case errors.Is(err, engine.ErrForbidden):
 		return http.StatusForbidden
+	case errors.Is(err, errConcurrency):
+		return http.StatusTooManyRequests
 	case errors.Is(err, engine.ErrBusy), errors.Is(err, errAudit):
 		return http.StatusServiceUnavailable
 	case errors.Is(err, context.DeadlineExceeded):

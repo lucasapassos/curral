@@ -67,6 +67,7 @@ vírgula: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--policy-limits-query` | (desligado) | regra opcional com limites por request, ex.: `data.curral.limits` |
 | `--max-concurrency` | 8 | queries executando ao mesmo tempo |
 | `--queue-timeout` | 5s | espera por um slot livre; depois disso responde 503 |
+| `--max-concurrency-per-user` | 0 (sem limite) | queries simultâneas por usuário quando a política não define `max_concurrency` |
 | `--query-timeout` | 60s | duração máxima; depois disso responde 504 |
 | `--max-rows` | 0 | limite de linhas por resposta (0 = sem limite) |
 | `--threads`, `--memory-limit`, `--temp-dir`, `--max-temp-size` | | recursos do DuckDB |
@@ -377,7 +378,7 @@ limits := {"timeout": "30s", "max_rows": 10000} if "analyst" in input.roles
 - **Sem limites:** resultado indefinido significa nenhum limite.
 - **Fail-closed:** se a regra falhar (formato inválido, conflito de valores), o request é negado com 500.
 - **Onde aparecem:** na resposta do dry-run e no evento de auditoria (`limits`).
-- **Exemplo pronto:** `examples/policy.rego` lê os limites de `data.roles[role].limits`. No exemplo, o analyst tem 30 s e 10 mil linhas.
+- **Exemplo pronto:** `examples/policy.rego` lê os limites de `data.roles[role].limits`. No exemplo, o analyst tem 30 s, 10 mil linhas e 2 queries simultâneas.
 
 ## Desempenho
 
@@ -400,6 +401,37 @@ serialização), numa máquina de 6 cores:
 - **Queries pequenas:** a latência é dominada pelo custo fixo do DuckDB. Cerca
   de 0,25 ms vêm de garantias que foram mantidas de propósito: conexão nova por
   request (isolamento entre usuários) e a inspeção que alimenta a política.
+
+## Justiça entre usuários
+
+`--max-concurrency` é o total de queries simultâneas da instância. Para um
+usuário não ocupar todos os slots, há duas formas de definir uma cota por
+usuário:
+- **Na política**, com `max_concurrency` na regra de limites.
+- **Como padrão**, com `--max-concurrency-per-user`, que vale quando a política
+  não define nada.
+
+```rego
+limits := {"max_concurrency": 2} if "analyst" in input.roles                   # por usuário
+limits := {"max_concurrency": 4, "concurrency_group": "role:etl"} if "etl" in input.roles  # cota da role
+```
+
+- **Por padrão a cota é individual.** Com `concurrency_group`, todos os
+  usuários do grupo dividem a mesma cota.
+- **Quem passa da cota recebe 429 na hora** (`Retry-After: 1`), em vez de
+  esperar na fila. Esperar ocuparia um slot global e uma transação, que é
+  justamente o que se quer evitar.
+- **Rastreio:** a recusa vai para a auditoria (`decided_by: concurrency`) e
+  conta em `curral_queries_throttled_total`.
+- **Dry-run:** mostra a cota, mas não a consome.
+
+Medição com `--max-concurrency 4`, um usuário disparando 12 queries pesadas e
+outro fazendo uma query simples:
+
+| | usuário comum | usuário abusivo |
+|---|---|---|
+| sem cota | esperou 5 s e recebeu **503** | 8 executaram, 4 receberam 503 |
+| `--max-concurrency-per-user 2` | **200 em 2 ms** | 2 executaram, 10 receberam 429 |
 
 ## Política (input)
 

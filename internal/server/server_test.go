@@ -731,3 +731,96 @@ func TestBruteForceLockout(t *testing.T) {
 		t.Fatalf("audit: blocked=%q lastIP=%q", blocked, lastIP)
 	}
 }
+
+func TestConcurrencyPerUser(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	ts, aw := newServerWithAudit(t, path)
+	s := lastServer
+	setPolicy := func(rego string) {
+		f := filepath.Join(t.TempDir(), "p.rego")
+		os.WriteFile(f, []byte("package curral\nimport rego.v1\nallow := true\n"+rego), 0o600)
+		pol, err := policy.Load(context.Background(), "data.curral.allow", []string{f}, "data.curral.limits")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetPolicy(pol)
+	}
+	// hold runs a long query as user until the returned stop is called.
+	hold := func(user string) (stop func()) {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			req, _ := http.NewRequestWithContext(ctx, "POST", ts.URL+"/v1/query",
+				strings.NewReader(`{"sql":"SELECT count(*) FROM range(100000000000)"}`))
+			req.SetBasicAuth(user, user+"-pw")
+			if resp, err := http.DefaultClient.Do(req); err == nil {
+				resp.Body.Close()
+			}
+		}()
+		deadline := time.Now().Add(5 * time.Second)
+		for s.groups.running() == 0 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if s.groups.running() == 0 {
+			t.Fatal("long query never started")
+		}
+		return func() {
+			cancel()
+			<-done
+			for s.groups.running() != 0 {
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+	}
+	q := `{"sql":"SELECT 1"}`
+
+	// Per user, from the policy.
+	setPolicy(`limits := {"max_concurrency": 1} if "analyst" in input.roles`)
+	stop := hold("analyst")
+	r := do(t, ts, "analyst", q)
+	if r.status != 429 || r.header.Get("Retry-After") == "" || !strings.Contains(r.body, "limit 1 for user:analyst") {
+		t.Fatalf("over limit: %d %v %s", r.status, r.header, r.body)
+	}
+	if r := do(t, ts, "admin", q); r.status != 200 {
+		t.Fatalf("other user blocked: %d", r.status)
+	}
+	if r := do(t, ts, "analyst", `{"sql":"SELECT 1","dry_run":true}`); r.status != 200 || !strings.Contains(r.body, `"max_concurrency":1`) {
+		t.Fatalf("dry run: %d %s", r.status, r.body)
+	}
+	stop()
+	if r := do(t, ts, "analyst", q); r.status != 200 {
+		t.Fatalf("slot not released: %d", r.status)
+	}
+
+	// A shared group across roles.
+	setPolicy(`limits := {"max_concurrency": 1, "concurrency_group": "batch"} if not "admin" in input.roles`)
+	stop = hold("analyst")
+	if r := do(t, ts, "etl", q); r.status != 429 {
+		t.Fatalf("shared group: %d", r.status)
+	}
+	stop()
+
+	// Default per-user limit when the policy sets none.
+	setPolicy("")
+	s.MaxConcurrencyPerUser = 1
+	stop = hold("etl")
+	if r := do(t, ts, "etl", q); r.status != 429 {
+		t.Fatalf("default per-user limit: %d", r.status)
+	}
+	if r := do(t, ts, "analyst", q); r.status != 200 {
+		t.Fatalf("default limit leaked across users: %d", r.status)
+	}
+	stop()
+
+	aw.Close()
+	var throttled int
+	for _, ev := range readAudit(t, path) {
+		if ev.DecidedBy == "concurrency" && ev.Status == 429 {
+			throttled++
+		}
+	}
+	if throttled != 3 {
+		t.Fatalf("throttled audit events = %d", throttled)
+	}
+}

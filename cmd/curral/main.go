@@ -101,6 +101,7 @@ type serveFlags struct {
 	policyQuery    string
 	limitsQuery    string
 	maxConcurrency int
+	perUserConc    int64
 	queueTimeout   time.Duration
 	queryTimeout   time.Duration
 	maxRows        int64
@@ -145,6 +146,7 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.StringVar(&f.policyQuery, "policy-query", "data.curral.allow", "Rego decision that must evaluate to true")
 	fs.StringVar(&f.limitsQuery, "policy-limits-query", "", "optional Rego rule with per-request limits {timeout, max_rows}, e.g. data.curral.limits")
 	fs.IntVar(&f.maxConcurrency, "max-concurrency", 8, "queries executing at the same time")
+	fs.Int64Var(&f.perUserConc, "max-concurrency-per-user", 0, "queries one user may run at once when the policy sets no max_concurrency (0 = no limit)")
 	fs.DurationVar(&f.queueTimeout, "queue-timeout", 5*time.Second, "how long a query waits for a free slot before 503")
 	fs.DurationVar(&f.queryTimeout, "query-timeout", 60*time.Second, "maximum query duration (0 = none)")
 	fs.Int64Var(&f.maxRows, "max-rows", 0, "maximum rows returned per query (0 = unlimited)")
@@ -426,6 +428,7 @@ func runServe(args []string, checkOnly bool) error {
 		return err
 	}
 	srv.TrustedProxies = proxies
+	srv.MaxConcurrencyPerUser = f.perUserConc
 	limiterCfg := func(n int) auth.LimiterConfig {
 		return auth.LimiterConfig{MaxFailures: n, Window: f.failWindow, Lockout: f.lockout}
 	}

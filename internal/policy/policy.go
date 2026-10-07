@@ -60,6 +60,10 @@ func Load(ctx context.Context, query string, files []string, limitsQuery ...stri
 type Limits struct {
 	Timeout time.Duration `json:"timeout,omitempty"`
 	MaxRows int64         `json:"max_rows,omitempty"`
+	// MaxConcurrency caps simultaneous queries of ConcurrencyGroup (by
+	// default the user). Requests over it are refused, not queued.
+	MaxConcurrency   int64  `json:"max_concurrency,omitempty"`
+	ConcurrencyGroup string `json:"concurrency_group,omitempty"`
 }
 
 // Limits evaluates the limits query, if configured. An undefined result means
@@ -110,11 +114,25 @@ func (p *Policy) Limits(ctx context.Context, input map[string]any) (Limits, erro
 			if l.MaxRows, err = n.Int64(); err != nil {
 				return l, fmt.Errorf("limits.max_rows: %w", err)
 			}
+		case "max_concurrency":
+			n, ok := val.(json.Number)
+			if !ok {
+				return l, fmt.Errorf("limits.max_concurrency: unsupported %T", val)
+			}
+			if l.MaxConcurrency, err = n.Int64(); err != nil {
+				return l, fmt.Errorf("limits.max_concurrency: %w", err)
+			}
+		case "concurrency_group":
+			g, ok := val.(string)
+			if !ok || g == "" {
+				return l, fmt.Errorf("limits.concurrency_group must be a non-empty string")
+			}
+			l.ConcurrencyGroup = g
 		default:
 			return l, fmt.Errorf("limits: unknown key %q", k)
 		}
 	}
-	if l.Timeout < 0 || l.MaxRows < 0 {
+	if l.Timeout < 0 || l.MaxRows < 0 || l.MaxConcurrency < 0 {
 		return l, fmt.Errorf("limits must not be negative")
 	}
 	return l, nil

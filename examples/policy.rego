@@ -72,6 +72,10 @@ denied_table if {
 # Optional per-request limits, enabled with --policy-limits-query data.curral.limits.
 # Evaluated only after allow; an undefined result means no limits. The global
 # --query-timeout and --max-rows still cap everything.
+#   timeout, max_rows: this request
+#   max_concurrency:   queries this user may run at once (over it: 429);
+#                      add "concurrency_group": "role:analyst" to share one
+#                      quota among every analyst instead
 limits := data.roles[role].limits if {
 	not "admin" in input.roles
 	count(input.roles) == 1
