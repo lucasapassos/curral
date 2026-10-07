@@ -2,9 +2,9 @@
 package encode
 
 import (
+	"bufio"
 	"database/sql/driver"
 	"encoding/base64"
-	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,8 +14,11 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
+	"unsafe"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
 
@@ -28,6 +31,7 @@ const (
 	CSV    Format = "csv"
 	JSON   Format = "json"
 	NDJSON Format = "ndjson"
+	Arrow  Format = "arrow" // Arrow IPC stream; written by the engine, not here
 )
 
 // ParseFormat accepts a format name or a media type.
@@ -39,6 +43,8 @@ func ParseFormat(s string) (Format, bool) {
 		return JSON, true
 	case "ndjson", "jsonl", "application/x-ndjson", "application/jsonl":
 		return NDJSON, true
+	case "arrow", "application/vnd.apache.arrow.stream":
+		return Arrow, true
 	}
 	return "", false
 }
@@ -49,6 +55,8 @@ func (f Format) ContentType() string {
 		return "text/csv; charset=utf-8"
 	case NDJSON:
 		return "application/x-ndjson"
+	case Arrow:
+		return "application/vnd.apache.arrow.stream"
 	}
 	return "application/json"
 }
@@ -61,7 +69,7 @@ type Options struct {
 }
 
 // ErrMaxRows is returned (after writing MaxRows rows) when more rows exist.
-var ErrMaxRows = errors.New("row limit reached")
+var ErrMaxRows = engine.ErrMaxRows
 
 // Write streams rows to w and returns how many rows were written. If reading
 // rows fails midway, the error is returned after the output is closed off in
@@ -78,14 +86,21 @@ func Write(w io.Writer, f Format, cols []engine.Column, rows engine.Rows, opts O
 	lastFlush := time.Now()
 	var n int64
 
+	// Rows are small writes; batch them before they reach the response.
+	bw := writerPool.Get().(*bufio.Writer)
+	bw.Reset(w)
+	defer func() {
+		bw.Reset(nil)
+		writerPool.Put(bw)
+	}()
 	var enc rowEncoder
 	switch f {
 	case CSV:
-		enc = newCSV(w, cols, fmts)
+		enc = newCSV(bw, cols, fmts)
 	case NDJSON:
-		enc = newJSONRows(w, cols, fmts, false)
+		enc = newJSONRows(bw, cols, fmts, false)
 	default:
-		enc = newJSONRows(w, cols, fmts, true)
+		enc = newJSONRows(bw, cols, fmts, true)
 	}
 	if err := enc.begin(); err != nil {
 		return 0, err
@@ -107,8 +122,11 @@ func Write(w io.Writer, f Format, cols []engine.Column, rows engine.Rows, opts O
 			return n, err // client is gone; nothing more to say
 		}
 		n++
-		if opts.Flush != nil && time.Since(lastFlush) >= opts.FlushEvery {
+		if opts.Flush != nil && n%256 == 0 && time.Since(lastFlush) >= opts.FlushEvery {
 			if err := enc.flush(); err != nil {
+				return n, err
+			}
+			if err := bw.Flush(); err != nil {
 				return n, err
 			}
 			opts.Flush()
@@ -118,8 +136,13 @@ func Write(w io.Writer, f Format, cols []engine.Column, rows engine.Rows, opts O
 	if err := enc.end(n, rerr); err != nil {
 		return n, err
 	}
+	if err := bw.Flush(); err != nil {
+		return n, err
+	}
 	return n, rerr
 }
+
+var writerPool = sync.Pool{New: func() any { return bufio.NewWriterSize(nil, 64<<10) }}
 
 type rowEncoder interface {
 	begin() error
@@ -131,46 +154,94 @@ type rowEncoder interface {
 // ---- CSV ----
 
 type csvEncoder struct {
-	w     *csv.Writer
+	w     io.Writer
 	cols  []engine.Column
 	kinds []valueKind
-	rec   []string
-	buf   []byte
+	line  []byte
+	field []byte
 }
 
 func newCSV(w io.Writer, cols []engine.Column, kinds []valueKind) *csvEncoder {
-	return &csvEncoder{w: csv.NewWriter(w), cols: cols, kinds: kinds, rec: make([]string, len(cols))}
+	return &csvEncoder{w: w, cols: cols, kinds: kinds}
 }
 
 func (e *csvEncoder) begin() error {
+	e.line = e.line[:0]
 	for i, c := range e.cols {
-		e.rec[i] = c.Name
+		if i > 0 {
+			e.line = append(e.line, ',')
+		}
+		e.line = appendCSVField(e.line, []byte(c.Name))
 	}
-	return e.w.Write(e.rec)
+	_, err := e.w.Write(append(e.line, '\n'))
+	return err
 }
 
 func (e *csvEncoder) row(vals []driver.Value) error {
+	e.line = e.line[:0]
 	for i, v := range vals {
-		if v == nil {
-			e.rec[i] = ""
-			continue
+		if i > 0 {
+			e.line = append(e.line, ',')
 		}
-		if s, ok := v.(string); ok {
-			e.rec[i] = s
-			continue
+		switch t := v.(type) {
+		case nil:
+		case string:
+			e.line = appendCSVString(e.line, t)
+		case bool, int8, int16, int32, int64, uint8, uint16, uint32, uint64,
+			float32, float64, time.Time, *big.Int, duckdb.Decimal:
+			// Never contain separators, quotes or leading spaces.
+			e.line = appendText(e.line, v, e.kinds[i])
+		default:
+			e.field = appendText(e.field[:0], v, e.kinds[i])
+			e.line = appendCSVField(e.line, e.field)
 		}
-		e.buf = appendText(e.buf[:0], v, e.kinds[i])
-		e.rec[i] = string(e.buf)
 	}
-	return e.w.Write(e.rec)
+	e.line = append(e.line, '\n')
+	_, err := e.w.Write(e.line)
+	return err
 }
 
-func (e *csvEncoder) flush() error {
-	e.w.Flush()
-	return e.w.Error()
+func (e *csvEncoder) flush() error { return nil }
+
+func (e *csvEncoder) end(int64, error) error { return nil }
+
+// csvNeedsQuotes follows encoding/csv: quote fields containing a comma,
+// quote, CR or LF, starting with a space, or equal to \. (which some
+// readers take as end of data).
+func csvNeedsQuotes(f []byte) bool {
+	if len(f) == 0 {
+		return false
+	}
+	if len(f) == 2 && f[0] == '\\' && f[1] == '.' {
+		return true
+	}
+	for _, c := range f {
+		if c == ',' || c == '"' || c == '\r' || c == '\n' {
+			return true
+		}
+	}
+	r, _ := utf8.DecodeRune(f)
+	return unicode.IsSpace(r)
 }
 
-func (e *csvEncoder) end(int64, error) error { return e.flush() }
+func appendCSVField(b, f []byte) []byte {
+	if !csvNeedsQuotes(f) {
+		return append(b, f...)
+	}
+	b = append(b, '"')
+	for _, c := range f {
+		if c == '"' {
+			b = append(b, '"')
+		}
+		b = append(b, c)
+	}
+	return append(b, '"')
+}
+
+func appendCSVString(b []byte, s string) []byte {
+	// Avoid copying the string just to inspect it.
+	return appendCSVField(b, unsafe.Slice(unsafe.StringData(s), len(s)))
+}
 
 // ---- JSON / NDJSON ----
 
@@ -275,6 +346,22 @@ func kindOf(dbType string) valueKind {
 }
 
 func appendTime(b []byte, t time.Time, k valueKind) []byte {
+	if y := t.Year(); y < 0 || y > 9999 || k == kindTimestampTZ {
+		return appendTimeSlow(b, t, k)
+	}
+	switch k {
+	case kindDate:
+		return appendDate(b, t)
+	case kindTime:
+		return appendClock(b, t)
+	}
+	b = appendDate(b, t)
+	b = append(b, 'T')
+	return appendClock(b, t)
+}
+
+// appendTimeSlow is the reference formatting the fast paths must match.
+func appendTimeSlow(b []byte, t time.Time, k valueKind) []byte {
 	switch k {
 	case kindDate:
 		return t.AppendFormat(b, "2006-01-02")
@@ -284,6 +371,77 @@ func appendTime(b []byte, t time.Time, k valueKind) []byte {
 		return t.AppendFormat(b, time.RFC3339Nano)
 	}
 	return t.AppendFormat(b, "2006-01-02T15:04:05.999999999")
+}
+
+func appendDate(b []byte, t time.Time) []byte {
+	y, m, d := t.Date()
+	b = append(b, byte('0'+y/1000), byte('0'+y/100%10), byte('0'+y/10%10), byte('0'+y%10), '-')
+	b = append(b, byte('0'+int(m)/10), byte('0'+int(m)%10), '-')
+	return append(b, byte('0'+d/10), byte('0'+d%10))
+}
+
+// appendClock writes hh:mm:ss with the fraction trimmed of trailing zeros.
+func appendClock(b []byte, t time.Time) []byte {
+	h, mi, sec := t.Clock()
+	b = append(b, byte('0'+h/10), byte('0'+h%10), ':', byte('0'+mi/10), byte('0'+mi%10), ':',
+		byte('0'+sec/10), byte('0'+sec%10))
+	ns := t.Nanosecond()
+	if ns == 0 {
+		return b
+	}
+	var frac [9]byte
+	for i := 8; i >= 0; i-- {
+		frac[i] = byte('0' + ns%10)
+		ns /= 10
+	}
+	n := 9
+	for frac[n-1] == '0' {
+		n--
+	}
+	b = append(b, '.')
+	return append(b, frac[:n]...)
+}
+
+// appendDecimal matches duckdb.Decimal.String (trailing fractional zeros
+// trimmed) without big.Int formatting when the value fits in an int64.
+func appendDecimal(b []byte, d duckdb.Decimal) []byte {
+	if d.Value == nil || !d.Value.IsInt64() {
+		return append(b, d.String()...)
+	}
+	v := d.Value.Int64()
+	if v == 0 {
+		return append(b, '0')
+	}
+	u := uint64(v)
+	if v < 0 {
+		b = append(b, '-')
+		u = uint64(^v) + 1
+	}
+	var digits [20]byte
+	all := strconv.AppendUint(digits[:0], u, 10)
+	trimmed := all
+	for len(trimmed) > 0 && trimmed[len(trimmed)-1] == '0' {
+		trimmed = trimmed[:len(trimmed)-1]
+	}
+	scale := int(d.Scale) - (len(all) - len(trimmed))
+	switch {
+	case scale <= 0:
+		b = append(b, trimmed...)
+		for range -scale {
+			b = append(b, '0')
+		}
+	case len(trimmed) <= scale:
+		b = append(b, '0', '.')
+		for range scale - len(trimmed) {
+			b = append(b, '0')
+		}
+		b = append(b, trimmed...)
+	default:
+		b = append(b, trimmed[:len(trimmed)-scale]...)
+		b = append(b, '.')
+		b = append(b, trimmed[len(trimmed)-scale:]...)
+	}
+	return b
 }
 
 func appendUUID(b []byte, u []byte) []byte {
@@ -310,8 +468,22 @@ func appendText(b []byte, v any, k valueKind) []byte {
 		return append(b, t...)
 	case bool:
 		return strconv.AppendBool(b, t)
-	case int8, int16, int32, int64, uint8, uint16, uint32, uint64, int, uint:
-		return fmt.Append(b, t)
+	case int8:
+		return strconv.AppendInt(b, int64(t), 10)
+	case int16:
+		return strconv.AppendInt(b, int64(t), 10)
+	case int32:
+		return strconv.AppendInt(b, int64(t), 10)
+	case int64:
+		return strconv.AppendInt(b, t, 10)
+	case uint8:
+		return strconv.AppendUint(b, uint64(t), 10)
+	case uint16:
+		return strconv.AppendUint(b, uint64(t), 10)
+	case uint32:
+		return strconv.AppendUint(b, uint64(t), 10)
+	case uint64:
+		return strconv.AppendUint(b, t, 10)
 	case float32:
 		return appendNumber(b, float64(t), 32)
 	case float64:
@@ -326,7 +498,7 @@ func appendText(b []byte, v any, k valueKind) []byte {
 	case *big.Int:
 		return t.Append(b, 10)
 	case duckdb.Decimal:
-		return append(b, t.String()...)
+		return appendDecimal(b, t)
 	}
 	return appendJSON(b, v, k)
 }
@@ -378,7 +550,9 @@ func appendJSON(b []byte, v any, k valueKind) []byte {
 		b = t.Append(b, 10)
 		return append(b, '"')
 	case duckdb.Decimal:
-		return appendJSONString(b, t.String())
+		b = append(b, '"')
+		b = appendDecimal(b, t)
+		return append(b, '"')
 	case duckdb.UUID:
 		b = append(b, '"')
 		b = appendUUID(b, t[:])

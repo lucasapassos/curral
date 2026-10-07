@@ -8,6 +8,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"slices"
@@ -39,7 +40,13 @@ type Options struct {
 var (
 	ErrBusy      = errors.New("too many concurrent queries")
 	ErrForbidden = errors.New("forbidden")
+	// ErrMaxRows is returned after a result was cut at its row limit.
+	ErrMaxRows = errors.New("row limit reached")
 )
+
+// ArrowWriter writes a statement's result to w as an Arrow IPC stream,
+// stopping (with ErrMaxRows) after maxRows rows when maxRows > 0.
+type ArrowWriter func(w io.Writer, maxRows int64) (rows int64, err error)
 
 // QueryError is a problem with the submitted SQL (parse/bind/runtime).
 type QueryError struct{ Err error }
@@ -306,6 +313,9 @@ type Request struct {
 	// per-role limit from the policy). The engine's QueryTimeout still caps
 	// the whole request.
 	ExecTimeout *time.Duration
+	// EmitArrow, when set, replaces emit: the result goes out as an Arrow
+	// IPC stream written by the ArrowWriter it is handed.
+	EmitArrow func(ArrowWriter) error
 }
 
 // Timing breaks a request's time down by stage.
@@ -457,6 +467,11 @@ func (e *Engine) Query(ctx context.Context, req Request,
 
 		if req.ExecTimeout != nil && *req.ExecTimeout > 0 {
 			execCtx, cancelExec = context.WithTimeout(ctx, *req.ExecTimeout)
+		}
+		if req.EmitArrow != nil {
+			return req.EmitArrow(func(w io.Writer, maxRows int64) (int64, error) {
+				return writeArrow(execCtx, c, req.SQL, args, w, maxRows)
+			})
 		}
 		dr, err := st.QueryContext(execCtx, args)
 		if err != nil {

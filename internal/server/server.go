@@ -241,6 +241,21 @@ type dryRunResponse struct {
 	PolicySHA256  string         `json:"policy_sha256"`
 }
 
+// startOnWrite calls start before the first write.
+type startOnWrite struct {
+	w       io.Writer
+	start   func()
+	started bool
+}
+
+func (s *startOnWrite) Write(b []byte) (int, error) {
+	if !s.started {
+		s.started = true
+		s.start()
+	}
+	return s.w.Write(b)
+}
+
 type countingWriter struct {
 	w io.Writer
 	n int64
@@ -291,7 +306,7 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 	}
 	format, ok := pickFormat(req.Format, r)
 	if !ok {
-		reject(http.StatusBadRequest, "unsupported format (csv, json, ndjson)")
+		reject(http.StatusBadRequest, "unsupported format (csv, json, ndjson, arrow)")
 		return
 	}
 
@@ -377,8 +392,35 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		return err
 	}
 
+	startStream := func(contentType string) {
+		started = true
+		h := w.Header()
+		h.Set("Content-Type", contentType)
+		h.Set("X-Curral-Statement-Type", insp.StatementType)
+		h.Set("Trailer", "X-Curral-Error, X-Curral-Row-Count")
+		w.WriteHeader(http.StatusOK)
+	}
+	var emitArrow func(engine.ArrowWriter) error
+	if format == encode.Arrow {
+		emitArrow = func(write engine.ArrowWriter) error {
+			// Headers go out with the first byte, so a query that fails
+			// before producing data still gets a proper error status.
+			out := &startOnWrite{w: &bytes, start: func() { startStream(format.ContentType()) }}
+			n, err := write(out, minLimit(s.MaxRows, limits.MaxRows))
+			rows = n
+			if started {
+				w.Header().Set("X-Curral-Row-Count", fmt.Sprint(n))
+				if err != nil {
+					w.Header().Set("X-Curral-Error", oneLine(err.Error()))
+				}
+			}
+			return err
+		}
+	}
+
 	err = s.Engine.Query(r.Context(), engine.Request{
-		SQL: req.SQL, Params: params, Database: req.Database, Timing: &timing, ExecTimeout: &execTimeout,
+		EmitArrow: emitArrow,
+		SQL:       req.SQL, Params: params, Database: req.Database, Timing: &timing, ExecTimeout: &execTimeout,
 	}, authorize, emit)
 
 	if req.DryRun {

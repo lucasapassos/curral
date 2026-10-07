@@ -428,7 +428,7 @@ func runVersion() error {
 	if err := db.QueryRow("SELECT version()").Scan(&duck); err != nil {
 		return err
 	}
-	fmt.Printf("curral %s (commit %s, %s, DuckDB %s)\n", version, commit, runtime.Version(), duck)
+	fmt.Printf("curral %s (commit %s, %s, DuckDB %s, arrow %v)\n", version, commit, runtime.Version(), duck, engine.ArrowAvailable)
 	return nil
 }
 

@@ -30,7 +30,7 @@ import (
 	"curral/internal/policy"
 )
 
-func newServer(t *testing.T) *httptest.Server {
+func newServer(t testing.TB) *httptest.Server {
 	t.Helper()
 	ts, _ := newServerWithAudit(t, "")
 	return ts
@@ -38,7 +38,7 @@ func newServer(t *testing.T) *httptest.Server {
 
 // newServerWithAudit starts a server; with auditPath set it also writes
 // audit events there.
-func newServerWithAudit(t *testing.T, auditPath string) (*httptest.Server, *audit.Writer) {
+func newServerWithAudit(t testing.TB, auditPath string) (*httptest.Server, *audit.Writer) {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("CURRAL_DATA", dir)

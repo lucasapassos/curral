@@ -19,9 +19,12 @@ cliente ─HTTP─▶ curral
 Requer Go 1.25+ e um compilador C (cgo, por causa do DuckDB).
 
 ```sh
-go build -ldflags "-s -w" -o bin/curral ./cmd/curral
-go test ./...
+go build -tags duckdb_arrow -ldflags "-s -w" -o bin/curral ./cmd/curral
+go test -tags duckdb_arrow ./...
 ```
+
+A tag `duckdb_arrow` habilita a saída Arrow IPC e é usada na imagem Docker e no
+CI. Sem ela o build funciona igual, mas `format: arrow` responde 400.
 
 ## Docker
 
@@ -162,7 +165,8 @@ source .env.r2 && go test ./internal/engine -run R2 -v
 {"sql": "SELECT * FROM orders WHERE id = $1", "params": [42], "database": "sales", "format": "csv"}
 ```
 
-- **`format`**: `csv`, `json` (default) ou `ndjson`. Também pode vir de `?format=` ou do header `Accept`.
+- **`format`**: `csv`, `json` (default), `ndjson` ou `arrow` (Arrow IPC stream,
+  `application/vnd.apache.arrow.stream`). Também pode vir de `?format=` ou do header `Accept`.
 - **`database`**: catálogo usado para nomes não qualificados. O default vem do campo `default` do catálogo.
 - **Resposta em JSON**: `{"columns":[{"name","type"}],"data":[{...}],"row_count":N}`.
 - **Tipos convertidos para string**: DECIMAL, HUGEINT e UUID, para não perder precisão.
@@ -295,6 +299,28 @@ limits := {"timeout": "30s", "max_rows": 10000} if "analyst" in input.roles
 - **Fail-closed:** se a regra falhar (formato inválido, conflito de valores), o request é negado com 500.
 - **Onde aparecem:** na resposta do dry-run e no evento de auditoria (`limits`).
 - **Exemplo pronto:** `examples/policy.rego` lê os limites de `data.roles[role].limits`. No exemplo, o analyst tem 30 s e 10 mil linhas.
+
+## Desempenho
+
+Medido no caminho HTTP completo (auth, inspeção, política, execução e
+serialização), numa máquina de 6 cores:
+
+| Cenário | Tempo |
+|---|---|
+| `SELECT 1` / point lookup | ~0,7 ms / ~0,9 ms por request |
+| 1 milhão de linhas (4 colunas), CSV | ~570 ms |
+| 1 milhão de linhas, JSON | ~580 ms |
+| 1 milhão de linhas, **Arrow** | **~140 ms** |
+| Iceberg no R2 com `cache_ttl` | ~8 ms (sem cache: 250–900 ms) |
+
+- **Resultados grandes: prefira `format: arrow`.** O DuckDB converte vetores
+  inteiros direto para Arrow, sem converter valor por valor. Clientes como
+  pyarrow, polars e o próprio DuckDB leem o stream direto.
+- **CSV e JSON:** os formatadores de decimal, data e CSV são escritos à mão e
+  testados contra as implementações de referência do Go e do driver.
+- **Queries pequenas:** a latência é dominada pelo custo fixo do DuckDB. Cerca
+  de 0,25 ms vêm de garantias que foram mantidas de propósito: conexão nova por
+  request (isolamento entre usuários) e a inspeção que alimenta a política.
 
 ## Política (input)
 

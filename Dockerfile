@@ -13,7 +13,7 @@ COPY . .
 ARG VERSION=dev
 ARG COMMIT=unknown
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=1 go build -trimpath \
+    CGO_ENABLED=1 go build -trimpath -tags duckdb_arrow \
       -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
       -o /out/curral ./cmd/curral
 

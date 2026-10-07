@@ -3,6 +3,7 @@ module curral
 go 1.27.1
 
 require (
+	github.com/apache/arrow-go/v18 v18.5.1
 	github.com/duckdb/duckdb-go-bindings v0.10506.0
 	github.com/duckdb/duckdb-go/v2 v2.10506.0
 	github.com/lestrrat-go/httprc/v3 v3.0.6
@@ -17,7 +18,6 @@ require (
 
 require (
 	github.com/agnivade/levenshtein v1.2.1 // indirect
-	github.com/apache/arrow-go/v18 v18.5.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1 // indirect

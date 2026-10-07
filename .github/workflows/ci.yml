@@ -24,14 +24,18 @@ jobs:
           if [ -n "$unformatted" ]; then echo "needs gofmt:"; echo "$unformatted"; exit 1; fi
 
       - name: vet
-        run: go vet ./...
+        run: go vet ./... && go vet -tags duckdb_arrow ./...
 
       # The R2 integration tests skip themselves without R2_* variables.
+      # Release builds use -tags duckdb_arrow (Arrow IPC output).
       - name: test
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -tags duckdb_arrow ./...
+
+      - name: test without arrow
+        run: go test -count=1 ./internal/server ./internal/engine
 
       - name: build
-        run: go build -o bin/curral ./cmd/curral && ./bin/curral version
+        run: go build -tags duckdb_arrow -o bin/curral ./cmd/curral && ./bin/curral version
 
   docker:
     runs-on: ubuntu-latest
