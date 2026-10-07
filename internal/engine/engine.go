@@ -12,6 +12,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
@@ -63,6 +64,7 @@ type Engine struct {
 	schemas   map[string]string // name -> schema used by USE
 	scanFuncs map[string]bool   // table functions that scan attached non-DuckDB catalogs
 	caches    map[string]*catalogcache.Proxy
+	waiting   atomic.Int64 // requests waiting for a slot
 	log       *slog.Logger
 }
 
@@ -140,6 +142,20 @@ func (e *Engine) startCaches(cat *config.Catalog) (*config.Catalog, error) {
 	return &out, nil
 }
 
+// DuckDBVersion returns the embedded DuckDB version.
+func (e *Engine) DuckDBVersion(ctx context.Context) string {
+	var v string
+	if err := e.db.QueryRowContext(ctx, "SELECT version()").Scan(&v); err != nil {
+		return "unknown"
+	}
+	return v
+}
+
+// Load reports queries executing, queries waiting for a slot, and the limit.
+func (e *Engine) Load() (running, waiting, limit int) {
+	return len(e.sem), int(e.waiting.Load()), cap(e.sem)
+}
+
 // CacheStats reports hits/misses of a database's catalog cache, if enabled.
 func (e *Engine) CacheStats(database string) (hits, misses int64, ok bool) {
 	p, ok := e.caches[database]
@@ -147,6 +163,11 @@ func (e *Engine) CacheStats(database string) (hits, misses int64, ok bool) {
 		return 0, 0, false
 	}
 	return p.Hits.Load(), p.Misses.Load(), true
+}
+
+// CachedDatabases lists databases with a catalog metadata cache.
+func (e *Engine) CachedDatabases() []string {
+	return slices.Sorted(maps.Keys(e.caches))
 }
 
 func (e *Engine) boot(ctx context.Context, cat *config.Catalog) error {
@@ -434,6 +455,8 @@ func (e *Engine) acquire(ctx context.Context) error {
 	if e.opts.QueueTimeout <= 0 {
 		return ErrBusy
 	}
+	e.waiting.Add(1)
+	defer e.waiting.Add(-1)
 	t := time.NewTimer(e.opts.QueueTimeout)
 	defer t.Stop()
 	select {

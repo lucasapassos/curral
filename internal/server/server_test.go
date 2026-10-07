@@ -20,6 +20,7 @@ import (
 	"curral/internal/auth"
 	"curral/internal/config"
 	"curral/internal/engine"
+	"curral/internal/metrics"
 	"curral/internal/policy"
 )
 
@@ -75,6 +76,10 @@ func newServerWithAudit(t *testing.T, auditPath string) (*httptest.Server, *audi
 	}
 	t.Cleanup(func() { eng.Close() })
 	s := &Server{Engine: eng, Auth: auth.New(users, time.Minute), Policy: pol, Log: log, MaxBody: 1 << 20, Version: "test"}
+	s.Metrics = metrics.New(metrics.Sources{
+		Load: eng.Load, BuildLabels: map[string]string{"version": "test", "policy_sha256": pol.SHA256},
+	})
+	lastServer = s
 	var aw *audit.Writer
 	if auditPath != "" {
 		if aw, err = audit.Open(auditPath, 64, log); err != nil {
@@ -267,5 +272,49 @@ func TestAuditFailClosed(t *testing.T) {
 	r = do(t, ts, "admin", `{"sql":"SELECT count(*) AS n FROM orders WHERE id = 99"}`)
 	if r.status != 503 {
 		t.Fatalf("read while audit down: %d", r.status)
+	}
+}
+
+// lastServer is the most recent server built by newServerWithAudit, for
+// tests that need its internals (metrics handler).
+var lastServer *Server
+
+func TestMetrics(t *testing.T) {
+	ts := newServer(t)
+	s := lastServer
+	do(t, ts, "analyst", `{"sql":"SELECT id FROM orders"}`)
+	do(t, ts, "analyst", `{"sql":"SELECT id FROM orders"}`)
+	do(t, ts, "analyst", `{"sql":"DELETE FROM orders"}`)
+	do(t, ts, "admin", `{"sql":"ATTACH ':memory:' AS m"}`)
+	do(t, ts, "analyst", `{"sql":"SELECT 1","nope":1}`)
+	do(t, ts, "", `{"sql":"SELECT 1"}`)
+
+	rec := httptest.NewRecorder()
+	s.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		`curral_queries_total{decided_by="policy",decision="allow",statement_type="SELECT",status="200"} 2`,
+		`curral_queries_total{decided_by="policy",decision="deny",statement_type="DELETE",status="403"} 1`,
+		`curral_queries_total{decided_by="engine",decision="deny",statement_type="none",status="403"} 1`,
+		`curral_queries_total{decided_by="request",decision="error",statement_type="none",status="400"} 1`,
+		`curral_policy_decisions_total{decision="allow",role="analyst"} 2`,
+		`curral_policy_decisions_total{decision="deny",role="analyst"} 1`,
+		`curral_auth_failures_total 1`,
+		`curral_rows_returned_total 4`,
+		`curral_query_slots 4`,
+		`curral_queries_running 0`,
+		`curral_query_stage_seconds_count{stage="total"} 5`,
+		`curral_build_info{policy_sha256="` + s.Policy.SHA256 + `",version="test"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %s", want)
+		}
+	}
+	if t.Failed() {
+		for _, l := range strings.Split(body, "\n") {
+			if strings.HasPrefix(l, "curral_") {
+				t.Log(l)
+			}
+		}
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"curral/internal/auth"
 	"curral/internal/config"
 	"curral/internal/engine"
+	"curral/internal/metrics"
 	"curral/internal/policy"
 	"curral/internal/server"
 )
@@ -109,6 +110,7 @@ type serveFlags struct {
 	auditLog       string
 	auditSQL       string
 	auditQueue     int
+	metricsListen  string
 	logLevel       string
 	logFormat      string
 }
@@ -137,6 +139,7 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.StringVar(&f.auditLog, "audit-log", "", "audit log file (JSON lines), '-' for stdout; empty disables auditing. Queries are refused while it cannot be written; SIGHUP reopens it")
 	fs.StringVar(&f.auditSQL, "audit-sql", server.AuditSQLRedacted, "SQL text in audit events: redacted (literals become ?), full or hash")
 	fs.IntVar(&f.auditQueue, "audit-queue", 4096, "audit events buffered in memory")
+	fs.StringVar(&f.metricsListen, "metrics-listen", "", "serve Prometheus /metrics on this separate address (e.g. 127.0.0.1:9090); empty disables")
 	fs.StringVar(&f.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.StringVar(&f.logFormat, "log-format", "text", "text or json")
 
@@ -291,7 +294,37 @@ func runServe(args []string, checkOnly bool) error {
 		log.Warn("audit log disabled (--audit-log not set)")
 	}
 
+	var mtr *metrics.Metrics
+	var metricsSrv *http.Server
+	if f.metricsListen != "" {
+		src := metrics.Sources{
+			Load:       eng.Load,
+			CacheStats: eng.CacheStats,
+			CachedDBs:  eng.CachedDatabases(),
+			BuildLabels: map[string]string{
+				"version": version, "commit": commit,
+				"duckdb": eng.DuckDBVersion(ctx), "policy_sha256": pol.SHA256,
+			},
+		}
+		if aw != nil {
+			src.AuditStats = func() (int64, int64, bool) {
+				return aw.Written.Load(), aw.Dropped.Load(), aw.Healthy() == nil
+			}
+		}
+		mtr = metrics.New(src)
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", mtr.Handler())
+		metricsSrv = &http.Server{Addr: f.metricsListen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("metrics server", "err", err)
+			}
+		}()
+		log.Info("metrics enabled", "addr", f.metricsListen)
+	}
+
 	srv := &server.Server{
+		Metrics:  mtr,
 		Engine:   eng,
 		Auth:     auth.New(users, f.authCacheTTL),
 		Policy:   pol,
@@ -319,6 +352,9 @@ func runServe(args []string, checkOnly bool) error {
 		shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		err = httpSrv.Shutdown(shutCtx)
+	}
+	if metricsSrv != nil {
+		metricsSrv.Close()
 	}
 	// After HTTP shutdown no handler can still write events.
 	if aw != nil {

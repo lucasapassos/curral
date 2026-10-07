@@ -24,6 +24,7 @@ services:
     image: curral:${CURRAL_VERSION:-dev}
     ports:
       - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9090:9090" # Prometheus /metrics (no auth: keep it internal)
     environment:
       CURRAL_CATALOG: /etc/curral/catalog.r2.yaml
       CURRAL_USERS: /etc/curral/users.yaml
@@ -34,6 +35,7 @@ services:
       CURRAL_QUERY_TIMEOUT: ${CURRAL_QUERY_TIMEOUT:-60s}
       CURRAL_AUDIT_LOG: /var/log/curral/audit.jsonl
       CURRAL_AUDIT_SQL: ${CURRAL_AUDIT_SQL:-redacted}
+      CURRAL_METRICS_LISTEN: :9090
       R2_CATALOG_URI: ${R2_CATALOG_URI:-${R2_CATALOG_URI:?set R2_CATALOG_URI}}
       R2_WAREHOUSE: ${R2_WAREHOUSE:-${R2_WAREHOUSE:?set R2_WAREHOUSE}}
       R2_TOKEN: ${R2_TOKEN:-${R2_TOKEN:?set R2_TOKEN}}

@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"curral/internal/auth"
 	"curral/internal/encode"
 	"curral/internal/engine"
+	"curral/internal/metrics"
 	"curral/internal/policy"
 )
 
@@ -38,8 +40,9 @@ type Server struct {
 	MaxRows int64
 	MaxBody int64
 
-	Audit    *audit.Writer // nil disables auditing
-	AuditSQL string        // redacted (default), full or hash
+	Metrics  *metrics.Metrics // nil disables metrics
+	Audit    *audit.Writer    // nil disables auditing
+	AuditSQL string           // redacted (default), full or hash
 	Version  string
 }
 
@@ -90,6 +93,7 @@ func (s *Server) authed(h handler) http.HandlerFunc {
 			w.Header().Set("WWW-Authenticate", `Basic realm="curral", charset="UTF-8"`)
 			writeError(w, http.StatusUnauthorized, "invalid credentials")
 			s.Log.Info("auth failed", "user", user, "remote", r.RemoteAddr, "request_id", requestID(r))
+			s.Metrics.AuthFailure()
 			if s.Audit != nil {
 				ev := s.newEvent(r, "auth_failure", nil)
 				ev.User = user
@@ -164,6 +168,10 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 	// Requests rejected before anything runs are recorded best-effort.
 	reject := func(status int, msg string) {
 		writeError(w, status, msg)
+		s.Metrics.ObserveQuery(metrics.Query{
+			Status: strconv.Itoa(status), Decision: "error", DecidedBy: "request", Roles: p.Roles,
+			Stages: map[string]time.Duration{metrics.StageTotal: time.Since(start)},
+		})
 		if s.Audit != nil {
 			ev.Decision, ev.DecidedBy, ev.Status, ev.Error = "error", "request", status, msg
 			s.Audit.Record(ev)
@@ -286,6 +294,26 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 	}
 	s.Log.Info("query", attrs...)
 
+	decision, decidedBy := decisionOf(err, allowed, policyCalled, policyE, auditE)
+	policyResult := ""
+	switch {
+	case allowed:
+		policyResult = "allow"
+	case policyCalled && policyE == nil:
+		policyResult = "deny"
+	}
+	total := time.Since(start)
+	s.Metrics.ObserveQuery(metrics.Query{
+		Status: strconv.Itoa(status), Decision: decision, DecidedBy: decidedBy,
+		StatementType: insp.StatementType, Roles: p.Roles, PolicyResult: policyResult,
+		Rows: rows, Bytes: bytes.n,
+		Stages: map[string]time.Duration{
+			metrics.StageQueue: timing.Queue, metrics.StageInspect: timing.Inspect,
+			metrics.StageAuthorize: timing.Authorize, metrics.StageExecute: timing.Execute,
+			metrics.StageTotal: total,
+		},
+	})
+
 	if s.Audit == nil {
 		return
 	}
@@ -300,13 +328,13 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 	if err != nil {
 		ev.Error = oneLine(err.Error())
 	}
-	ev.Decision, ev.DecidedBy = decisionOf(err, allowed, policyCalled, policyE, auditE)
+	ev.Decision, ev.DecidedBy = decision, decidedBy
 	ev.TimingMS = map[string]float64{
 		"queue":     ms(timing.Queue),
 		"inspect":   ms(timing.Inspect),
 		"authorize": ms(timing.Authorize),
 		"execute":   ms(timing.Execute),
-		"total":     ms(time.Since(start)),
+		"total":     ms(total),
 	}
 	if reservation != nil {
 		reservation.Write(ev)

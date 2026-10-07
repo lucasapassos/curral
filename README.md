@@ -73,6 +73,7 @@ vírgula: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--audit-log` | (desligado) | arquivo JSONL de auditoria; `-` = stdout; `SIGHUP` reabre |
 | `--audit-sql` | `redacted` | texto do SQL na auditoria: `redacted`, `full` ou `hash` |
 | `--audit-queue` | 4096 | eventos em memória aguardando escrita |
+| `--metrics-listen` | (desligado) | endereço separado para o `/metrics` do Prometheus, ex.: `127.0.0.1:9090` |
 
 ## Catálogo
 
@@ -193,6 +194,32 @@ evento.
 Limitação: um crash do processo entre o commit de uma escrita e a gravação do
 evento pode perder esse evento. A reserva prévia cobre disco cheio e falhas
 de permissão, mas não queda do processo.
+
+## Métricas
+
+Com `--metrics-listen`, o `/metrics` (formato Prometheus) é servido numa porta
+separada da API e **sem autenticação**. Mantenha essa porta na rede interna.
+
+| Métrica | Tipo | Labels |
+|---|---|---|
+| `curral_queries_total` | counter | `status`, `decision`, `decided_by`, `statement_type` |
+| `curral_policy_decisions_total` | counter | `role`, `decision` (cada role do usuário conta uma vez) |
+| `curral_query_stage_seconds` | histogram | `stage`: `queue`, `inspect`, `authorize`, `execute`, `total` |
+| `curral_queries_running` / `curral_queries_waiting` / `curral_query_slots` | gauge | |
+| `curral_rows_returned_total` / `curral_response_bytes_total` | counter | |
+| `curral_auth_failures_total` | counter | |
+| `curral_audit_events_written_total` / `curral_audit_events_dropped_total` | counter | |
+| `curral_audit_healthy` | gauge | 0 = queries sendo recusadas |
+| `curral_catalog_cache_requests_total` | counter | `database`, `result` (`hit`, `miss`) |
+| `curral_build_info` | gauge | `version`, `commit`, `duckdb`, `policy_sha256` |
+
+Também saem as métricas padrão do runtime Go e do processo (`go_*`, `process_*`).
+
+Alertas sugeridos:
+- `curral_audit_healthy == 0`: as queries estão sendo recusadas.
+- `rate(curral_queries_total{status="503"}[5m]) > 0`: fila cheia ou auditoria fora.
+- `curral_queries_waiting > 0` por muito tempo: aumentar `--max-concurrency`.
+- Um pico em `curral_policy_decisions_total{decision="deny"}` ou em `curral_auth_failures_total`.
 
 ## Política (input)
 

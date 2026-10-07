@@ -33,7 +33,7 @@ ENV CURRAL_LISTEN=:8080 \
     CURRAL_EXTENSION_DIR=/opt/curral/extensions \
     CURRAL_TEMP_DIR=/var/lib/curral/tmp \
     CURRAL_LOG_FORMAT=json
-EXPOSE 8080
+EXPOSE 8080 9090
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s CMD ["/usr/local/bin/curral", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/curral"]
 CMD ["serve"]
