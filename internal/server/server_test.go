@@ -6,10 +6,12 @@ import (
 	"crypto/rsa"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -639,5 +641,93 @@ func TestOIDCIdentities(t *testing.T) {
 	}
 	if c := query("eve@gmail.com"); c != 403 {
 		t.Fatalf("any other Gmail account must stay denied: %d", c)
+	}
+}
+
+func TestClientIP(t *testing.T) {
+	s := &Server{TrustedProxies: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("::1/128")}}
+	cases := []struct {
+		remote, xff, want string
+	}{
+		{"203.0.113.5:1234", "", "203.0.113.5"},
+		{"203.0.113.5:1234", "1.2.3.4", "203.0.113.5"},              // untrusted peer: header ignored
+		{"10.0.0.2:1234", "198.51.100.7", "198.51.100.7"},           // via trusted proxy
+		{"10.0.0.2:1234", "6.6.6.6, 198.51.100.7", "198.51.100.7"},  // client-written hop ignored
+		{"10.0.0.2:1234", "198.51.100.7, 10.0.0.9", "198.51.100.7"}, // chain of trusted proxies
+		{"10.0.0.2:1234", "", "10.0.0.2"},
+		{"10.0.0.2:1234", "garbage, 198.51.100.7", "198.51.100.7"},
+		{"10.0.0.2:1234", "198.51.100.7, garbage", "10.0.0.2"},
+		{"[::1]:1234", "2001:db8::1", "2001:db8::1"},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = c.remote
+		if c.xff != "" {
+			r.Header.Set("X-Forwarded-For", c.xff)
+		}
+		if got := s.clientIP(r); got != c.want {
+			t.Errorf("%s / %q: got %s want %s", c.remote, c.xff, got, c.want)
+		}
+	}
+}
+
+func TestBruteForceLockout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	ts, aw := newServerWithAudit(t, path)
+	s := lastServer
+	s.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
+	s.IPLimiter = auth.NewLimiter(auth.LimiterConfig{MaxFailures: 10, Window: time.Minute, Lockout: time.Minute})
+	s.UserLimiter = auth.NewLimiter(auth.LimiterConfig{MaxFailures: 25, Window: time.Minute, Lockout: time.Minute})
+
+	try := func(ip, user, pass string) int {
+		req, _ := http.NewRequest("POST", ts.URL+"/v1/query", strings.NewReader(`{"sql":"SELECT 1"}`))
+		req.SetBasicAuth(user, pass)
+		req.Header.Set("X-Forwarded-For", ip)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == 429 && resp.Header.Get("Retry-After") == "" {
+			t.Fatal("429 without Retry-After")
+		}
+		return resp.StatusCode
+	}
+
+	for i := range 10 {
+		if c := try("198.51.100.1", "analyst", "guess"); c != 401 {
+			t.Fatalf("attempt %d: %d", i+1, c)
+		}
+	}
+	if c := try("198.51.100.1", "analyst", "analyst-pw"); c != 429 {
+		t.Fatalf("locked IP with the right password: %d", c)
+	}
+	if c := try("198.51.100.2", "analyst", "analyst-pw"); c != 200 {
+		t.Fatalf("another IP: %d", c)
+	}
+
+	// A distributed attack on one account: few failures per IP, many in total.
+	for i := range 25 {
+		try(fmt.Sprintf("192.0.2.%d", i), "etl", "guess")
+	}
+	if c := try("192.0.2.200", "ETL", "etl-pw"); c != 429 {
+		t.Fatalf("user lockout across IPs (case-insensitive): %d", c)
+	}
+	if c := try("192.0.2.201", "admin", "admin-pw"); c != 200 {
+		t.Fatalf("other users unaffected: %d", c)
+	}
+
+	aw.Close()
+	var blocked, lastIP string
+	for _, ev := range readAudit(t, path) {
+		if ev.Event == "auth_blocked" && blocked == "" {
+			blocked = ev.Error
+		}
+		if ev.Event == "auth_failure" {
+			lastIP = ev.RemoteAddr
+		}
+	}
+	if blocked != "ip locked out" || !strings.HasPrefix(lastIP, "192.0.2.") {
+		t.Fatalf("audit: blocked=%q lastIP=%q", blocked, lastIP)
 	}
 }

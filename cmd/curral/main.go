@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"runtime"
@@ -123,6 +124,13 @@ type serveFlags struct {
 	oidcSkew       time.Duration
 	oidcVerified   bool
 	oidcDomains    listFlag
+	tlsCert        string
+	tlsKey         string
+	trustedProxies listFlag
+	ipMaxFail      int
+	userMaxFail    int
+	failWindow     time.Duration
+	lockout        time.Duration
 	logLevel       string
 	logFormat      string
 }
@@ -160,6 +168,13 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.DurationVar(&f.oidcSkew, "oidc-skew", 30*time.Second, "clock skew tolerated when validating JWT times")
 	fs.BoolVar(&f.oidcVerified, "oidc-require-email-verified", true, "with --oidc-user-claim email, reject tokens without email_verified=true (disable for providers that never send it, e.g. Entra ID)")
 	fs.Var(&f.oidcDomains, "oidc-hosted-domain", "only accept Google tokens whose hd claim is this Workspace domain (repeatable)")
+	fs.StringVar(&f.tlsCert, "tls-cert", "", "serve HTTPS with this certificate (PEM, full chain); reloaded on SIGHUP")
+	fs.StringVar(&f.tlsKey, "tls-key", "", "private key for --tls-cert (PEM)")
+	fs.Var(&f.trustedProxies, "trusted-proxy", "CIDR or IP of a reverse proxy allowed to set X-Forwarded-For (repeatable)")
+	fs.IntVar(&f.ipMaxFail, "auth-ip-max-failures", 10, "failed logins from one client IP within the window before it is locked out (0 = off)")
+	fs.IntVar(&f.userMaxFail, "auth-user-max-failures", 30, "failed logins for one user name within the window before it is locked out (0 = off)")
+	fs.DurationVar(&f.failWindow, "auth-failure-window", 5*time.Minute, "window in which failed logins are counted")
+	fs.DurationVar(&f.lockout, "auth-lockout", 15*time.Minute, "how long a lockout lasts")
 	fs.StringVar(&f.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.StringVar(&f.logFormat, "log-format", "text", "text or json")
 
@@ -181,6 +196,9 @@ func parseFlags(args []string) (*serveFlags, error) {
 	}
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required flags: %s", strings.Join(missing, ", "))
+	}
+	if (f.tlsCert == "") != (f.tlsKey == "") {
+		return nil, fmt.Errorf("--tls-cert and --tls-key go together")
 	}
 	switch f.auditSQL {
 	case server.AuditSQLRedacted, server.AuditSQLFull, server.AuditSQLHash:
@@ -364,6 +382,13 @@ func runServe(args []string, checkOnly bool) error {
 		mtr.SetPolicySource(func() string { return srv.Policy().SHA256 })
 	}
 
+	var certs *server.CertLoader
+	if f.tlsCert != "" {
+		if certs, err = server.NewCertLoader(f.tlsCert, f.tlsKey); err != nil {
+			return err
+		}
+	}
+
 	// SIGHUP: reopen the audit log (logrotate) and reload users and policy.
 	// A broken file keeps the previous version in effect. The catalog is
 	// locked into DuckDB at boot and needs a restart.
@@ -374,6 +399,13 @@ func runServe(args []string, checkOnly bool) error {
 			if aw != nil {
 				if err := aw.Reopen(); err != nil {
 					log.Error("audit log reopen failed", "err", err)
+				}
+			}
+			if certs != nil {
+				if err := certs.Reload(); err != nil {
+					log.Error("tls certificate reload failed; keeping the current one", "err", err)
+				} else {
+					log.Info("tls certificate reloaded")
 				}
 			}
 			users, err := config.LoadUsers(f.users)
@@ -389,14 +421,37 @@ func runServe(args []string, checkOnly bool) error {
 		}
 	}()
 
+	proxies, err := parsePrefixes(f.trustedProxies)
+	if err != nil {
+		return err
+	}
+	srv.TrustedProxies = proxies
+	limiterCfg := func(n int) auth.LimiterConfig {
+		return auth.LimiterConfig{MaxFailures: n, Window: f.failWindow, Lockout: f.lockout}
+	}
+	srv.IPLimiter = auth.NewLimiter(limiterCfg(f.ipMaxFail))
+	srv.UserLimiter = auth.NewLimiter(limiterCfg(f.userMaxFail))
+	go func() {
+		for range time.Tick(time.Minute) {
+			srv.IPLimiter.Sweep()
+			srv.UserLimiter.Sweep()
+		}
+	}()
+
 	httpSrv := &http.Server{
 		Addr:              f.listen,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	errc := make(chan error, 1)
-	go func() { errc <- httpSrv.ListenAndServe() }()
-	log.Info("curral listening", "addr", f.listen, "databases", dbs, "max_concurrency", f.maxConcurrency,
+	if certs != nil {
+		httpSrv.TLSConfig = certs.TLSConfig()
+		go func() { errc <- httpSrv.ListenAndServeTLS("", "") }()
+	} else {
+		go func() { errc <- httpSrv.ListenAndServe() }()
+		log.Warn("serving plain HTTP: credentials travel unencrypted unless a TLS proxy is in front (--tls-cert/--tls-key)")
+	}
+	log.Info("curral listening", "addr", f.listen, "tls", certs != nil, "trusted_proxies", f.trustedProxies, "databases", dbs, "max_concurrency", f.maxConcurrency,
 		"version", version, "policy_sha256", pol.SHA256)
 
 	select {
@@ -424,6 +479,23 @@ var (
 	version = "dev"
 	commit  = "unknown"
 )
+
+// parsePrefixes accepts CIDRs and single addresses.
+func parsePrefixes(list []string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, s := range list {
+		if p, err := netip.ParsePrefix(s); err == nil {
+			out = append(out, p.Masked())
+			continue
+		}
+		a, err := netip.ParseAddr(s)
+		if err != nil {
+			return nil, fmt.Errorf("--trusted-proxy %q: not an IP or CIDR", s)
+		}
+		out = append(out, netip.PrefixFrom(a, a.BitLen()))
+	}
+	return out, nil
+}
 
 func runVersion() error {
 	db, err := sql.Open("duckdb", "")

@@ -11,8 +11,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -39,11 +39,19 @@ type Server struct {
 	MaxRows int64
 	MaxBody int64
 
-	Metrics  *metrics.Metrics // nil disables metrics
-	OIDC     *auth.OIDC       // nil disables bearer JWTs
-	Audit    *audit.Writer    // nil disables auditing
-	AuditSQL string           // redacted (default), full or hash
-	Version  string
+	Metrics *metrics.Metrics // nil disables metrics
+	OIDC    *auth.OIDC       // nil disables bearer JWTs
+
+	// Brute-force protection: failures are counted per client IP and per
+	// claimed user name; nil disables either.
+	IPLimiter   *auth.Limiter
+	UserLimiter *auth.Limiter
+	// TrustedProxies may set X-Forwarded-For; only then is it used to find
+	// the client address (for limits and audit).
+	TrustedProxies []netip.Prefix
+	Audit          *audit.Writer // nil disables auditing
+	AuditSQL       string        // redacted (default), full or hash
+	Version        string
 
 	// Swapped atomically on reload; in-flight requests keep the version
 	// they started with.
@@ -116,6 +124,25 @@ type handler func(http.ResponseWriter, *http.Request, *auth.Principal)
 
 func (s *Server) authed(h handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		ip := s.clientIP(r)
+		claimed := ""
+		if u, _, ok := r.BasicAuth(); ok {
+			claimed = u
+		}
+		// Blocked callers are turned away before any credential check.
+		if left, scope, blocked := s.blocked(ip, claimed); blocked {
+			w.Header().Set("Retry-After", strconv.Itoa(int(left.Seconds())+1))
+			writeError(w, http.StatusTooManyRequests, "too many failed authentication attempts; try again later")
+			s.Metrics.AuthBlocked(scope)
+			if s.Audit != nil {
+				ev := s.newEvent(r, "auth_blocked", nil)
+				ev.User, ev.Error = claimed, scope+" locked out"
+				ev.Decision, ev.DecidedBy, ev.Status = "deny", "auth", http.StatusTooManyRequests
+				s.Audit.Record(ev)
+			}
+			return
+		}
+
 		p, method, user, reason := s.authenticate(r)
 		if p == nil {
 			w.Header().Set("WWW-Authenticate", `Basic realm="curral", charset="UTF-8"`)
@@ -124,8 +151,9 @@ func (s *Server) authed(h handler) http.HandlerFunc {
 			}
 			writeError(w, http.StatusUnauthorized, "invalid credentials")
 			s.Log.Info("auth failed", "method", method, "user", user, "reason", reason,
-				"remote", r.RemoteAddr, "request_id", requestID(r))
+				"client", ip, "request_id", requestID(r))
 			s.Metrics.AuthFailure(method)
+			s.recordFailure(ip, user)
 			if s.Audit != nil {
 				ev := s.newEvent(r, "auth_failure", nil)
 				ev.User, ev.AuthMethod, ev.Error = user, method, reason
@@ -136,6 +164,64 @@ func (s *Server) authed(h handler) http.HandlerFunc {
 		}
 		h(w, r, p)
 	}
+}
+
+func (s *Server) blocked(ip, user string) (time.Duration, string, bool) {
+	if left, ok := s.IPLimiter.Blocked(ip); ok {
+		return left, "ip", true
+	}
+	if user != "" {
+		if left, ok := s.UserLimiter.Blocked(strings.ToLower(user)); ok {
+			return left, "user", true
+		}
+	}
+	return 0, "", false
+}
+
+func (s *Server) recordFailure(ip, user string) {
+	if s.IPLimiter.Fail(ip) {
+		s.Metrics.AuthLockout("ip")
+		s.Log.Warn("client locked out after repeated authentication failures", "client", ip)
+	}
+	if user != "" && s.UserLimiter.Fail(strings.ToLower(user)) {
+		s.Metrics.AuthLockout("user")
+		s.Log.Warn("user locked out after repeated authentication failures", "user", user)
+	}
+}
+
+// clientIP is the peer address, or, when the peer is a trusted proxy, the
+// right-most address in X-Forwarded-For that is not itself a trusted proxy.
+// Addresses a client writes into the header are never trusted.
+func (s *Server) clientIP(r *http.Request) string {
+	peer, err := netip.ParseAddrPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	addr := peer.Addr().Unmap()
+	if !s.trusted(addr) {
+		return addr.String()
+	}
+	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		hop, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
+		if err != nil {
+			break // garbage: stop at the last address we could vouch for
+		}
+		addr = hop.Unmap()
+		if !s.trusted(addr) {
+			break
+		}
+	}
+	return addr.String()
+}
+
+func (s *Server) trusted(a netip.Addr) bool {
+	for _, p := range s.TrustedProxies {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
 }
 
 // authenticate picks the method from the Authorization header: Basic for
@@ -183,12 +269,9 @@ func (s *Server) newEvent(r *http.Request, kind string, p *auth.Principal) *audi
 		TS:           time.Now().UTC(),
 		Event:        kind,
 		RequestID:    requestID(r),
-		RemoteAddr:   r.RemoteAddr,
+		RemoteAddr:   s.clientIP(r),
 		ForwardedFor: r.Header.Get("X-Forwarded-For"),
 		Version:      s.Version,
-	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		ev.RemoteAddr = host
 	}
 	if pol := s.Policy(); pol != nil {
 		ev.PolicySHA256 = pol.SHA256

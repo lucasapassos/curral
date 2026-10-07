@@ -31,6 +31,8 @@ type Metrics struct {
 	bytes     prometheus.Counter
 	authFail  *prometheus.CounterVec
 	reloads   *prometheus.CounterVec
+	lockouts  *prometheus.CounterVec
+	blocked   *prometheus.CounterVec
 	policy    *policyCollector
 }
 
@@ -78,11 +80,17 @@ func New(src Sources) *Metrics {
 		authFail: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "curral_auth_failures_total", Help: "Requests rejected for invalid credentials, by attempted method.",
 		}, []string{"method"}),
+		lockouts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "curral_auth_lockouts_total", Help: "Lockouts started after repeated authentication failures, by scope (ip, user).",
+		}, []string{"scope"}),
+		blocked: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "curral_auth_blocked_total", Help: "Requests refused (429) because their client or user is locked out, by scope.",
+		}, []string{"scope"}),
 		reloads: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "curral_config_reloads_total", Help: "Users/policy reloads (SIGHUP) by result (ok, error).",
 		}, []string{"result"}),
 	}
-	reg.MustRegister(m.requests, m.decisions, m.stage, m.rows, m.bytes, m.authFail, m.reloads,
+	reg.MustRegister(m.requests, m.decisions, m.stage, m.rows, m.bytes, m.authFail, m.reloads, m.lockouts, m.blocked,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	if src.Load != nil {
@@ -201,6 +209,18 @@ func (m *Metrics) ObserveQuery(q Query) {
 func (m *Metrics) Reload(result string) {
 	if m != nil {
 		m.reloads.WithLabelValues(result).Inc()
+	}
+}
+
+func (m *Metrics) AuthLockout(scope string) {
+	if m != nil {
+		m.lockouts.WithLabelValues(scope).Inc()
+	}
+}
+
+func (m *Metrics) AuthBlocked(scope string) {
+	if m != nil {
+		m.blocked.WithLabelValues(scope).Inc()
 	}
 }
 

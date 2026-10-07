@@ -83,6 +83,11 @@ vírgula: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--audit-sql` | `redacted` | texto do SQL na auditoria: `redacted`, `full` ou `hash` |
 | `--audit-queue` | 4096 | eventos em memória aguardando escrita |
 | `--metrics-listen` | (desligado) | endereço separado para o `/metrics` do Prometheus, ex.: `127.0.0.1:9090` |
+| `--tls-cert` / `--tls-key` | (HTTP puro) | HTTPS nativo, TLS 1.2+; o certificado recarrega no `SIGHUP` |
+| `--trusted-proxy` | (nenhum) | IP/CIDR de proxy que pode definir `X-Forwarded-For`, repetível |
+| `--auth-ip-max-failures` | 10 | falhas de login por IP na janela antes do bloqueio (0 = off) |
+| `--auth-user-max-failures` | 30 | falhas por nome de usuário na janela antes do bloqueio (0 = off) |
+| `--auth-failure-window` / `--auth-lockout` | 5m / 15m | janela de contagem / duração do bloqueio |
 
 ## Catálogo
 
@@ -241,6 +246,38 @@ curral serve ... \
 - **Teste local:** `gcloud auth print-identity-token` gera um ID token cuja
   audience é o client ID do próprio gcloud. Não use essa audience em produção:
   qualquer usuário do gcloud teria tokens aceitos.
+
+## Exposição na rede: TLS e força bruta
+
+**TLS.** Sem TLS, senhas, API keys e tokens trafegam em claro, e o curral
+avisa isso no boot. Há duas opções:
+- **TLS nativo:** `--tls-cert`/`--tls-key`. O `SIGHUP` recarrega o certificado
+  sem derrubar conexões, e um arquivo inválido mantém o certificado atual.
+- **Proxy com certificado automático:** `docker compose --profile tls up`
+  sobe um Caddy na frente, com Let's Encrypt para `CURRAL_DOMAIN` ou CA local
+  para `localhost`, e HSTS.
+
+**Força bruta.**
+- **Contagem:** falhas de autenticação são contadas por IP e por nome de
+  usuário. O limite por usuário pega ataques distribuídos.
+- **Bloqueio:** passado o limite, o request recebe **429** com `Retry-After`,
+  **mesmo com a credencial certa**. O bloqueio é checado antes do bcrypt, então
+  não gasta CPU.
+- **CPU:** o bcrypt roda com concorrência limitada ao número de CPUs, para que
+  uma enxurrada de senhas erradas não esgote a máquina.
+- **Rastreio:** eventos `auth_blocked` na auditoria e as métricas
+  `curral_auth_lockouts_total{scope}` e `curral_auth_blocked_total{scope}`.
+- **Trade-off:** o bloqueio por usuário permite que alguém bloqueie
+  temporariamente uma conta alheia errando a senha dela. Ajuste
+  `--auth-user-max-failures`, ou use 0 para desligar.
+
+**IP real atrás de proxy.** O curral só usa `X-Forwarded-For` quando a conexão
+vem de um `--trusted-proxy`, e lê da direita para a esquerda, parando no
+primeiro IP não confiável. Assim, um IP que o próprio cliente escreve no header
+nunca é aceito. Confie **só no IP do proxy**, nunca na sub-rede Docker
+inteira: ela inclui o gateway, por onde chega qualquer acesso às portas
+publicadas no host, que poderiam então forjar o header. O compose fixa o IP do
+Caddy (`CURRAL_PROXY_IP`) por esse motivo.
 
 ## Auditoria
 

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/hex"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -45,13 +46,17 @@ type Authenticator struct {
 	users map[string]config.User
 	keys  map[[32]byte]apiKey
 	ids   []config.Identity
-	ttl   time.Duration
-	cache sync.Map // [32]byte -> cacheEntry
-	dummy []byte
+	// bcrypt is deliberately slow; bound how many run at once so a flood of
+	// wrong passwords cannot take every CPU.
+	bcryptSlots chan struct{}
+	ttl         time.Duration
+	cache       sync.Map // [32]byte -> cacheEntry
+	dummy       []byte
 }
 
 func New(users *config.Users, ttl time.Duration) *Authenticator {
-	a := &Authenticator{users: map[string]config.User{}, keys: map[[32]byte]apiKey{}, ids: users.Identities, ttl: ttl}
+	a := &Authenticator{users: map[string]config.User{}, keys: map[[32]byte]apiKey{}, ids: users.Identities, ttl: ttl,
+		bcryptSlots: make(chan struct{}, runtime.NumCPU())}
 	for _, u := range users.Users {
 		a.users[u.Name] = u
 	}
@@ -77,6 +82,8 @@ func (a *Authenticator) Authenticate(user, pass string) *Principal {
 		a.cache.Delete(key)
 	}
 
+	a.bcryptSlots <- struct{}{}
+	defer func() { <-a.bcryptSlots }()
 	u, ok := a.users[user]
 	if !ok {
 		_ = bcrypt.CompareHashAndPassword(a.dummy, []byte(pass))

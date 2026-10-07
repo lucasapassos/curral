@@ -1,0 +1,10 @@
+# TLS in front of curral (docker compose --profile tls up).
+# A public domain gets a Let's Encrypt certificate automatically (ports 80
+# and 443 must reach this host); "localhost" uses Caddy's local CA.
+{$CURRAL_DOMAIN:localhost} {
+	reverse_proxy curral:8080
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+}
