@@ -311,6 +311,28 @@ Proteções que valem independentemente da política:
 - **Conexão nova por request**: tabelas TEMP, variáveis e `USE` não vazam entre usuários.
 - **Uma transação por request**: inspeção, autorização e execução veem o mesmo snapshot. Os metadados de catálogos remotos são buscados uma vez por request; falhas fazem rollback.
 
+## Verificação da inspeção
+
+O RBAC depende de a inspeção reportar corretamente o que um statement escreve.
+Isso é verificado contra o comportamento real do DuckDB por um **fuzz
+diferencial** (`internal/engine/fuzz_test.go`):
+1. Executa cada statement gerado.
+2. Compara um retrato de todos os catálogos (linhas, colunas, tabelas, views, schemas, sequences e macros) antes e depois.
+3. Falha se algum objeto alterado não estiver nos `targets` de uma inspeção marcada como `resolved`.
+
+```sh
+go test ./internal/engine -run '^$' -fuzz FuzzWriteTargets -fuzztime 5m         # mutação livre
+go test ./internal/engine -run '^$' -fuzz FuzzWriteTargetsGrammar -fuzztime 5m  # gramática de DML/DDL
+```
+
+- **No CI normal** rodam o corpus de seeds e uma varredura exaustiva (templates × grafias de nomes).
+- **Toda semana** o workflow `fuzz` roda os dois fuzzers por 10 minutos cada.
+- **Achados desse processo**, todos já corrigidos e cobertos por testes de regressão:
+  - bypass com `$$...$$`;
+  - `ALTER ... RENAME TO` sem o nome novo nos alvos;
+  - `memory.t` resolvido no catálogo errado;
+  - nomes de objetos com UTF-8 inválido quebrando os metadados do DuckDB.
+
 ## Limitações conhecidas
 
 - **Resultado materializado**: o driver Go materializa o resultado inteiro no DuckDB antes de entregar a primeira linha. Use `--memory-limit`/`--temp-dir` e, se precisar, `--max-rows`.

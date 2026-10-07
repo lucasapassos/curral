@@ -144,9 +144,13 @@ func TestInspect(t *testing.T) {
 		{"WITH x AS (SELECT 1 AS id) DELETE FROM orders WHERE id IN (SELECT id FROM x)", "DELETE", []string{"sales.main.orders"}, []string{"sales.main.orders"}, true},
 		{"CREATE TABLE crm.copy AS SELECT * FROM salaries", "CREATE", []string{"sales.main.salaries"}, []string{"sales.crm.copy"}, true},
 		{"CREATE TEMP TABLE scratch(a INT)", "CREATE", nil, []string{"temp.main.scratch"}, true},
+		{"CREATE TABLE memory.scratch(a INT)", "CREATE", nil, []string{"memory.main.scratch"}, true},
+		{"CREATE TABLE crm.scratch(a INT)", "CREATE", nil, []string{"sales.crm.scratch"}, true},
 		{"DROP TABLE IF EXISTS crm.clients", "DROP", nil, []string{"sales.crm.clients"}, true},
 		{"DROP SCHEMA logs.x", "DROP", nil, []string{"logs.x.*"}, true},
 		{"ALTER TABLE orders ADD COLUMN note VARCHAR", "ALTER", nil, []string{"sales.main.orders"}, true},
+		{"ALTER TABLE crm.clients RENAME TO c2", "ALTER", nil, []string{"sales.crm.c2", "sales.crm.clients"}, true},
+		{"ALTER TABLE orders RENAME COLUMN amount TO total", "ALTER", nil, []string{"sales.main.orders"}, true},
 		{"CREATE INDEX idx ON orders(id)", "CREATE", []string{"sales.main.orders"}, []string{"sales.main.orders"}, true},
 		{"EXPLAIN SELECT * FROM salaries", "EXPLAIN", []string{"sales.main.salaries"}, nil, true},
 		{"EXPLAIN ANALYZE DELETE FROM orders", "DELETE", []string{"sales.main.orders"}, []string{"sales.main.orders"}, true},
@@ -185,6 +189,9 @@ func TestPragmasAndTransactions(t *testing.T) {
 		if _, _, err := run(e, Request{SQL: q}, nil); err != nil {
 			t.Errorf("%s: %v", q, err)
 		}
+	}
+	if _, _, err := run(e, Request{SQL: "CREATE TABLE \xff(a INT)"}, nil); !isQueryErr(err) {
+		t.Errorf("invalid UTF-8: %v", err)
 	}
 	if _, _, err := run(e, Request{SQL: "BEGIN TRANSACTION"}, nil); !isQueryErr(err) {
 		t.Errorf("BEGIN: %v", err)

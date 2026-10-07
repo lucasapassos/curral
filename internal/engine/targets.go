@@ -1,6 +1,9 @@
 package engine
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 type tokKind int
 
@@ -304,7 +307,7 @@ func writeTargets(q string) (verb string, targets, reads [][]string, ok bool) {
 			depth--
 		} else if depth == 0 && t.kind == tokWord {
 			switch t.up {
-			case "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "CREATE", "DROP", "ALTER", "COPY":
+			case "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "CREATE", "DROP", "ALTER", "COPY", "COMMENT":
 				start = i
 			}
 		}
@@ -366,7 +369,42 @@ func parseTarget(c *cursor) (targets, reads [][]string, ok bool) {
 		if c.accept("IF") && !c.accept("EXISTS") {
 			return nil, nil, false
 		}
-		return one()
+		n, ok := c.name()
+		if !ok {
+			return nil, nil, false
+		}
+		targets = [][]string{n}
+		// RENAME TO creates an object under the new name, in the same
+		// catalog and schema. (RENAME COLUMN/CONSTRAINT do not.)
+		if c.accept("RENAME") && c.accept("TO") {
+			to, ok := c.name()
+			if !ok || len(to) != 1 {
+				return nil, nil, false
+			}
+			targets = append(targets, append(slices.Clone(n[:len(n)-1]), to[0]))
+		}
+		return targets, nil, true
+	case "COMMENT":
+		c.i++
+		if !c.accept("ON") {
+			return nil, nil, false
+		}
+		kind := c.peek().up
+		if !c.accept("TABLE", "VIEW", "SEQUENCE", "MACRO", "COLUMN") {
+			return nil, nil, false // e.g. INDEX: its table is not in the statement
+		}
+		n, ok := c.name()
+		if !ok {
+			return nil, nil, false
+		}
+		if kind == "COLUMN" {
+			// [catalog.][schema.]table.column: the table is what changes.
+			if len(n) < 2 {
+				return nil, nil, false
+			}
+			n = n[:len(n)-1]
+		}
+		return [][]string{n}, nil, true
 	case "CREATE":
 		c.i++
 		if c.accept("OR") && !c.accept("REPLACE") {

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
 
@@ -60,7 +61,8 @@ type Engine struct {
 	opts      Options
 	def       string
 	databases []DatabaseInfo
-	known     map[string]string // lower(name) -> name
+	known     map[string]string // lower(name) -> name, catalog file databases
+	catalogs  map[string]string // lower(name) -> name, every attached catalog (incl. memory, temp, system)
 	schemas   map[string]string // name -> schema used by USE
 	scanFuncs map[string]bool   // table functions that scan attached non-DuckDB catalogs
 	caches    map[string]*catalogcache.Proxy
@@ -112,6 +114,11 @@ func Open(ctx context.Context, cat *config.Catalog, opts Options, log *slog.Logg
 		e.Close()
 		return nil, err
 	}
+	// ATTACH/DETACH are always denied, so this set is fixed from now on.
+	if err := e.loadCatalogs(ctx); err != nil {
+		e.Close()
+		return nil, err
+	}
 	return e, nil
 }
 
@@ -140,6 +147,23 @@ func (e *Engine) startCaches(cat *config.Catalog) (*config.Catalog, error) {
 		e.log.Info("catalog metadata cache enabled", "database", d.Name, "ttl", ttl.String())
 	}
 	return &out, nil
+}
+
+func (e *Engine) loadCatalogs(ctx context.Context) error {
+	rows, err := e.db.QueryContext(ctx, "SELECT database_name FROM duckdb_databases()")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	e.catalogs = map[string]string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		e.catalogs[strings.ToLower(name)] = name
+	}
+	return rows.Err()
 }
 
 // DuckDBVersion returns the embedded DuckDB version.
@@ -330,6 +354,11 @@ func (e *Engine) Query(ctx context.Context, req Request,
 	authorize func(context.Context, Inspection) error,
 	emit func([]Column, Rows) error,
 ) error {
+	if !utf8.ValidString(req.SQL) {
+		// DuckDB would store invalid UTF-8 in object names and comments,
+		// after which its own metadata functions fail for everyone.
+		return &QueryError{errors.New("sql is not valid UTF-8")}
+	}
 	tm := req.Timing
 	if tm == nil {
 		tm = &Timing{}

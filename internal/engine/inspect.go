@@ -188,7 +188,7 @@ func verbMatches(verb string, typ duckdb.StmtType) bool {
 		return typ == duckdb.STATEMENT_TYPE_CREATE || typ == duckdb.STATEMENT_TYPE_CREATE_FUNC
 	case "DROP":
 		return typ == duckdb.STATEMENT_TYPE_DROP
-	case "ALTER":
+	case "ALTER", "COMMENT":
 		return typ == duckdb.STATEMENT_TYPE_ALTER
 	case "COPY":
 		return typ == duckdb.STATEMENT_TYPE_COPY
@@ -223,15 +223,15 @@ func (e *Engine) qualify(parts []string, database string) string {
 	case 1:
 		return database + "." + e.schemas[database] + "." + parts[0]
 	case 2:
-		if name, ok := e.known[strings.ToLower(parts[0])]; ok {
+		// DuckDB reads x.t as catalog x (its main schema) when x is an
+		// attached catalog, else as schema x of the current catalog; when
+		// both exist it refuses the statement as ambiguous.
+		if name, ok := e.catalogs[strings.ToLower(parts[0])]; ok {
 			return name + ".main." + parts[1]
-		}
-		if strings.EqualFold(parts[0], "temp") {
-			return "temp.main." + parts[1]
 		}
 		return database + "." + parts[0] + "." + parts[1]
 	default:
-		if name, ok := e.known[strings.ToLower(parts[0])]; ok {
+		if name, ok := e.catalogs[strings.ToLower(parts[0])]; ok {
 			parts[0] = name
 		}
 		return strings.Join(parts, ".")
