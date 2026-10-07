@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2"
 
+	"curral/internal/audit"
 	"curral/internal/auth"
 	"curral/internal/config"
 	"curral/internal/engine"
@@ -22,6 +24,14 @@ import (
 )
 
 func newServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	ts, _ := newServerWithAudit(t, "")
+	return ts
+}
+
+// newServerWithAudit starts a server; with auditPath set it also writes
+// audit events there.
+func newServerWithAudit(t *testing.T, auditPath string) (*httptest.Server, *audit.Writer) {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("CURRAL_DATA", dir)
@@ -64,10 +74,17 @@ func newServer(t *testing.T) *httptest.Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { eng.Close() })
-	s := &Server{Engine: eng, Auth: auth.New(users, time.Minute), Policy: pol, Log: log, MaxBody: 1 << 20}
+	s := &Server{Engine: eng, Auth: auth.New(users, time.Minute), Policy: pol, Log: log, MaxBody: 1 << 20, Version: "test"}
+	var aw *audit.Writer
+	if auditPath != "" {
+		if aw, err = audit.Open(auditPath, 64, log); err != nil {
+			t.Fatal(err)
+		}
+		s.Audit = aw
+	}
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
-	return ts
+	return ts, aw
 }
 
 type result struct {
@@ -159,4 +176,96 @@ func TestDatabasesAndHealth(t *testing.T) {
 		t.Fatalf("health: %v %v", resp.StatusCode, err)
 	}
 	resp.Body.Close()
+}
+
+func readAudit(t *testing.T, path string) []audit.Event {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []audit.Event
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var ev audit.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("bad line %q: %v", line, err)
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+func TestAuditEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	ts, aw := newServerWithAudit(t, path)
+
+	r1 := do(t, ts, "analyst", `{"sql":"SELECT id FROM orders WHERE amount > 15 AND id <> 99","format":"csv"}`)
+	do(t, ts, "analyst", `{"sql":"SELECT * FROM salaries WHERE name = 'Maria Silva'"}`)
+	do(t, ts, "admin", `{"sql":"ATTACH ':memory:' AS m"}`)
+	do(t, ts, "analyst", `{"sql":"SELEC 1"}`)
+	do(t, ts, "analyst", `{"sql":"SELECT 1", "nope": 1}`)
+	req, _ := http.NewRequest("POST", ts.URL+"/v1/query", strings.NewReader(`{"sql":"SELECT 1"}`))
+	req.SetBasicAuth("analyst", "wrong")
+	resp, _ := http.DefaultClient.Do(req)
+	resp.Body.Close()
+	if err := aw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	evs := readAudit(t, path)
+	if len(evs) != 6 {
+		t.Fatalf("%d events: %+v", len(evs), evs)
+	}
+	ok := evs[0]
+	if ok.Decision != "allow" || ok.DecidedBy != "policy" || ok.Status != 200 || ok.Rows != 1 || ok.Bytes == 0 ||
+		ok.User != "analyst" || ok.RequestID != r1.header.Get("X-Request-Id") || len(ok.PolicySHA256) != 64 ||
+		ok.Resolved == nil || !*ok.Resolved || len(ok.Tables) != 1 || ok.Tables[0] != "sales.main.orders" ||
+		ok.SQL != "SELECT id FROM orders WHERE amount > ? AND id <> ?" || len(ok.SQLSHA256) != 64 ||
+		ok.TimingMS["total"] <= 0 || ok.Version != "test" {
+		t.Errorf("allow event: %+v", ok)
+	}
+	deny := evs[1]
+	if deny.Decision != "deny" || deny.DecidedBy != "policy" || deny.Status != 403 ||
+		strings.Contains(deny.SQL, "Maria") || deny.Tables[0] != "sales.main.salaries" {
+		t.Errorf("policy deny event: %+v", deny)
+	}
+	if e := evs[2]; e.Decision != "deny" || e.DecidedBy != "engine" || e.Status != 403 || e.User != "admin" {
+		t.Errorf("engine deny event: %+v", e)
+	}
+	if e := evs[3]; e.Decision != "error" || e.DecidedBy != "engine" || e.Status != 400 {
+		t.Errorf("syntax error event: %+v", e)
+	}
+	if e := evs[4]; e.Decision != "error" || e.DecidedBy != "request" || e.Status != 400 {
+		t.Errorf("bad request event: %+v", e)
+	}
+	if e := evs[5]; e.Event != "auth_failure" || e.User != "analyst" || e.Decision != "deny" || e.Status != 401 {
+		t.Errorf("auth failure event: %+v", e)
+	}
+	raw, _ := os.ReadFile(path)
+	if strings.Contains(string(raw), "wrong") || strings.Contains(string(raw), "Maria") {
+		t.Error("password or literal leaked into the audit log")
+	}
+}
+
+// With the audit sink failing, nothing executes: the INSERT must not apply.
+func TestAuditFailClosed(t *testing.T) {
+	if _, err := os.Stat("/dev/full"); err != nil {
+		t.Skip("no /dev/full")
+	}
+	ts, aw := newServerWithAudit(t, "/dev/full")
+	defer aw.Close()
+	// The first event fails to write and marks the sink unhealthy.
+	do(t, ts, "analyst", `{"sql":"SELECT 1"}`)
+	deadline := time.Now().Add(2 * time.Second)
+	for aw.Healthy() == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	r := do(t, ts, "etl", `{"sql":"INSERT INTO orders VALUES (99, 1)"}`)
+	if r.status != 503 || !strings.Contains(r.body, "audit") {
+		t.Fatalf("status=%d body=%s", r.status, r.body)
+	}
+	r = do(t, ts, "admin", `{"sql":"SELECT count(*) AS n FROM orders WHERE id = 99"}`)
+	if r.status != 503 {
+		t.Fatalf("read while audit down: %d", r.status)
+	}
 }

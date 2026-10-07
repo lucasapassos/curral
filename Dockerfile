@@ -21,12 +21,13 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 # container boots offline and always gets the same extension builds.
 ARG EXTENSIONS="httpfs avro iceberg"
 RUN /out/curral install-extensions --extension-dir /out/extensions ${EXTENSIONS} \
- && mkdir -p /out/var/lib/curral/tmp
+ && mkdir -p /out/var/lib/curral/tmp /out/var/log/curral
 
 FROM gcr.io/distroless/cc-${DISTROLESS}:nonroot
 COPY --from=build /out/curral /usr/local/bin/curral
 COPY --from=build --chown=nonroot:nonroot /out/extensions /opt/curral/extensions
 COPY --from=build --chown=nonroot:nonroot /out/var/lib/curral /var/lib/curral
+COPY --from=build --chown=nonroot:nonroot /out/var/log/curral /var/log/curral
 WORKDIR /var/lib/curral
 ENV CURRAL_LISTEN=:8080 \
     CURRAL_EXTENSION_DIR=/opt/curral/extensions \

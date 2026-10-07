@@ -32,6 +32,8 @@ services:
       CURRAL_MAX_CONCURRENCY: ${CURRAL_MAX_CONCURRENCY:-8}
       CURRAL_MEMORY_LIMIT: ${CURRAL_MEMORY_LIMIT:-2GB}
       CURRAL_QUERY_TIMEOUT: ${CURRAL_QUERY_TIMEOUT:-60s}
+      CURRAL_AUDIT_LOG: /var/log/curral/audit.jsonl
+      CURRAL_AUDIT_SQL: ${CURRAL_AUDIT_SQL:-redacted}
       R2_CATALOG_URI: ${R2_CATALOG_URI:-${R2_CATALOG_URI:?set R2_CATALOG_URI}}
       R2_WAREHOUSE: ${R2_WAREHOUSE:-${R2_WAREHOUSE:?set R2_WAREHOUSE}}
       R2_TOKEN: ${R2_TOKEN:-${R2_TOKEN:?set R2_TOKEN}}
@@ -39,7 +41,8 @@ services:
       R2_CACHE_TTL: ${R2_CACHE_TTL:-30s}
     volumes:
       - ./examples:/etc/curral:ro
-    # The image's only writable path is DuckDB's spill directory.
+      - audit:/var/log/curral
+    # Writable paths: DuckDB's spill directory (tmpfs) and the audit volume.
     read_only: true
     tmpfs:
       - /var/lib/curral/tmp:uid=65532,gid=65532,mode=0700
@@ -47,3 +50,6 @@ services:
     security_opt: ["no-new-privileges:true"]
     mem_limit: ${CURRAL_CONTAINER_MEMORY:-3g}
     restart: unless-stopped
+
+volumes:
+  audit:

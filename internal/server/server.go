@@ -3,18 +3,31 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 
+	"curral/internal/audit"
 	"curral/internal/auth"
 	"curral/internal/encode"
 	"curral/internal/engine"
 	"curral/internal/policy"
+)
+
+// SQL text modes for audit events.
+const (
+	AuditSQLRedacted = "redacted"
+	AuditSQLFull     = "full"
+	AuditSQLHash     = "hash"
 )
 
 type Server struct {
@@ -24,14 +37,44 @@ type Server struct {
 	Log     *slog.Logger
 	MaxRows int64
 	MaxBody int64
+
+	Audit    *audit.Writer // nil disables auditing
+	AuditSQL string        // redacted (default), full or hash
+	Version  string
 }
+
+// errAudit means the query was refused because it could not be audited.
+var errAudit = errors.New("audit log unavailable: query refused")
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/query", s.authed(s.query))
 	mux.HandleFunc("GET /v1/databases", s.authed(s.databases))
 	mux.HandleFunc("GET /healthz", s.health)
-	return mux
+	return withRequestID(mux)
+}
+
+type ctxKey struct{}
+
+// withRequestID tags every request with an ID, returned in X-Request-Id and
+// used in both operational and audit logs.
+func withRequestID(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := newRequestID()
+		w.Header().Set("X-Request-Id", id)
+		h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, id)))
+	})
+}
+
+func newRequestID() string {
+	var b [8]byte
+	rand.Read(b[:])
+	return fmt.Sprintf("%011x%s", time.Now().UnixMilli(), hex.EncodeToString(b[:]))
+}
+
+func requestID(r *http.Request) string {
+	id, _ := r.Context().Value(ctxKey{}).(string)
+	return id
 }
 
 type handler func(http.ResponseWriter, *http.Request, *auth.Principal)
@@ -46,10 +89,53 @@ func (s *Server) authed(h handler) http.HandlerFunc {
 		if p == nil {
 			w.Header().Set("WWW-Authenticate", `Basic realm="curral", charset="UTF-8"`)
 			writeError(w, http.StatusUnauthorized, "invalid credentials")
-			s.Log.Info("auth failed", "user", user, "remote", r.RemoteAddr)
+			s.Log.Info("auth failed", "user", user, "remote", r.RemoteAddr, "request_id", requestID(r))
+			if s.Audit != nil {
+				ev := s.newEvent(r, "auth_failure", nil)
+				ev.User = user
+				ev.Decision, ev.DecidedBy, ev.Status = "deny", "auth", http.StatusUnauthorized
+				s.Audit.Record(ev)
+			}
 			return
 		}
 		h(w, r, p)
+	}
+}
+
+func (s *Server) newEvent(r *http.Request, kind string, p *auth.Principal) *audit.Event {
+	ev := &audit.Event{
+		TS:           time.Now().UTC(),
+		Event:        kind,
+		RequestID:    requestID(r),
+		RemoteAddr:   r.RemoteAddr,
+		ForwardedFor: r.Header.Get("X-Forwarded-For"),
+		Version:      s.Version,
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		ev.RemoteAddr = host
+	}
+	if s.Policy != nil {
+		ev.PolicySHA256 = s.Policy.SHA256
+	}
+	if p != nil {
+		ev.User, ev.Roles = p.Name, p.Roles
+	}
+	return ev
+}
+
+// setSQL records the statement according to the audit SQL mode. The hash is
+// always kept so a known statement can be matched later.
+func (s *Server) setSQL(ev *audit.Event, sql string) {
+	sum := sha256.Sum256([]byte(sql))
+	ev.SQLSHA256 = hex.EncodeToString(sum[:])
+	switch s.AuditSQL {
+	case AuditSQLFull:
+		ev.SQL = sql
+	case AuditSQLHash:
+	default:
+		if red, ok := engine.RedactSQL(sql); ok {
+			ev.SQL = red
+		}
 	}
 }
 
@@ -60,40 +146,73 @@ type queryRequest struct {
 	Format   string `json:"format"`
 }
 
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(b []byte) (int, error) {
+	n, err := c.w.Write(b)
+	c.n += int64(n)
+	return n, err
+}
+
 func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
 	start := time.Now()
+	ev := s.newEvent(r, "query", p)
+
+	// Requests rejected before anything runs are recorded best-effort.
+	reject := func(status int, msg string) {
+		writeError(w, status, msg)
+		if s.Audit != nil {
+			ev.Decision, ev.DecidedBy, ev.Status, ev.Error = "error", "request", status, msg
+			s.Audit.Record(ev)
+		}
+	}
+
 	var req queryRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, s.MaxBody))
 	dec.UseNumber()
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		reject(http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
+	s.setSQL(ev, req.SQL)
+	ev.ParamsCount = len(req.Params)
+	ev.Database = req.Database
 	if strings.TrimSpace(req.SQL) == "" {
-		writeError(w, http.StatusBadRequest, "sql is required")
+		reject(http.StatusBadRequest, "sql is required")
 		return
 	}
 	params, err := convertParams(req.Params)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		reject(http.StatusBadRequest, err.Error())
 		return
 	}
 	format, ok := pickFormat(req.Format, r)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "unsupported format (csv, json, ndjson)")
+		reject(http.StatusBadRequest, "unsupported format (csv, json, ndjson)")
 		return
 	}
 
 	var (
-		insp    engine.Inspection
-		rows    int64
-		started bool
-		policyE error
+		insp         engine.Inspection
+		rows         int64
+		bytes        countingWriter
+		started      bool
+		policyCalled bool
+		allowed      bool
+		policyE      error
+		auditE       error
+		reservation  *audit.Reservation
+		timing       engine.Timing
 	)
+	bytes.w = w
 	authorize := func(ctx context.Context, i engine.Inspection) error {
 		insp = i
-		allowed, err := s.Policy.Allow(ctx, map[string]any{
+		policyCalled = true
+		ok, err := s.Policy.Allow(ctx, map[string]any{
 			"user":           p.Name,
 			"roles":          p.Roles,
 			"sql":            req.SQL,
@@ -109,8 +228,16 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 			policyE = err
 			return err
 		}
-		if !allowed {
+		if !ok {
 			return engine.ErrForbidden
+		}
+		allowed = true
+		// Fail closed: nothing executes without room to record it.
+		if s.Audit != nil {
+			if reservation, auditE = s.Audit.Reserve(time.Second); auditE != nil {
+				s.Log.Error("query refused: audit unavailable", "request_id", ev.RequestID, "err", auditE)
+				return errAudit
+			}
 		}
 		return nil
 	}
@@ -122,7 +249,7 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		h.Set("Trailer", "X-Curral-Error, X-Curral-Row-Count")
 		w.WriteHeader(http.StatusOK)
 		rc := http.NewResponseController(w)
-		n, err := encode.Write(w, format, cols, rs, encode.Options{
+		n, err := encode.Write(&bytes, format, cols, rs, encode.Options{
 			MaxRows: s.MaxRows,
 			Flush:   func() { _ = rc.Flush() },
 		})
@@ -134,7 +261,7 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		return err
 	}
 
-	err = s.Engine.Query(r.Context(), engine.Request{SQL: req.SQL, Params: params, Database: req.Database}, authorize, emit)
+	err = s.Engine.Query(r.Context(), engine.Request{SQL: req.SQL, Params: params, Database: req.Database, Timing: &timing}, authorize, emit)
 
 	status := http.StatusOK
 	if err != nil && !started {
@@ -148,8 +275,9 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		}
 		writeError(w, status, msg)
 	}
+
 	attrs := []any{
-		"user", p.Name, "status", status, "type", insp.StatementType,
+		"request_id", ev.RequestID, "user", p.Name, "status", status, "type", insp.StatementType,
 		"databases", insp.Databases, "rows", rows, "format", format,
 		"duration", time.Since(start),
 	}
@@ -157,6 +285,58 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		attrs = append(attrs, "err", err)
 	}
 	s.Log.Info("query", attrs...)
+
+	if s.Audit == nil {
+		return
+	}
+	if insp.StatementType != "" {
+		ev.StatementType = insp.StatementType
+		ev.Database = insp.Database
+		ev.Tables, ev.Targets, ev.Functions = insp.Tables, insp.Targets, insp.Functions
+		resolved := insp.Resolved
+		ev.Resolved = &resolved
+	}
+	ev.Status, ev.Rows, ev.Bytes = status, rows, bytes.n
+	if err != nil {
+		ev.Error = oneLine(err.Error())
+	}
+	ev.Decision, ev.DecidedBy = decisionOf(err, allowed, policyCalled, policyE, auditE)
+	ev.TimingMS = map[string]float64{
+		"queue":     ms(timing.Queue),
+		"inspect":   ms(timing.Inspect),
+		"authorize": ms(timing.Authorize),
+		"execute":   ms(timing.Execute),
+		"total":     ms(time.Since(start)),
+	}
+	if reservation != nil {
+		reservation.Write(ev)
+	} else {
+		s.Audit.Record(ev)
+	}
+}
+
+// decisionOf classifies the outcome for the audit log: whether the request
+// was allowed, denied or failed, and which component decided.
+func decisionOf(err error, allowed, policyCalled bool, policyE, auditE error) (decision, by string) {
+	switch {
+	case auditE != nil:
+		return "error", "audit"
+	case allowed:
+		return "allow", "policy" // execution errors are in the error field
+	case policyE != nil:
+		return "error", "policy"
+	case policyCalled:
+		return "deny", "policy"
+	case errors.Is(err, engine.ErrForbidden):
+		return "deny", "engine"
+	case errors.Is(err, engine.ErrBusy):
+		return "error", "queue"
+	}
+	return "error", "engine"
+}
+
+func ms(d time.Duration) float64 {
+	return float64(d.Microseconds()) / 1000
 }
 
 func statusOf(err, policyErr error) int {
@@ -166,7 +346,7 @@ func statusOf(err, policyErr error) int {
 		return http.StatusInternalServerError
 	case errors.Is(err, engine.ErrForbidden):
 		return http.StatusForbidden
-	case errors.Is(err, engine.ErrBusy):
+	case errors.Is(err, engine.ErrBusy), errors.Is(err, errAudit):
 		return http.StatusServiceUnavailable
 	case errors.Is(err, context.DeadlineExceeded):
 		return http.StatusGatewayTimeout

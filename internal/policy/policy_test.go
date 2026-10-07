@@ -60,6 +60,20 @@ func TestExamplePolicy(t *testing.T) {
 	}
 }
 
+func TestPolicyHash(t *testing.T) {
+	a, b := load(t), load(t)
+	if len(a.SHA256) != 64 || a.SHA256 != b.SHA256 {
+		t.Fatalf("hash %q vs %q", a.SHA256, b.SHA256)
+	}
+	c, err := Load(context.Background(), "data.curral.allow", []string{"../../examples/policy.rego", "../../examples/roles.r2.json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SHA256 == a.SHA256 {
+		t.Fatal("different data files must hash differently")
+	}
+}
+
 func TestLoadErrors(t *testing.T) {
 	if _, err := Load(context.Background(), "data.curral.allow", nil); err == nil {
 		t.Fatal("expected error without files")

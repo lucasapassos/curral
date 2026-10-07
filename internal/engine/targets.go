@@ -9,6 +9,7 @@ const (
 	tokQuoted                // "quoted identifier"
 	tokString                // 'string'
 	tokPunct                 // single char
+	tokNumber                // numeric literal
 	tokOther
 )
 
@@ -17,6 +18,7 @@ type token struct {
 	text string // identifier text (unquoted) or punct char
 	up   string // upper-cased text for bare words
 	pos  int    // byte offset of the token start
+	end  int    // byte offset just past the token
 }
 
 // tokenize is a minimal SQL lexer: enough to find statement keywords and
@@ -47,7 +49,13 @@ func tokenize(s string) (out []token, ok bool) {
 				return out, false // nested comment
 			}
 			i += end + 4
-		case c == '$' && (i+1 >= len(s) || !(s[i+1] >= '0' && s[i+1] <= '9')) && dollarQuote(s[i:]):
+		case c == '$' && i+1 < len(s) && s[i+1] >= '0' && s[i+1] <= '9':
+			// Positional parameter $1: not a literal.
+			start := i
+			for i++; i < len(s) && s[i] >= '0' && s[i] <= '9'; i++ {
+			}
+			out = append(out, token{kind: tokOther, text: s[start:i], pos: start, end: i})
+		case c == '$' && dollarQuote(s[i:]):
 			return out, false
 		case c == '\'' || c == '"':
 			if c == '\'' && len(out) > 0 {
@@ -81,23 +89,88 @@ func tokenize(s string) (out []token, ok bool) {
 			if c == '\'' {
 				k = tokString
 			}
-			out = append(out, token{kind: k, text: b.String(), pos: start})
+			out = append(out, token{kind: k, text: b.String(), pos: start, end: i})
 		case isWordByte(c):
 			start := i
 			for i < len(s) && (isWordByte(s[i]) || (s[i] >= '0' && s[i] <= '9') || s[i] == '$') {
 				i++
 			}
 			w := s[start:i]
-			out = append(out, token{kind: tokWord, text: w, up: strings.ToUpper(w), pos: start})
+			out = append(out, token{kind: tokWord, text: w, up: strings.ToUpper(w), pos: start, end: i})
+		case c >= '0' && c <= '9' || (c == '.' && i+1 < len(s) && s[i+1] >= '0' && s[i+1] <= '9'):
+			start := i
+			i = scanNumber(s, i)
+			out = append(out, token{kind: tokNumber, text: s[start:i], pos: start, end: i})
 		case strings.IndexByte("().,;", c) >= 0:
-			out = append(out, token{kind: tokPunct, text: string(c), pos: i})
+			out = append(out, token{kind: tokPunct, text: string(c), pos: i, end: i + 1})
 			i++
 		default:
-			out = append(out, token{kind: tokOther, text: string(c), pos: i})
+			out = append(out, token{kind: tokOther, text: string(c), pos: i, end: i + 1})
 			i++
 		}
 	}
 	return out, ok
+}
+
+// scanNumber returns the end of the numeric literal starting at i:
+// digits, an optional fraction, an optional exponent, and _ separators.
+func scanNumber(s string, i int) int {
+	digits := func() {
+		for i < len(s) && (s[i] >= '0' && s[i] <= '9' || s[i] == '_') {
+			i++
+		}
+	}
+	if strings.HasPrefix(s[i:], "0x") || strings.HasPrefix(s[i:], "0X") {
+		i += 2
+		for i < len(s) && strings.IndexByte("0123456789abcdefABCDEF_", s[i]) >= 0 {
+			i++
+		}
+		return i
+	}
+	digits()
+	if i < len(s) && s[i] == '.' {
+		i++
+		digits()
+	}
+	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		j := i + 1
+		if j < len(s) && (s[j] == '+' || s[j] == '-') {
+			j++
+		}
+		if j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			i = j
+			digits()
+		}
+	}
+	return i
+}
+
+// RedactSQL replaces string and numeric literals with ? and drops comments,
+// keeping the statement's shape for audit logs without the values (which may
+// be personal data). ok is false when the SQL uses constructs the tokenizer
+// cannot read safely; callers should then log only a hash.
+func RedactSQL(q string) (string, bool) {
+	toks, ok := tokenize(q)
+	if !ok {
+		return "", false
+	}
+	var b strings.Builder
+	prev := 0
+	for _, t := range toks {
+		gap := q[prev:t.pos]
+		if strings.TrimSpace(gap) != "" {
+			gap = " " // a comment: drop it
+		}
+		b.WriteString(gap)
+		switch t.kind {
+		case tokString, tokNumber:
+			b.WriteByte('?')
+		default:
+			b.WriteString(q[t.pos:t.end])
+		}
+		prev = t.end
+	}
+	return strings.TrimSpace(b.String()), true
 }
 
 // dollarQuote reports whether s starts a dollar-quoted string: $$ or $tag$.

@@ -21,6 +21,7 @@ import (
 	_ "github.com/duckdb/duckdb-go/v2"
 	"golang.org/x/term"
 
+	"curral/internal/audit"
 	"curral/internal/auth"
 	"curral/internal/config"
 	"curral/internal/engine"
@@ -105,6 +106,9 @@ type serveFlags struct {
 	externalAccess bool
 	allowedPaths   listFlag
 	authCacheTTL   time.Duration
+	auditLog       string
+	auditSQL       string
+	auditQueue     int
 	logLevel       string
 	logFormat      string
 }
@@ -130,6 +134,9 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.BoolVar(&f.externalAccess, "external-access", false, "keep enable_external_access on (lets queries read files/URLs)")
 	fs.Var(&f.allowedPaths, "allowed-path", "path or URL prefix still reachable with external access off (repeatable)")
 	fs.DurationVar(&f.authCacheTTL, "auth-cache-ttl", 5*time.Minute, "cache successful password checks for this long (0 = off)")
+	fs.StringVar(&f.auditLog, "audit-log", "", "audit log file (JSON lines), '-' for stdout; empty disables auditing. Queries are refused while it cannot be written; SIGHUP reopens it")
+	fs.StringVar(&f.auditSQL, "audit-sql", server.AuditSQLRedacted, "SQL text in audit events: redacted (literals become ?), full or hash")
+	fs.IntVar(&f.auditQueue, "audit-queue", 4096, "audit events buffered in memory")
 	fs.StringVar(&f.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.StringVar(&f.logFormat, "log-format", "text", "text or json")
 
@@ -151,6 +158,11 @@ func parseFlags(args []string) (*serveFlags, error) {
 	}
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required flags: %s", strings.Join(missing, ", "))
+	}
+	switch f.auditSQL {
+	case server.AuditSQLRedacted, server.AuditSQLFull, server.AuditSQLHash:
+	default:
+		return nil, fmt.Errorf("--audit-sql must be redacted, full or hash")
 	}
 	return f, nil
 }
@@ -258,13 +270,37 @@ func runServe(args []string, checkOnly bool) error {
 		return nil
 	}
 
+	var aw *audit.Writer
+	if f.auditLog != "" {
+		if aw, err = audit.Open(f.auditLog, f.auditQueue, log); err != nil {
+			return fmt.Errorf("audit log: %w", err)
+		}
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		go func() {
+			for range hup {
+				if err := aw.Reopen(); err != nil {
+					log.Error("audit log reopen failed", "err", err)
+				} else {
+					log.Info("audit log reopened")
+				}
+			}
+		}()
+		log.Info("audit log enabled", "path", f.auditLog, "sql", f.auditSQL)
+	} else {
+		log.Warn("audit log disabled (--audit-log not set)")
+	}
+
 	srv := &server.Server{
-		Engine:  eng,
-		Auth:    auth.New(users, f.authCacheTTL),
-		Policy:  pol,
-		Log:     log,
-		MaxRows: f.maxRows,
-		MaxBody: f.maxBody,
+		Engine:   eng,
+		Auth:     auth.New(users, f.authCacheTTL),
+		Policy:   pol,
+		Log:      log,
+		MaxRows:  f.maxRows,
+		MaxBody:  f.maxBody,
+		Audit:    aw,
+		AuditSQL: f.auditSQL,
+		Version:  version,
 	}
 	httpSrv := &http.Server{
 		Addr:              f.listen,
@@ -273,17 +309,24 @@ func runServe(args []string, checkOnly bool) error {
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- httpSrv.ListenAndServe() }()
-	log.Info("curral listening", "addr", f.listen, "databases", dbs, "max_concurrency", f.maxConcurrency)
+	log.Info("curral listening", "addr", f.listen, "databases", dbs, "max_concurrency", f.maxConcurrency,
+		"version", version, "policy_sha256", pol.SHA256)
 
 	select {
-	case err := <-errc:
-		return err
+	case err = <-errc:
 	case <-ctx.Done():
+		log.Info("shutting down")
+		shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		err = httpSrv.Shutdown(shutCtx)
 	}
-	log.Info("shutting down")
-	shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	return httpSrv.Shutdown(shutCtx)
+	// After HTTP shutdown no handler can still write events.
+	if aw != nil {
+		if cerr := aw.Close(); cerr != nil {
+			log.Error("audit log close", "err", cerr)
+		}
+	}
+	return err
 }
 
 // Set at build time: -ldflags "-X main.version=... -X main.commit=..."

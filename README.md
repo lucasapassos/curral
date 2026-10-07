@@ -70,6 +70,9 @@ vírgula: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--external-access` | false | mantém `enable_external_access` ligado |
 | `--allowed-path` | | prefixo (diretório ou `s3://bucket/`) liberado com acesso externo desligado, repetível |
 | `--auth-cache-ttl` | 5m | cache de senhas já verificadas |
+| `--audit-log` | (desligado) | arquivo JSONL de auditoria; `-` = stdout; `SIGHUP` reabre |
+| `--audit-sql` | `redacted` | texto do SQL na auditoria: `redacted`, `full` ou `hash` |
+| `--audit-queue` | 4096 | eventos em memória aguardando escrita |
 
 ## Catálogo
 
@@ -162,6 +165,34 @@ source .env.r2 && go test ./internal/engine -run R2 -v
 - **Erros antes do stream**: `{"error": "..."}` com 400 (SQL inválido), 401, 403, 499 (cliente desconectou), 503 (fila cheia) ou 504 (timeout).
 
 Outros endpoints: `GET /v1/databases` (autenticado) e `GET /healthz`.
+
+## Auditoria
+
+Com `--audit-log`, cada request gera uma linha JSON num arquivo próprio,
+separado do log operacional. Falhas de autenticação e negações também geram
+evento.
+
+```json
+{"ts":"...","event":"query","request_id":"1a1147f8f9b0...","user":"analyst","roles":["analyst"],
+ "remote_addr":"10.0.0.7","database":"sales","statement_type":"SELECT",
+ "sql":"SELECT count(*) FROM orders WHERE amount > ?","sql_sha256":"...","params_count":0,
+ "tables":["sales.main.orders"],"resolved":true,"decision":"allow","decided_by":"policy",
+ "policy_sha256":"...","status":200,"rows":1,"bytes":42,
+ "timing_ms":{"queue":0,"inspect":1.2,"authorize":0.25,"execute":1.7,"total":3.3},
+ "curral_version":"0.2.0"}
+```
+
+- **`decision`** pode ser `allow`, `deny` ou `error`. **`decided_by`** indica quem decidiu: `policy`, `engine` (ATTACH, multi-statement, SQL inválido), `auth`, `queue`, `audit` ou `request`.
+- **`policy_sha256`** é o hash dos arquivos de política, para provar qual versão da regra decidiu.
+- **`request_id`** também volta no header `X-Request-Id` e aparece no log operacional.
+- **SQL:** por padrão, literais viram `?`, porque podem conter dados pessoais. Se o SQL usar construções que o tokenizer não lê com segurança, fica só o `sql_sha256`. Os valores de `params` nunca são registrados, só a contagem. Senhas nunca aparecem.
+- **Fail-closed:** antes de executar, o curral reserva espaço na fila de auditoria. Se o arquivo não puder ser escrito (disco cheio, permissão) ou a fila estiver cheia, a query responde **503** e não executa. A recuperação é verificada a cada 5 s gravando um evento `audit_recovered`.
+- **Rotação:** mova o arquivo e envie `SIGHUP` (`copytruncate` não é necessário). O arquivo novo começa com um evento `audit_reopened`.
+- **Custo:** imperceptível nas medições (escrita assíncrona em lote).
+
+Limitação: um crash do processo entre o commit de uma escrita e a gravação do
+evento pode perder esse evento. A reserva prévia cobre disco cheio e falhas
+de permissão, mas não queda do processo.
 
 ## Política (input)
 

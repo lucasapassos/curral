@@ -255,7 +255,16 @@ func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) 
 type Request struct {
 	SQL      string
 	Params   []any
-	Database string // catalog to USE; empty means the default
+	Database string  // catalog to USE; empty means the default
+	Timing   *Timing // filled in when not nil
+}
+
+// Timing breaks a request's time down by stage.
+type Timing struct {
+	Queue     time.Duration // waiting for a concurrency slot
+	Inspect   time.Duration // connection, prepare and inspection
+	Authorize time.Duration // the authorize callback
+	Execute   time.Duration // execution, streaming and commit
 }
 
 // Inspection is what authorization gets to see before anything executes.
@@ -296,10 +305,23 @@ func (e *Engine) Query(ctx context.Context, req Request,
 	authorize func(context.Context, Inspection) error,
 	emit func([]Column, Rows) error,
 ) error {
-	if err := e.acquire(ctx); err != nil {
+	tm := req.Timing
+	if tm == nil {
+		tm = &Timing{}
+	}
+	mark := time.Now()
+	lap := func(d *time.Duration) {
+		now := time.Now()
+		*d += now.Sub(mark)
+		mark = now
+	}
+	err := e.acquire(ctx)
+	lap(&tm.Queue)
+	if err != nil {
 		return err
 	}
 	defer func() { <-e.sem }()
+	defer lap(&tm.Execute)
 
 	if e.opts.QueryTimeout > 0 {
 		var cancel context.CancelFunc
@@ -366,10 +388,13 @@ func (e *Engine) Query(ctx context.Context, req Request,
 		}
 
 		insp, err := e.inspect(ctx, c, typ, req.SQL, args, database)
+		lap(&tm.Inspect)
 		if err != nil {
 			return err
 		}
-		if err := authorize(ctx, insp); err != nil {
+		err = authorize(ctx, insp)
+		lap(&tm.Authorize)
+		if err != nil {
 			return err
 		}
 

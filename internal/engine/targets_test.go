@@ -88,3 +88,21 @@ func TestUnhandledTypesUnresolved(t *testing.T) {
 		t.Errorf("UPDATE EXTENSIONS: %v", err)
 	}
 }
+
+func TestRedactSQL(t *testing.T) {
+	cases := map[string]string{
+		"SELECT * FROM t WHERE cpf = '123.456.789-00' AND age > 42":                  "SELECT * FROM t WHERE cpf = ? AND age > ?",
+		"SELECT \"col 1\", x.y FROM t2 -- secret note\nWHERE v IN (1.5e3, .5, 0x1F)": "SELECT \"col 1\", x.y FROM t2 WHERE v IN (?, ?, ?)",
+		"SELECT /* 999 */ a1, $1, $name FROM t":                                      "SELECT a1, $1, $name FROM t",
+		"INSERT INTO t VALUES ('it''s', -7)":                                         "INSERT INTO t VALUES (?, -?)",
+	}
+	for in, want := range cases {
+		got, ok := RedactSQL(in)
+		if !ok || got != want {
+			t.Errorf("%q\n got %q\nwant %q", in, got, want)
+		}
+	}
+	if _, ok := RedactSQL("SELECT $$ secret $$"); ok {
+		t.Error("dollar-quoted SQL must not be redacted")
+	}
+}
