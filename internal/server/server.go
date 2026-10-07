@@ -40,6 +40,7 @@ type Server struct {
 	MaxBody int64
 
 	Metrics  *metrics.Metrics // nil disables metrics
+	OIDC     *auth.OIDC       // nil disables bearer JWTs
 	Audit    *audit.Writer    // nil disables auditing
 	AuditSQL string           // redacted (default), full or hash
 	Version  string
@@ -115,19 +116,19 @@ type handler func(http.ResponseWriter, *http.Request, *auth.Principal)
 
 func (s *Server) authed(h handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		user, pass, ok := r.BasicAuth()
-		var p *auth.Principal
-		if ok {
-			p = s.authn.Load().Authenticate(user, pass)
-		}
+		p, method, user, reason := s.authenticate(r)
 		if p == nil {
 			w.Header().Set("WWW-Authenticate", `Basic realm="curral", charset="UTF-8"`)
+			if s.OIDC != nil {
+				w.Header().Add("WWW-Authenticate", `Bearer realm="curral"`)
+			}
 			writeError(w, http.StatusUnauthorized, "invalid credentials")
-			s.Log.Info("auth failed", "user", user, "remote", r.RemoteAddr, "request_id", requestID(r))
-			s.Metrics.AuthFailure()
+			s.Log.Info("auth failed", "method", method, "user", user, "reason", reason,
+				"remote", r.RemoteAddr, "request_id", requestID(r))
+			s.Metrics.AuthFailure(method)
 			if s.Audit != nil {
 				ev := s.newEvent(r, "auth_failure", nil)
-				ev.User = user
+				ev.User, ev.AuthMethod, ev.Error = user, method, reason
 				ev.Decision, ev.DecidedBy, ev.Status = "deny", "auth", http.StatusUnauthorized
 				s.Audit.Record(ev)
 			}
@@ -135,6 +136,44 @@ func (s *Server) authed(h handler) http.HandlerFunc {
 		}
 		h(w, r, p)
 	}
+}
+
+// authenticate picks the method from the Authorization header: Basic for
+// local users, "Bearer curral_..." for API keys, any other Bearer for OIDC
+// JWTs. On failure it returns the attempted method, the claimed user (if
+// any) and a reason for the logs; the client only ever sees 401.
+func (s *Server) authenticate(r *http.Request) (p *auth.Principal, method, user, reason string) {
+	h := r.Header.Get("Authorization")
+	scheme, cred, _ := strings.Cut(h, " ")
+	cred = strings.TrimSpace(cred)
+	switch {
+	case h == "":
+		return nil, "none", "", "no credentials"
+	case strings.EqualFold(scheme, "Basic"):
+		user, pass, ok := r.BasicAuth()
+		if !ok {
+			return nil, auth.MethodBasic, "", "malformed basic credentials"
+		}
+		if p = s.authn.Load().Authenticate(user, pass); p == nil {
+			return nil, auth.MethodBasic, user, "wrong user or password"
+		}
+		return p, auth.MethodBasic, user, ""
+	case strings.EqualFold(scheme, "Bearer") && strings.HasPrefix(cred, auth.APIKeyPrefix):
+		if p = s.authn.Load().AuthenticateAPIKey(cred); p == nil {
+			return nil, auth.MethodAPIKey, "", "unknown or expired api key"
+		}
+		return p, auth.MethodAPIKey, p.Name, ""
+	case strings.EqualFold(scheme, "Bearer"):
+		if s.OIDC == nil {
+			return nil, auth.MethodJWT, "", "jwt authentication not configured"
+		}
+		p, err := s.OIDC.Authenticate(cred)
+		if err != nil {
+			return nil, auth.MethodJWT, "", oneLine(err.Error())
+		}
+		return p, auth.MethodJWT, p.Name, ""
+	}
+	return nil, "unknown", "", "unsupported authorization scheme"
 }
 
 func (s *Server) newEvent(r *http.Request, kind string, p *auth.Principal) *audit.Event {
@@ -153,7 +192,7 @@ func (s *Server) newEvent(r *http.Request, kind string, p *auth.Principal) *audi
 		ev.PolicySHA256 = pol.SHA256
 	}
 	if p != nil {
-		ev.User, ev.Roles = p.Name, p.Roles
+		ev.User, ev.Roles, ev.AuthMethod = p.Name, p.Roles, p.Method
 	}
 	return ev
 }

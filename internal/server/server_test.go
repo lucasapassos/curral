@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"database/sql"
 	"encoding/json"
 	"io"
@@ -16,6 +18,9 @@ import (
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/lestrrat-go/jwx/v3/jwa"
+	"github.com/lestrrat-go/jwx/v3/jwk"
+	"github.com/lestrrat-go/jwx/v3/jwt"
 
 	"curral/internal/audit"
 	"curral/internal/auth"
@@ -214,7 +219,7 @@ func TestAuditEvents(t *testing.T) {
 	do(t, ts, "analyst", `{"sql":"SELEC 1"}`)
 	do(t, ts, "analyst", `{"sql":"SELECT 1", "nope": 1}`)
 	req, _ := http.NewRequest("POST", ts.URL+"/v1/query", strings.NewReader(`{"sql":"SELECT 1"}`))
-	req.SetBasicAuth("analyst", "wrong")
+	req.SetBasicAuth("analyst", "s3cret-typo-91")
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
 	if err := aw.Close(); err != nil {
@@ -251,7 +256,7 @@ func TestAuditEvents(t *testing.T) {
 		t.Errorf("auth failure event: %+v", e)
 	}
 	raw, _ := os.ReadFile(path)
-	if strings.Contains(string(raw), "wrong") || strings.Contains(string(raw), "Maria") {
+	if strings.Contains(string(raw), "s3cret-typo-91") || strings.Contains(string(raw), "Maria") {
 		t.Error("password or literal leaked into the audit log")
 	}
 }
@@ -303,7 +308,7 @@ func TestMetrics(t *testing.T) {
 		`curral_queries_total{decided_by="request",decision="error",statement_type="none",status="400"} 1`,
 		`curral_policy_decisions_total{decision="allow",role="analyst"} 2`,
 		`curral_policy_decisions_total{decision="deny",role="analyst"} 1`,
-		`curral_auth_failures_total 1`,
+		`curral_auth_failures_total{method="none"} 1`,
 		`curral_rows_returned_total 4`,
 		`curral_query_slots 4`,
 		`curral_queries_running 0`,
@@ -487,5 +492,94 @@ limits := {"timeout": "soon"}
 	}
 	if !limited {
 		t.Fatal("limits missing from audit events")
+	}
+}
+
+func TestAPIKeyAndJWT(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	ts, aw := newServerWithAudit(t, path)
+	s := lastServer
+
+	// API key for the etl role, reloaded like any users-file change.
+	key, hash, _ := auth.NewAPIKey()
+	users, _ := config.LoadUsers("../../examples/users.yaml")
+	users.APIKeys = []config.APIKey{{Name: "etl-job", KeyHash: hash, Roles: []string{"etl"}}}
+	s.SetAuth(auth.New(users, time.Minute))
+
+	// OIDC provider issuing analyst tokens.
+	raw, _ := rsa.GenerateKey(rand.Reader, 2048)
+	priv, _ := jwk.Import(raw)
+	priv.Set(jwk.KeyIDKey, "k1")
+	priv.Set(jwk.AlgorithmKey, jwa.RS256())
+	pub, _ := priv.PublicKey()
+	set := jwk.NewSet()
+	set.AddKey(pub)
+	mux := http.NewServeMux()
+	idp := httptest.NewServer(mux)
+	defer idp.Close()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"issuer": idp.URL, "jwks_uri": idp.URL + "/jwks"})
+	})
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) { json.NewEncoder(w).Encode(set) })
+	o, err := auth.NewOIDC(context.Background(), auth.OIDCConfig{Issuer: idp.URL, Audience: "curral", UserClaim: "email", RolesClaim: "groups"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _ := jwt.NewBuilder().Issuer(idp.URL).Audience([]string{"curral"}).Subject("x").
+		Expiration(time.Now().Add(time.Hour)).Build()
+	tok.Set("email", "ana@example.com")
+	tok.Set("groups", []string{"analyst"})
+	signed, _ := jwt.Sign(tok, jwt.WithKey(jwa.RS256(), priv))
+
+	bearer := func(cred, body string) result {
+		req, _ := http.NewRequest("POST", ts.URL+"/v1/query", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+cred)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return result{resp.StatusCode, string(b), resp.Header, resp.Trailer}
+	}
+
+	if r := bearer(string(signed), `{"sql":"SELECT 1"}`); r.status != 401 {
+		t.Fatalf("jwt without OIDC configured: %d", r.status)
+	}
+	s.OIDC = o
+
+	cases := []struct {
+		cred, sql string
+		status    int
+	}{
+		{key, "INSERT INTO orders VALUES (3, 1)", 200},
+		{key, "INSERT INTO logs.events VALUES (9)", 403},
+		{key + "x", "SELECT 1", 401},
+		{string(signed), "SELECT id FROM orders", 200},
+		{string(signed), "SELECT * FROM salaries", 403},
+		{string(signed) + "x", "SELECT 1", 401},
+		{"not-a-token", "SELECT 1", 401},
+	}
+	for _, c := range cases {
+		if r := bearer(c.cred, `{"sql":"`+c.sql+`"}`); r.status != c.status {
+			t.Errorf("%.20s… %s: %d %s", c.cred, c.sql, r.status, r.body)
+		}
+	}
+
+	aw.Close()
+	methods := map[string]int{}
+	for _, ev := range readAudit(t, path) {
+		if ev.Event == "query" {
+			methods[ev.AuthMethod+"/"+ev.User]++
+		}
+		if ev.Event == "auth_failure" {
+			methods["fail/"+ev.AuthMethod]++
+		}
+	}
+	want := map[string]int{"api_key/etl-job": 2, "jwt/ana@example.com": 2, "fail/api_key": 1, "fail/jwt": 3}
+	for k, v := range want {
+		if methods[k] != v {
+			t.Errorf("audit %s = %d, want %d (all: %v)", k, methods[k], v, methods)
+		}
 	}
 }

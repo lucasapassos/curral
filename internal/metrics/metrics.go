@@ -29,7 +29,7 @@ type Metrics struct {
 	stage     *prometheus.HistogramVec
 	rows      prometheus.Counter
 	bytes     prometheus.Counter
-	authFail  prometheus.Counter
+	authFail  *prometheus.CounterVec
 	reloads   *prometheus.CounterVec
 	policy    *policyCollector
 }
@@ -75,9 +75,9 @@ func New(src Sources) *Metrics {
 		bytes: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "curral_response_bytes_total", Help: "Result bytes sent to clients.",
 		}),
-		authFail: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "curral_auth_failures_total", Help: "Requests rejected for invalid credentials.",
-		}),
+		authFail: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "curral_auth_failures_total", Help: "Requests rejected for invalid credentials, by attempted method.",
+		}, []string{"method"}),
 		reloads: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "curral_config_reloads_total", Help: "Users/policy reloads (SIGHUP) by result (ok, error).",
 		}, []string{"result"}),
@@ -204,9 +204,9 @@ func (m *Metrics) Reload(result string) {
 	}
 }
 
-func (m *Metrics) AuthFailure() {
+func (m *Metrics) AuthFailure(method string) {
 	if m != nil {
-		m.authFail.Inc()
+		m.authFail.WithLabelValues(method).Inc()
 	}
 }
 

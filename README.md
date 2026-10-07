@@ -71,6 +71,9 @@ vírgula: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--external-access` | false | mantém `enable_external_access` ligado |
 | `--allowed-path` | | prefixo (diretório ou `s3://bucket/`) liberado com acesso externo desligado, repetível |
 | `--auth-cache-ttl` | 5m | cache de senhas já verificadas |
+| `--oidc-issuer` / `--oidc-audience` | (desligado) | aceita JWTs desse provedor OIDC; a audience é obrigatória |
+| `--oidc-user-claim` / `--oidc-roles-claim` | `sub` / `roles` | claims de usuário e roles (aceita caminho com ponto: `realm_access.roles`) |
+| `--oidc-skew` | 30s | tolerância de relógio para `exp`/`nbf` |
 | `--audit-log` | (desligado) | arquivo JSONL de auditoria; `-` = stdout; `SIGHUP` reabre |
 | `--audit-sql` | `redacted` | texto do SQL na auditoria: `redacted`, `full` ou `hash` |
 | `--audit-queue` | 4096 | eventos em memória aguardando escrita |
@@ -167,6 +170,31 @@ source .env.r2 && go test ./internal/engine -run R2 -v
 - **Erros antes do stream**: `{"error": "..."}` com 400 (SQL inválido), 401, 403, 499 (cliente desconectou), 503 (fila cheia) ou 504 (timeout).
 
 Outros endpoints: `GET /v1/databases` (autenticado) e `GET /healthz`.
+
+## Autenticação
+
+Três métodos, escolhidos pelo header `Authorization`:
+
+| Header | Método | Origem das roles |
+|---|---|---|
+| `Basic base64(user:senha)` | usuário local (bcrypt, com cache) | `users[].roles` no arquivo de usuários |
+| `Bearer curral_...` | API key de serviço | `api_keys[].roles` no arquivo de usuários |
+| `Bearer <JWT>` | token OIDC (Keycloak, Auth0, Entra, Google...) | claim `--oidc-roles-claim` |
+
+- **API keys**: `curral gen-api-key etl-job etl` mostra a chave **uma vez** e a
+  entrada para o arquivo. O arquivo guarda só o SHA-256 da chave. `expires` é
+  opcional. Como usuários, as API keys recarregam com `SIGHUP`.
+- **JWT**:
+  - **Boot:** o curral faz a descoberta OIDC e baixa o JWKS. Se o provedor estiver inacessível, o boot falha.
+  - **Chaves:** o JWKS é atualizado em segundo plano.
+  - **Validação:** assinatura, `iss`, `aud`, `exp` e `nbf`. Tokens sem assinatura (`alg: none`) ou de outra chave são recusados.
+  - **Roles:** a claim pode ser uma lista ou uma string separada por espaços (ex.: `scope`).
+- **Rastreio:** a auditoria registra `auth_method` (`basic`, `api_key`, `jwt`). `curral_auth_failures_total{method}` separa as falhas por método, e o log operacional traz o motivo. O cliente recebe sempre só 401.
+
+```sh
+curral serve ... --oidc-issuer https://sso.example.com/realms/main --oidc-audience curral \
+  --oidc-user-claim preferred_username --oidc-roles-claim realm_access.roles
+```
 
 ## Auditoria
 

@@ -93,7 +93,28 @@ func lookupFold(m map[string]any, key string) any {
 
 // Users is the content of the users file.
 type Users struct {
-	Users []User `yaml:"users"`
+	Users   []User   `yaml:"users"`
+	APIKeys []APIKey `yaml:"api_keys"`
+}
+
+// APIKey authenticates a service with "Authorization: Bearer curral_...".
+// Only the SHA-256 of the key is stored (generate with curral gen-api-key).
+type APIKey struct {
+	Name    string   `yaml:"name"`
+	KeyHash string   `yaml:"key_sha256"`
+	Roles   []string `yaml:"roles"`
+	Expires string   `yaml:"expires"` // optional, RFC 3339 or YYYY-MM-DD
+}
+
+// ExpiresAt parses Expires; zero means no expiry.
+func (k APIKey) ExpiresAt() (time.Time, error) {
+	if k.Expires == "" {
+		return time.Time{}, nil
+	}
+	if t, err := time.Parse(time.RFC3339, k.Expires); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.DateOnly, k.Expires)
 }
 
 type User struct {
@@ -238,6 +259,19 @@ func LoadUsers(path string) (*Users, error) {
 			return nil, fmt.Errorf("%s: duplicate user %q", path, usr.Name)
 		}
 		seen[usr.Name] = true
+	}
+	keys := map[string]bool{}
+	for _, k := range u.APIKeys {
+		if k.Name == "" || len(k.KeyHash) != 64 || strings.Trim(strings.ToLower(k.KeyHash), "0123456789abcdef") != "" {
+			return nil, fmt.Errorf("%s: api key %q needs a name and a 64-hex key_sha256", path, k.Name)
+		}
+		if seen[k.Name] || keys[k.Name] {
+			return nil, fmt.Errorf("%s: duplicate name %q", path, k.Name)
+		}
+		keys[k.Name] = true
+		if _, err := k.ExpiresAt(); err != nil {
+			return nil, fmt.Errorf("%s: api key %q: invalid expires %q", path, k.Name, k.Expires)
+		}
 	}
 	return &u, nil
 }

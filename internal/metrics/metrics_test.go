@@ -58,5 +58,5 @@ func TestPolicyDecisionsPerRole(t *testing.T) {
 	}
 	var nilM *Metrics
 	nilM.ObserveQuery(Query{}) // disabled metrics are a no-op
-	nilM.AuthFailure()
+	nilM.AuthFailure("basic")
 }

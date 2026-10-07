@@ -1,5 +1,6 @@
 # Generate hashes with: curral hash-password
 # Example passwords: admin-pw, analyst-pw, etl-pw (do not use outside local tests).
+# Example API key (local tests only): curral_XICI32AYJPBF3NO24LOFD75YEEGCMVJ6ZSRLZ2G2NDHF77VSRRVA
 users:
   - name: admin
     password_hash: "$2a$10$rNoKnQq.3DpMThFMWCWrV.K5gnqR/KpayqeDRFmiYtXMJzIUJrgTC"
@@ -10,3 +11,11 @@ users:
   - name: etl
     password_hash: "$2a$10$bdAmoqFBIWf8pxbPhwQIj.Khrgcq4YPIhmNngGBHOHpCru4kkDHZO"
     roles: [etl]
+
+# Service credentials: "Authorization: Bearer curral_...". Generate with
+# curral gen-api-key NAME ROLES...; only the SHA-256 is stored here.
+api_keys:
+  - name: etl-job
+    key_sha256: "49e4c3b903ad51d4840cd5a065be4d2c0e967f0ff088fcd1ac9769369d5d01d9"
+    roles: [etl]
+    # expires: 2027-12-31

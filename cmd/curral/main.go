@@ -36,6 +36,8 @@ Usage:
   curral serve          [flags]   start the HTTP server
   curral check          [flags]   validate catalog, users and policy, then exit
   curral hash-password            read a password and print its bcrypt hash
+  curral gen-api-key NAME [ROLE...]
+                                  create an API key; prints the key once and the users-file entry
   curral install-extensions --extension-dir DIR NAME...
                                   install DuckDB extensions (e.g. at image build time)
   curral healthcheck    [URL]     GET URL (default http://127.0.0.1:8080/healthz), exit 0 if 200
@@ -61,6 +63,8 @@ func main() {
 		err = runServe(os.Args[2:], true)
 	case "hash-password":
 		err = runHash()
+	case "gen-api-key":
+		err = runGenAPIKey(os.Args[2:])
 	case "install-extensions":
 		err = runInstallExtensions(os.Args[2:])
 	case "healthcheck":
@@ -112,6 +116,11 @@ type serveFlags struct {
 	auditSQL       string
 	auditQueue     int
 	metricsListen  string
+	oidcIssuer     string
+	oidcAudience   string
+	oidcUserClaim  string
+	oidcRolesClaim string
+	oidcSkew       time.Duration
 	logLevel       string
 	logFormat      string
 }
@@ -142,6 +151,11 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.StringVar(&f.auditSQL, "audit-sql", server.AuditSQLRedacted, "SQL text in audit events: redacted (literals become ?), full or hash")
 	fs.IntVar(&f.auditQueue, "audit-queue", 4096, "audit events buffered in memory")
 	fs.StringVar(&f.metricsListen, "metrics-listen", "", "serve Prometheus /metrics on this separate address (e.g. 127.0.0.1:9090); empty disables")
+	fs.StringVar(&f.oidcIssuer, "oidc-issuer", "", "accept bearer JWTs from this OIDC issuer (discovery + JWKS); empty disables")
+	fs.StringVar(&f.oidcAudience, "oidc-audience", "", "required audience (aud) of JWTs")
+	fs.StringVar(&f.oidcUserClaim, "oidc-user-claim", "sub", "JWT claim used as the user name (e.g. email, preferred_username)")
+	fs.StringVar(&f.oidcRolesClaim, "oidc-roles-claim", "roles", "JWT claim with the roles; dotted paths allowed (realm_access.roles)")
+	fs.DurationVar(&f.oidcSkew, "oidc-skew", 30*time.Second, "clock skew tolerated when validating JWT times")
 	fs.StringVar(&f.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.StringVar(&f.logFormat, "log-format", "text", "text or json")
 
@@ -270,8 +284,8 @@ func runServe(args []string, checkOnly bool) error {
 		dbs = append(dbs, d.Name)
 	}
 	if checkOnly {
-		fmt.Printf("ok: %d database(s) [%s], %d user(s), policy %s\n",
-			len(dbs), strings.Join(dbs, ", "), len(users.Users), f.policyQuery)
+		fmt.Printf("ok: %d database(s) [%s], %d user(s), %d api key(s), policy %s\n",
+			len(dbs), strings.Join(dbs, ", "), len(users.Users), len(users.APIKeys), f.policyQuery)
 		return nil
 	}
 
@@ -313,7 +327,21 @@ func runServe(args []string, checkOnly bool) error {
 		log.Info("metrics enabled", "addr", f.metricsListen)
 	}
 
+	var oidc *auth.OIDC
+	if f.oidcIssuer != "" {
+		oidc, err = auth.NewOIDC(ctx, auth.OIDCConfig{
+			Issuer: f.oidcIssuer, Audience: f.oidcAudience,
+			UserClaim: f.oidcUserClaim, RolesClaim: f.oidcRolesClaim, Skew: f.oidcSkew,
+		})
+		if err != nil {
+			return err
+		}
+		log.Info("oidc enabled", "issuer", f.oidcIssuer, "audience", f.oidcAudience,
+			"user_claim", f.oidcUserClaim, "roles_claim", f.oidcRolesClaim)
+	}
+
 	srv := &server.Server{
+		OIDC:     oidc,
 		Metrics:  mtr,
 		Engine:   eng,
 		Log:      log,
@@ -450,6 +478,25 @@ func runHealthcheck(args []string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s: %s", url, resp.Status)
 	}
+	return nil
+}
+
+func runGenAPIKey(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: curral gen-api-key NAME [ROLE...]")
+	}
+	key, hash, err := auth.NewAPIKey()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "API key for %s (shown only now; store it in a secret manager):\n", args[0])
+	fmt.Println(key)
+	fmt.Fprintln(os.Stderr, "\nAdd to the users file under api_keys:")
+	roles := "[]"
+	if len(args) > 1 {
+		roles = "[" + strings.Join(args[1:], ", ") + "]"
+	}
+	fmt.Fprintf(os.Stderr, "  - name: %s\n    key_sha256: %s\n    roles: %s\n    # expires: 2027-12-31\n", args[0], hash, roles)
 	return nil
 }
 

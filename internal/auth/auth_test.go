@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -23,5 +24,27 @@ func TestAuthenticate(t *testing.T) {
 	}
 	if a.Authenticate("u", "wrong") != nil || a.Authenticate("ghost", "pw") != nil || a.Authenticate("", "") != nil {
 		t.Fatal("invalid credentials accepted")
+	}
+}
+
+func TestAPIKeys(t *testing.T) {
+	key, hash, err := NewAPIKey()
+	if err != nil || !strings.HasPrefix(key, APIKeyPrefix) || len(hash) != 64 {
+		t.Fatalf("%q %q %v", key, hash, err)
+	}
+	oldKey, oldHash, _ := NewAPIKey()
+	a := New(&config.Users{APIKeys: []config.APIKey{
+		{Name: "etl-job", KeyHash: strings.ToUpper(hash), Roles: []string{"etl"}},
+		{Name: "old-job", KeyHash: oldHash, Expires: "2020-01-01"},
+	}}, time.Minute)
+	if p := a.AuthenticateAPIKey(key); p == nil || p.Name != "etl-job" || p.Method != MethodAPIKey || p.Roles[0] != "etl" {
+		t.Fatalf("valid key: %+v", p)
+	}
+	for name, k := range map[string]string{
+		"expired": oldKey, "unknown": APIKeyPrefix + "AAAA", "no prefix": strings.TrimPrefix(key, APIKeyPrefix), "empty": "",
+	} {
+		if a.AuthenticateAPIKey(k) != nil {
+			t.Errorf("%s key accepted", name)
+		}
 	}
 }

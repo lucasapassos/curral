@@ -26,6 +26,7 @@ type Event struct {
 	Event         string             `json:"event"` // query, auth_failure
 	RequestID     string             `json:"request_id"`
 	User          string             `json:"user"`
+	AuthMethod    string             `json:"auth_method,omitempty"` // basic, api_key, jwt
 	Roles         []string           `json:"roles,omitempty"`
 	RemoteAddr    string             `json:"remote_addr"`
 	ForwardedFor  string             `json:"forwarded_for,omitempty"`

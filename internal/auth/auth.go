@@ -1,8 +1,13 @@
-// Package auth verifies local user/password credentials.
+// Package auth authenticates requests: local users (Basic), API keys and
+// OIDC-issued JWTs.
 package auth
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base32"
+	"encoding/hex"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,11 +16,22 @@ import (
 	"curral/internal/config"
 )
 
-// Principal is an authenticated user.
+// Principal is an authenticated user or service.
 type Principal struct {
-	Name  string
-	Roles []string
+	Name   string
+	Roles  []string
+	Method string // basic, api_key, jwt
 }
+
+// Authentication methods.
+const (
+	MethodBasic  = "basic"
+	MethodAPIKey = "api_key"
+	MethodJWT    = "jwt"
+)
+
+// APIKeyPrefix marks curral API keys, telling them apart from JWTs.
+const APIKeyPrefix = "curral_"
 
 type cacheEntry struct {
 	p       *Principal
@@ -26,15 +42,22 @@ type cacheEntry struct {
 // repeated requests do not pay bcrypt's cost (tens of ms) every time.
 type Authenticator struct {
 	users map[string]config.User
+	keys  map[[32]byte]apiKey
 	ttl   time.Duration
 	cache sync.Map // [32]byte -> cacheEntry
 	dummy []byte
 }
 
 func New(users *config.Users, ttl time.Duration) *Authenticator {
-	a := &Authenticator{users: map[string]config.User{}, ttl: ttl}
+	a := &Authenticator{users: map[string]config.User{}, keys: map[[32]byte]apiKey{}, ttl: ttl}
 	for _, u := range users.Users {
 		a.users[u.Name] = u
+	}
+	for _, k := range users.APIKeys {
+		var h [32]byte
+		hex.Decode(h[:], []byte(strings.ToLower(k.KeyHash)))
+		exp, _ := k.ExpiresAt()
+		a.keys[h] = apiKey{p: &Principal{Name: k.Name, Roles: k.Roles, Method: MethodAPIKey}, expires: exp}
 	}
 	// Unknown users still pay one bcrypt so timing does not reveal them.
 	a.dummy, _ = bcrypt.GenerateFromPassword([]byte("curral-dummy"), bcrypt.DefaultCost)
@@ -60,11 +83,40 @@ func (a *Authenticator) Authenticate(user, pass string) *Principal {
 	if bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(pass)) != nil {
 		return nil
 	}
-	p := &Principal{Name: u.Name, Roles: u.Roles}
+	p := &Principal{Name: u.Name, Roles: u.Roles, Method: MethodBasic}
 	if a.ttl > 0 {
 		a.cache.Store(key, cacheEntry{p: p, expires: time.Now().Add(a.ttl)})
 	}
 	return p
+}
+
+type apiKey struct {
+	p       *Principal
+	expires time.Time
+}
+
+// AuthenticateAPIKey checks a bearer API key. Keys are random and long, so a
+// plain SHA-256 lookup is enough (no bcrypt cost per request).
+func (a *Authenticator) AuthenticateAPIKey(key string) *Principal {
+	if !strings.HasPrefix(key, APIKeyPrefix) {
+		return nil
+	}
+	k, ok := a.keys[sha256.Sum256([]byte(key))]
+	if !ok || (!k.expires.IsZero() && time.Now().After(k.expires)) {
+		return nil
+	}
+	return k.p
+}
+
+// NewAPIKey returns a new random key and the hash to put in the users file.
+func NewAPIKey() (key, hash string, err error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", "", err
+	}
+	key = APIKeyPrefix + base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b)
+	sum := sha256.Sum256([]byte(key))
+	return key, hex.EncodeToString(sum[:]), nil
 }
 
 func cacheKey(user, pass string) [32]byte {
