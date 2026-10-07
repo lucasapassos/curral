@@ -1,0 +1,15 @@
+{
+  "allowed_functions": ["range", "generate_series", "unnest"],
+  "roles": {
+    "analyst": {
+      "read": ["lake"],
+      "write": [],
+      "deny_tables": ["lake.restricted.customers_pii"]
+    },
+    "etl": {
+      "read": ["lake"],
+      "write": [],
+      "deny_tables": []
+    }
+  }
+}

@@ -1,0 +1,12 @@
+# Generate hashes with: curral hash-password
+# Example passwords: admin-pw, analyst-pw, etl-pw (do not use outside local tests).
+users:
+  - name: admin
+    password_hash: "$2a$10$rNoKnQq.3DpMThFMWCWrV.K5gnqR/KpayqeDRFmiYtXMJzIUJrgTC"
+    roles: [admin]
+  - name: analyst
+    password_hash: "$2a$10$1dh.neV/AE968ov/MbQLxujg0QMqiOZHFvUipvpldEXNBzpD4ID3K"
+    roles: [analyst]
+  - name: etl
+    password_hash: "$2a$10$bdAmoqFBIWf8pxbPhwQIj.Khrgcq4YPIhmNngGBHOHpCru4kkDHZO"
+    roles: [etl]

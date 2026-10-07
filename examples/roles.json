@@ -1,0 +1,15 @@
+{
+  "allowed_functions": ["range", "generate_series", "unnest"],
+  "roles": {
+    "analyst": {
+      "read": ["sales", "logs"],
+      "write": [],
+      "deny_tables": ["sales.main.salaries"]
+    },
+    "etl": {
+      "read": ["logs"],
+      "write": ["sales"],
+      "deny_tables": []
+    }
+  }
+}

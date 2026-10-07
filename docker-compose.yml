@@ -1,0 +1,49 @@
+# curral serving a Cloudflare R2 Data Catalog (Iceberg).
+#
+# Credentials come from .env next to this file (never committed). Either the
+# R2_* names or the LAKE_* names work:
+#   R2_CATALOG_URI / R2_CATALOG_URI
+#   R2_WAREHOUSE   / R2_WAREHOUSE
+#   R2_TOKEN       / R2_TOKEN
+# Required as well (in .env or the shell):
+#   R2_SCHEMA        namespace for unqualified names, e.g. analytics
+#   R2_ALLOWED_PATH  storage prefix of the tables, e.g. s3://my-bucket/
+# Optional:
+#   R2_CACHE_TTL     catalog metadata cache, e.g. 30s (default 30s)
+#
+#   docker compose up --build
+#   curl -u analyst:analyst-pw -d '{"sql":"SELECT 1"}' localhost:8080/v1/query
+
+services:
+  curral:
+    build:
+      context: .
+      args:
+        VERSION: ${CURRAL_VERSION:-dev}
+        COMMIT: ${CURRAL_COMMIT:-unknown}
+    image: curral:${CURRAL_VERSION:-dev}
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      CURRAL_CATALOG: /etc/curral/catalog.r2.yaml
+      CURRAL_USERS: /etc/curral/users.yaml
+      CURRAL_POLICY: /etc/curral/policy.rego,/etc/curral/roles.r2.json
+      CURRAL_ALLOWED_PATH: ${R2_ALLOWED_PATH:?set R2_ALLOWED_PATH (e.g. s3://my-bucket/)}
+      CURRAL_MAX_CONCURRENCY: ${CURRAL_MAX_CONCURRENCY:-8}
+      CURRAL_MEMORY_LIMIT: ${CURRAL_MEMORY_LIMIT:-2GB}
+      CURRAL_QUERY_TIMEOUT: ${CURRAL_QUERY_TIMEOUT:-60s}
+      R2_CATALOG_URI: ${R2_CATALOG_URI:-${R2_CATALOG_URI:?set R2_CATALOG_URI}}
+      R2_WAREHOUSE: ${R2_WAREHOUSE:-${R2_WAREHOUSE:?set R2_WAREHOUSE}}
+      R2_TOKEN: ${R2_TOKEN:-${R2_TOKEN:?set R2_TOKEN}}
+      R2_SCHEMA: ${R2_SCHEMA:?set R2_SCHEMA (Iceberg namespace)}
+      R2_CACHE_TTL: ${R2_CACHE_TTL:-30s}
+    volumes:
+      - ./examples:/etc/curral:ro
+    # The image's only writable path is DuckDB's spill directory.
+    read_only: true
+    tmpfs:
+      - /var/lib/curral/tmp:uid=65532,gid=65532,mode=0700
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${CURRAL_CONTAINER_MEMORY:-3g}
+    restart: unless-stopped

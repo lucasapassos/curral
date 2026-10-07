@@ -1,0 +1,54 @@
+# Everything here is mounted once at startup, before the instance is locked.
+# String values may reference environment variables: ${VAR} or ${VAR:-default}.
+# A missing variable without a default aborts startup.
+
+# INSTALL + LOAD at boot. Autoloading is disabled afterwards, so list every
+# extension a query may need (e.g. httpfs, iceberg, postgres, json).
+extensions: []
+
+# Extra global settings (SET GLOBAL key = value).
+settings: {}
+
+# CREATE OR REPLACE SECRET name (TYPE type, KEY value, ...).
+secrets: []
+
+# ATTACH 'path' AS name (KEY value, ...). Options are passed through as-is,
+# so any ATTACH-capable source works.
+databases:
+  - name: sales
+    path: ${CURRAL_DATA:-./data}/sales.duckdb
+  - name: logs
+    path: ${CURRAL_DATA:-./data}/logs.duckdb
+    options: { READ_ONLY: true }
+
+# Catalog used for unqualified names (USE). Defaults to the first database.
+default: sales
+
+# Escape hatch: SQL run after the ATTACHes and before lockdown.
+init_sql: []
+
+# --- Iceberg REST catalog example -------------------------------------------
+# extensions: [httpfs, iceberg]
+# secrets:
+#   - name: lake_s3
+#     type: s3
+#     params:
+#       KEY_ID: ${AWS_ACCESS_KEY_ID}
+#       SECRET: ${AWS_SECRET_ACCESS_KEY}
+#       REGION: ${AWS_REGION:-us-east-1}
+#       ENDPOINT: ${S3_ENDPOINT:-s3.amazonaws.com}
+#   - name: lake_catalog
+#     type: iceberg
+#     params:
+#       CLIENT_ID: ${ICEBERG_CLIENT_ID}
+#       CLIENT_SECRET: ${ICEBERG_CLIENT_SECRET}
+#       OAUTH2_SERVER_URI: ${ICEBERG_OAUTH_URI}
+# databases:
+#   - name: lake
+#     path: ${ICEBERG_WAREHOUSE}
+#     options:
+#       TYPE: iceberg
+#       SECRET: lake_catalog
+#       ENDPOINT: ${ICEBERG_ENDPOINT}
+# Remote reads need network file access: run with --external-access, or keep it
+# off and allow the bucket with --allowed-path s3://my-bucket/

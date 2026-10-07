@@ -1,0 +1,6 @@
+.git
+.env*
+bin/
+data/
+*.duckdb
+*.duckdb.wal

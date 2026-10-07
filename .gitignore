@@ -1,0 +1,6 @@
+bin/
+*.duckdb
+*.duckdb.wal
+data/
+.env*
+!examples/*.env.example

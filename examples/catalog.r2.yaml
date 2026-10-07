@@ -1,0 +1,32 @@
+# Cloudflare R2 Data Catalog (Iceberg REST).
+# Values come from the environment; see examples/r2.env.example.
+#   R2_CATALOG_URI  "Catalog URI" in the bucket's R2 Data Catalog settings
+#   R2_WAREHOUSE    "Warehouse name" in the same page
+#   R2_TOKEN        Cloudflare API token with R2 Data Catalog + R2 Storage permissions
+#
+# R2 vends temporary storage credentials through the catalog, so no separate
+# S3 secret is needed. Remote reads need --external-access or
+# --allowed-path for the bucket.
+
+extensions: [httpfs, avro, iceberg]
+
+secrets:
+  - name: r2_catalog
+    type: iceberg
+    params:
+      TOKEN: ${R2_TOKEN}
+
+databases:
+  - name: lake
+    path: ${R2_WAREHOUSE}
+    schema: ${R2_SCHEMA:-default}   # Iceberg namespace used for unqualified names
+    # curral's catalog metadata cache: skips the REST loadTable round trip for
+    # this long. Commits by other writers may show up to TTL late. Keep it well
+    # below the lifetime of the catalog's vended storage credentials. 0s = off.
+    cache_ttl: ${R2_CACHE_TTL:-0s}
+    options:
+      TYPE: iceberg
+      SECRET: r2_catalog
+      ENDPOINT: ${R2_CATALOG_URI}
+
+default: lake
