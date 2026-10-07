@@ -109,3 +109,42 @@ func TestOIDCDiscoveryErrors(t *testing.T) {
 		t.Error("missing audience must fail")
 	}
 }
+
+func TestOIDCEmailVerifiedAndHostedDomain(t *testing.T) {
+	idp := newIdP(t)
+	o, err := NewOIDC(context.Background(), OIDCConfig{
+		Issuer: idp.srv.URL, Audience: "curral", UserClaim: "email",
+		RequireEmailVerified: true, HostedDomains: []string{"corp.com"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok := func(verified any, hd string) string {
+		return idp.token(t, idp.key, func(tk jwt.Token) {
+			if verified != nil {
+				tk.Set("email_verified", verified)
+			}
+			if hd != "" {
+				tk.Set("hd", hd)
+			}
+		})
+	}
+	ok := []string{tok(true, "corp.com"), tok("true", "CORP.com")}
+	for i, tk := range ok {
+		if _, err := o.Authenticate(tk); err != nil {
+			t.Errorf("ok[%d]: %v", i, err)
+		}
+	}
+	bad := map[string]string{
+		"not verified":      tok(false, "corp.com"),
+		"no verified":       tok(nil, "corp.com"),
+		"verified string":   tok("false", "corp.com"),
+		"other domain":      tok(true, "evil.com"),
+		"no domain (gmail)": tok(true, ""),
+	}
+	for name, tk := range bad {
+		if _, err := o.Authenticate(tk); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

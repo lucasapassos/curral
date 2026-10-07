@@ -171,7 +171,9 @@ func (s *Server) authenticate(r *http.Request) (p *auth.Principal, method, user,
 		if err != nil {
 			return nil, auth.MethodJWT, "", oneLine(err.Error())
 		}
-		return p, auth.MethodJWT, p.Name, ""
+		// Roles from the users file's identities (reloadable) join the
+		// token's own roles, e.g. for providers like Google that send none.
+		return s.authn.Load().MapIdentity(p), auth.MethodJWT, p.Name, ""
 	}
 	return nil, "unknown", "", "unsupported authorization scheme"
 }

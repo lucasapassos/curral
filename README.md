@@ -77,6 +77,8 @@ vírgula: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--oidc-issuer` / `--oidc-audience` | (desligado) | aceita JWTs desse provedor OIDC; a audience é obrigatória |
 | `--oidc-user-claim` / `--oidc-roles-claim` | `sub` / `roles` | claims de usuário e roles (aceita caminho com ponto: `realm_access.roles`) |
 | `--oidc-skew` | 30s | tolerância de relógio para `exp`/`nbf` |
+| `--oidc-require-email-verified` | true | com `--oidc-user-claim email`, exige `email_verified=true` |
+| `--oidc-hosted-domain` | (qualquer) | aceita só tokens com essa claim `hd` (domínio Google Workspace), repetível |
 | `--audit-log` | (desligado) | arquivo JSONL de auditoria; `-` = stdout; `SIGHUP` reabre |
 | `--audit-sql` | `redacted` | texto do SQL na auditoria: `redacted`, `full` ou `hash` |
 | `--audit-queue` | 4096 | eventos em memória aguardando escrita |
@@ -199,6 +201,46 @@ Três métodos, escolhidos pelo header `Authorization`:
 curral serve ... --oidc-issuer https://sso.example.com/realms/main --oidc-audience curral \
   --oidc-user-claim preferred_username --oidc-roles-claim realm_access.roles
 ```
+
+### Roles por identidade (`identities:`)
+
+Alguns provedores não mandam roles no token (o Google, por exemplo). A seção
+`identities` do arquivo de usuários atribui roles por usuário ou por domínio
+de e-mail, e recarrega com `SIGHUP`:
+
+```yaml
+identities:
+  - match: ana@gmail.com      # exato, sem diferenciar maiúsculas
+    roles: [analyst]
+  - match: "*@example.com"    # qualquer endereço do domínio (não pega subdomínios)
+    roles: [analyst]
+```
+
+As roles mapeadas se somam às que o token já trouxer. Um usuário autenticado
+que não aparece em nenhuma entrada (nem tem roles no token) não recebe acesso a
+nada da política de exemplo.
+
+### Google
+
+```sh
+curral serve ... \
+  --oidc-issuer https://accounts.google.com \
+  --oidc-audience <CLIENT_ID>.apps.googleusercontent.com \
+  --oidc-user-claim email
+  # opcional, contas Google Workspace: --oidc-hosted-domain example.com
+```
+
+- **Client ID:** crie um OAuth Client em Google Cloud Console → APIs &
+  Services → Credentials.
+- **Token:** o cliente envia o **ID token** (JWT) em
+  `Authorization: Bearer ...`. Access tokens do Google não são JWT e não servem.
+- **Quem consegue logar:** com a tela de consentimento "External", qualquer
+  conta Google obtém um token válido para o seu client ID. O acesso vem só de
+  `identities`, e `email_verified` é exigido para que uma conta com e-mail não
+  verificado não se passe por um endereço mapeado.
+- **Teste local:** `gcloud auth print-identity-token` gera um ID token cuja
+  audience é o client ID do próprio gcloud. Não use essa audience em produção:
+  qualquer usuário do gcloud teria tokens aceitos.
 
 ## Auditoria
 

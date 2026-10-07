@@ -121,6 +121,8 @@ type serveFlags struct {
 	oidcUserClaim  string
 	oidcRolesClaim string
 	oidcSkew       time.Duration
+	oidcVerified   bool
+	oidcDomains    listFlag
 	logLevel       string
 	logFormat      string
 }
@@ -156,6 +158,8 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.StringVar(&f.oidcUserClaim, "oidc-user-claim", "sub", "JWT claim used as the user name (e.g. email, preferred_username)")
 	fs.StringVar(&f.oidcRolesClaim, "oidc-roles-claim", "roles", "JWT claim with the roles; dotted paths allowed (realm_access.roles)")
 	fs.DurationVar(&f.oidcSkew, "oidc-skew", 30*time.Second, "clock skew tolerated when validating JWT times")
+	fs.BoolVar(&f.oidcVerified, "oidc-require-email-verified", true, "with --oidc-user-claim email, reject tokens without email_verified=true (disable for providers that never send it, e.g. Entra ID)")
+	fs.Var(&f.oidcDomains, "oidc-hosted-domain", "only accept Google tokens whose hd claim is this Workspace domain (repeatable)")
 	fs.StringVar(&f.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.StringVar(&f.logFormat, "log-format", "text", "text or json")
 
@@ -284,8 +288,8 @@ func runServe(args []string, checkOnly bool) error {
 		dbs = append(dbs, d.Name)
 	}
 	if checkOnly {
-		fmt.Printf("ok: %d database(s) [%s], %d user(s), %d api key(s), policy %s\n",
-			len(dbs), strings.Join(dbs, ", "), len(users.Users), len(users.APIKeys), f.policyQuery)
+		fmt.Printf("ok: %d database(s) [%s], %d user(s), %d api key(s), %d identit(ies), policy %s\n",
+			len(dbs), strings.Join(dbs, ", "), len(users.Users), len(users.APIKeys), len(users.Identities), f.policyQuery)
 		return nil
 	}
 
@@ -332,12 +336,15 @@ func runServe(args []string, checkOnly bool) error {
 		oidc, err = auth.NewOIDC(ctx, auth.OIDCConfig{
 			Issuer: f.oidcIssuer, Audience: f.oidcAudience,
 			UserClaim: f.oidcUserClaim, RolesClaim: f.oidcRolesClaim, Skew: f.oidcSkew,
+			RequireEmailVerified: f.oidcVerified && f.oidcUserClaim == "email",
+			HostedDomains:        f.oidcDomains,
 		})
 		if err != nil {
 			return err
 		}
 		log.Info("oidc enabled", "issuer", f.oidcIssuer, "audience", f.oidcAudience,
-			"user_claim", f.oidcUserClaim, "roles_claim", f.oidcRolesClaim)
+			"user_claim", f.oidcUserClaim, "roles_claim", f.oidcRolesClaim,
+			"require_email_verified", f.oidcVerified && f.oidcUserClaim == "email", "hosted_domains", f.oidcDomains)
 	}
 
 	srv := &server.Server{

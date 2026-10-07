@@ -583,3 +583,61 @@ func TestAPIKeyAndJWT(t *testing.T) {
 		}
 	}
 }
+
+// Google-style tokens carry no roles: access comes from users-file identities.
+func TestOIDCIdentities(t *testing.T) {
+	ts := newServer(t)
+	s := lastServer
+	raw, _ := rsa.GenerateKey(rand.Reader, 2048)
+	priv, _ := jwk.Import(raw)
+	priv.Set(jwk.KeyIDKey, "g1")
+	priv.Set(jwk.AlgorithmKey, jwa.RS256())
+	pub, _ := priv.PublicKey()
+	set := jwk.NewSet()
+	set.AddKey(pub)
+	mux := http.NewServeMux()
+	idp := httptest.NewServer(mux)
+	defer idp.Close()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"issuer": idp.URL, "jwks_uri": idp.URL + "/jwks"})
+	})
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) { json.NewEncoder(w).Encode(set) })
+	o, err := auth.NewOIDC(context.Background(), auth.OIDCConfig{
+		Issuer: idp.URL, Audience: "client-id", UserClaim: "email", RequireEmailVerified: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.OIDC = o
+	token := func(email string) string {
+		tk, _ := jwt.NewBuilder().Issuer(idp.URL).Audience([]string{"client-id"}).Subject("1").
+			Expiration(time.Now().Add(time.Hour)).Build()
+		tk.Set("email", email)
+		tk.Set("email_verified", true)
+		b, _ := jwt.Sign(tk, jwt.WithKey(jwa.RS256(), priv))
+		return string(b)
+	}
+	query := func(email string) int {
+		req, _ := http.NewRequest("POST", ts.URL+"/v1/query", strings.NewReader(`{"sql":"SELECT id FROM orders"}`))
+		req.Header.Set("Authorization", "Bearer "+token(email))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if c := query("ana@gmail.com"); c != 403 {
+		t.Fatalf("authenticated but unmapped must be denied: %d", c)
+	}
+	users, _ := config.LoadUsers("../../examples/users.yaml")
+	users.Identities = []config.Identity{{Match: "ana@gmail.com", Roles: []string{"analyst"}}}
+	s.SetAuth(auth.New(users, time.Minute)) // what SIGHUP does
+	if c := query("ana@gmail.com"); c != 200 {
+		t.Fatalf("mapped identity: %d", c)
+	}
+	if c := query("eve@gmail.com"); c != 403 {
+		t.Fatalf("any other Gmail account must stay denied: %d", c)
+	}
+}

@@ -93,8 +93,27 @@ func lookupFold(m map[string]any, key string) any {
 
 // Users is the content of the users file.
 type Users struct {
-	Users   []User   `yaml:"users"`
-	APIKeys []APIKey `yaml:"api_keys"`
+	Users      []User     `yaml:"users"`
+	APIKeys    []APIKey   `yaml:"api_keys"`
+	Identities []Identity `yaml:"identities"`
+}
+
+// Identity grants roles to users authenticated by OIDC, matched on the user
+// claim: an exact value (ana@gmail.com) or a whole e-mail domain
+// (*@example.com). Case-insensitive.
+type Identity struct {
+	Match string   `yaml:"match"`
+	Roles []string `yaml:"roles"`
+}
+
+// Matches reports whether user matches the identity pattern.
+func (i Identity) Matches(user string) bool {
+	m, u := strings.ToLower(i.Match), strings.ToLower(user)
+	if domain, ok := strings.CutPrefix(m, "*@"); ok {
+		at := strings.LastIndexByte(u, '@')
+		return at > 0 && u[at+1:] == domain
+	}
+	return m == u
 }
 
 // APIKey authenticates a service with "Authorization: Bearer curral_...".
@@ -259,6 +278,15 @@ func LoadUsers(path string) (*Users, error) {
 			return nil, fmt.Errorf("%s: duplicate user %q", path, usr.Name)
 		}
 		seen[usr.Name] = true
+	}
+	for _, id := range u.Identities {
+		m := id.Match
+		if d, ok := strings.CutPrefix(m, "*@"); ok {
+			m = d
+		}
+		if m == "" || strings.Contains(m, "*") || len(id.Roles) == 0 {
+			return nil, fmt.Errorf("%s: identity %q needs an exact user or *@domain and at least one role", path, id.Match)
+		}
 	}
 	keys := map[string]bool{}
 	for _, k := range u.APIKeys {

@@ -48,3 +48,21 @@ func TestAPIKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestMapIdentity(t *testing.T) {
+	a := New(&config.Users{Identities: []config.Identity{
+		{Match: "ana@gmail.com", Roles: []string{"analyst"}},
+		{Match: "*@corp.com", Roles: []string{"analyst", "etl"}},
+	}}, 0)
+	in := &Principal{Name: "ana@gmail.com", Roles: []string{"from-token"}, Method: MethodJWT}
+	out := a.MapIdentity(in)
+	if strings.Join(out.Roles, ",") != "from-token,analyst" || len(in.Roles) != 1 {
+		t.Fatalf("out=%v in=%v", out.Roles, in.Roles)
+	}
+	if got := a.MapIdentity(&Principal{Name: "bob@corp.com", Roles: []string{"analyst"}}).Roles; strings.Join(got, ",") != "analyst,etl" {
+		t.Fatalf("dedupe: %v", got)
+	}
+	if got := a.MapIdentity(&Principal{Name: "eve@gmail.com"}).Roles; len(got) != 0 {
+		t.Fatalf("unmapped user got roles %v", got)
+	}
+}

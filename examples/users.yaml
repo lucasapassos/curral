@@ -19,3 +19,12 @@ api_keys:
     key_sha256: "49e4c3b903ad51d4840cd5a065be4d2c0e967f0ff088fcd1ac9769369d5d01d9"
     roles: [etl]
     # expires: 2027-12-31
+
+# Roles for OIDC users (e.g. Google, whose tokens carry no roles), matched on
+# --oidc-user-claim: an exact value or a whole e-mail domain. Added to any
+# roles the token itself carries. Unmatched users get no roles from here.
+# identities:
+#   - match: ana@gmail.com
+#     roles: [analyst]
+#   - match: "*@example.com"
+#     roles: [analyst]

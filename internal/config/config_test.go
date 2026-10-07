@@ -70,3 +70,40 @@ databases:
 		}
 	}
 }
+
+func TestIdentities(t *testing.T) {
+	cases := []struct {
+		match, user string
+		want        bool
+	}{
+		{"ana@gmail.com", "ana@gmail.com", true},
+		{"ana@gmail.com", "ANA@Gmail.com", true},
+		{"ana@gmail.com", "ana@gmail.com.evil", false},
+		{"*@example.com", "bia@example.com", true},
+		{"*@Example.com", "BIA@EXAMPLE.COM", true},
+		{"*@example.com", "bia@sub.example.com", false},
+		{"*@example.com", "bia@example.com.evil", false},
+		{"*@example.com", "example.com", false},
+		{"*@example.com", "@example.com", false},
+	}
+	for _, c := range cases {
+		if got := (Identity{Match: c.match}).Matches(c.user); got != c.want {
+			t.Errorf("%q vs %q: got %v", c.match, c.user, got)
+		}
+	}
+	for _, body := range []string{
+		"identities: [{match: \"\", roles: [a]}]",
+		"identities: [{match: \"*\", roles: [a]}]",
+		"identities: [{match: \"a*@x.com\", roles: [a]}]",
+		"identities: [{match: \"*@\", roles: [a]}]",
+		"identities: [{match: \"a@x.com\"}]",
+	} {
+		if _, err := LoadUsers(writeFile(t, body)); err == nil {
+			t.Errorf("%s: expected error", body)
+		}
+	}
+	u, err := LoadUsers(writeFile(t, "identities: [{match: \"*@x.com\", roles: [analyst]}]"))
+	if err != nil || len(u.Identities) != 1 {
+		t.Fatalf("%+v %v", u, err)
+	}
+}

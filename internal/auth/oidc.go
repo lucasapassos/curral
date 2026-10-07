@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -23,6 +24,13 @@ type OIDCConfig struct {
 	RolesClaim string        // claim with roles (string or list); dotted paths allowed, e.g. realm_access.roles
 	Skew       time.Duration // clock skew tolerated for exp/nbf/iat
 	HTTPClient *http.Client  // optional
+	// RequireEmailVerified rejects tokens whose email_verified claim is not
+	// true. Use it whenever users are identified by e-mail, or an account
+	// with an unverified address could claim someone else's.
+	RequireEmailVerified bool
+	// HostedDomains, if set, only accepts tokens whose "hd" claim (Google
+	// Workspace domain) is one of them.
+	HostedDomains []string
 }
 
 // OIDC validates JWTs signed by the provider's keys. Keys come from the
@@ -110,6 +118,26 @@ func (o *OIDC) Authenticate(token string) (*Principal, error) {
 	claims, err := allClaims(tok)
 	if err != nil {
 		return nil, err
+	}
+	if o.cfg.RequireEmailVerified {
+		switch v := claims["email_verified"].(type) {
+		case bool:
+			if !v {
+				return nil, errors.New("email not verified")
+			}
+		case string: // some providers send "true"
+			if v != "true" {
+				return nil, errors.New("email not verified")
+			}
+		default:
+			return nil, errors.New("token has no email_verified claim")
+		}
+	}
+	if len(o.cfg.HostedDomains) > 0 {
+		hd, _ := claims["hd"].(string)
+		if !slices.ContainsFunc(o.cfg.HostedDomains, func(d string) bool { return strings.EqualFold(d, hd) }) {
+			return nil, fmt.Errorf("hosted domain %q not allowed", hd)
+		}
 	}
 	name, _ := lookup(claims, o.cfg.UserClaim).(string)
 	if name == "" {

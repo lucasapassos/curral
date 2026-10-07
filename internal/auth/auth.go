@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/hex"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -43,13 +44,14 @@ type cacheEntry struct {
 type Authenticator struct {
 	users map[string]config.User
 	keys  map[[32]byte]apiKey
+	ids   []config.Identity
 	ttl   time.Duration
 	cache sync.Map // [32]byte -> cacheEntry
 	dummy []byte
 }
 
 func New(users *config.Users, ttl time.Duration) *Authenticator {
-	a := &Authenticator{users: map[string]config.User{}, keys: map[[32]byte]apiKey{}, ttl: ttl}
+	a := &Authenticator{users: map[string]config.User{}, keys: map[[32]byte]apiKey{}, ids: users.Identities, ttl: ttl}
 	for _, u := range users.Users {
 		a.users[u.Name] = u
 	}
@@ -106,6 +108,25 @@ func (a *Authenticator) AuthenticateAPIKey(key string) *Principal {
 		return nil
 	}
 	return k.p
+}
+
+// MapIdentity returns p with the roles of every identity entry matching its
+// name added to the roles it already has (e.g. from a token claim). The
+// input is not modified.
+func (a *Authenticator) MapIdentity(p *Principal) *Principal {
+	roles := slices.Clone(p.Roles)
+	for _, id := range a.ids {
+		if id.Matches(p.Name) {
+			for _, r := range id.Roles {
+				if !slices.Contains(roles, r) {
+					roles = append(roles, r)
+				}
+			}
+		}
+	}
+	out := *p
+	out.Roles = roles
+	return &out
 }
 
 // NewAPIKey returns a new random key and the hash to put in the users file.
