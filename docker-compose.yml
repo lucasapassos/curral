@@ -12,6 +12,7 @@
 #   R2_CACHE_TTL     catalog metadata cache, e.g. 30s (default 30s)
 #
 #   docker compose up --build
+#   docker compose kill -s HUP curral   # reload users/policy, reopen audit log
 #   curl -u analyst:analyst-pw -d '{"sql":"SELECT 1"}' localhost:8080/v1/query
 
 services:
@@ -29,6 +30,7 @@ services:
       CURRAL_CATALOG: /etc/curral/catalog.r2.yaml
       CURRAL_USERS: /etc/curral/users.yaml
       CURRAL_POLICY: /etc/curral/policy.rego,/etc/curral/roles.r2.json
+      CURRAL_POLICY_LIMITS_QUERY: ${CURRAL_POLICY_LIMITS_QUERY:-data.curral.limits}
       CURRAL_ALLOWED_PATH: ${R2_ALLOWED_PATH:?set R2_ALLOWED_PATH (e.g. s3://my-bucket/)}
       CURRAL_MAX_CONCURRENCY: ${CURRAL_MAX_CONCURRENCY:-8}
       CURRAL_MEMORY_LIMIT: ${CURRAL_MEMORY_LIMIT:-2GB}

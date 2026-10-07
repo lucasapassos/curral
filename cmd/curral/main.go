@@ -94,6 +94,7 @@ type serveFlags struct {
 	users          string
 	policies       listFlag
 	policyQuery    string
+	limitsQuery    string
 	maxConcurrency int
 	queueTimeout   time.Duration
 	queryTimeout   time.Duration
@@ -123,6 +124,7 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.StringVar(&f.users, "users", "", "users file with bcrypt password hashes and roles (required)")
 	fs.Var(&f.policies, "policy", "Rego policy file, or JSON/YAML data file exposed as data.* (repeatable, required)")
 	fs.StringVar(&f.policyQuery, "policy-query", "data.curral.allow", "Rego decision that must evaluate to true")
+	fs.StringVar(&f.limitsQuery, "policy-limits-query", "", "optional Rego rule with per-request limits {timeout, max_rows}, e.g. data.curral.limits")
 	fs.IntVar(&f.maxConcurrency, "max-concurrency", 8, "queries executing at the same time")
 	fs.DurationVar(&f.queueTimeout, "queue-timeout", 5*time.Second, "how long a query waits for a free slot before 503")
 	fs.DurationVar(&f.queryTimeout, "query-timeout", 60*time.Second, "maximum query duration (0 = none)")
@@ -237,7 +239,7 @@ func runServe(args []string, checkOnly bool) error {
 	if err != nil {
 		return err
 	}
-	pol, err := policy.Load(ctx, f.policyQuery, f.policies)
+	pol, err := policy.Load(ctx, f.policyQuery, f.policies, f.limitsQuery)
 	if err != nil {
 		return err
 	}
@@ -278,17 +280,6 @@ func runServe(args []string, checkOnly bool) error {
 		if aw, err = audit.Open(f.auditLog, f.auditQueue, log); err != nil {
 			return fmt.Errorf("audit log: %w", err)
 		}
-		hup := make(chan os.Signal, 1)
-		signal.Notify(hup, syscall.SIGHUP)
-		go func() {
-			for range hup {
-				if err := aw.Reopen(); err != nil {
-					log.Error("audit log reopen failed", "err", err)
-				} else {
-					log.Info("audit log reopened")
-				}
-			}
-		}()
 		log.Info("audit log enabled", "path", f.auditLog, "sql", f.auditSQL)
 	} else {
 		log.Warn("audit log disabled (--audit-log not set)")
@@ -302,8 +293,7 @@ func runServe(args []string, checkOnly bool) error {
 			CacheStats: eng.CacheStats,
 			CachedDBs:  eng.CachedDatabases(),
 			BuildLabels: map[string]string{
-				"version": version, "commit": commit,
-				"duckdb": eng.DuckDBVersion(ctx), "policy_sha256": pol.SHA256,
+				"version": version, "commit": commit, "duckdb": eng.DuckDBVersion(ctx),
 			},
 		}
 		if aw != nil {
@@ -326,8 +316,6 @@ func runServe(args []string, checkOnly bool) error {
 	srv := &server.Server{
 		Metrics:  mtr,
 		Engine:   eng,
-		Auth:     auth.New(users, f.authCacheTTL),
-		Policy:   pol,
 		Log:      log,
 		MaxRows:  f.maxRows,
 		MaxBody:  f.maxBody,
@@ -335,6 +323,37 @@ func runServe(args []string, checkOnly bool) error {
 		AuditSQL: f.auditSQL,
 		Version:  version,
 	}
+	srv.SetAuth(auth.New(users, f.authCacheTTL))
+	srv.SetPolicy(pol)
+	if mtr != nil {
+		mtr.SetPolicySource(func() string { return srv.Policy().SHA256 })
+	}
+
+	// SIGHUP: reopen the audit log (logrotate) and reload users and policy.
+	// A broken file keeps the previous version in effect. The catalog is
+	// locked into DuckDB at boot and needs a restart.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			if aw != nil {
+				if err := aw.Reopen(); err != nil {
+					log.Error("audit log reopen failed", "err", err)
+				}
+			}
+			users, err := config.LoadUsers(f.users)
+			var newPol *policy.Policy
+			if err == nil {
+				newPol, err = policy.Load(context.Background(), f.policyQuery, f.policies, f.limitsQuery)
+			}
+			if err != nil {
+				srv.Reload(nil, nil, err)
+				continue
+			}
+			srv.Reload(auth.New(users, f.authCacheTTL), newPol, nil)
+		}
+	}()
+
 	httpSrv := &http.Server{
 		Addr:              f.listen,
 		Handler:           srv.Handler(),

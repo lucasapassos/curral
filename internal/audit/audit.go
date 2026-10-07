@@ -40,6 +40,7 @@ type Event struct {
 	Resolved      *bool              `json:"resolved,omitempty"`
 	Decision      string             `json:"decision"`   // allow, deny, error
 	DecidedBy     string             `json:"decided_by"` // policy, engine, auth, queue, audit, request
+	Limits        map[string]any     `json:"limits,omitempty"`
 	PolicySHA256  string             `json:"policy_sha256,omitempty"`
 	Status        int                `json:"status"`
 	Rows          int64              `json:"rows"`

@@ -2,7 +2,10 @@ package policy
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func load(t testing.TB) *Policy {
@@ -71,6 +74,53 @@ func TestPolicyHash(t *testing.T) {
 	}
 	if c.SHA256 == a.SHA256 {
 		t.Fatal("different data files must hash differently")
+	}
+}
+
+func TestLimits(t *testing.T) {
+	ctx := context.Background()
+	p, err := Load(ctx, "data.curral.allow", []string{"../../examples/policy.rego", "../../examples/roles.json"}, "data.curral.limits")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := p.Limits(ctx, input([]string{"analyst"}, "SELECT", nil, nil, true))
+	if err != nil || l.Timeout != 30*time.Second || l.MaxRows != 10000 {
+		t.Fatalf("analyst limits = %+v, %v", l, err)
+	}
+	for _, roles := range [][]string{{"admin"}, {"etl"}} {
+		if l, err := p.Limits(ctx, input(roles, "SELECT", nil, nil, true)); err != nil || l != (Limits{}) {
+			t.Fatalf("%v limits = %+v, %v", roles, l, err)
+		}
+	}
+	// Without a limits query nothing is limited.
+	if l, _ := load(t).Limits(ctx, input([]string{"analyst"}, "SELECT", nil, nil, true)); l != (Limits{}) {
+		t.Fatalf("limits without query = %+v", l)
+	}
+
+	dir := t.TempDir()
+	write := func(body string) string {
+		f := filepath.Join(dir, "l.rego")
+		os.WriteFile(f, []byte("package curral\nimport rego.v1\nallow := true\n"+body), 0o600)
+		return f
+	}
+	for body, want := range map[string]Limits{
+		`limits := {"timeout": 1.5}`:                 {Timeout: 1500 * time.Millisecond},
+		`limits := {"max_rows": 7}`:                  {MaxRows: 7},
+		`limits := {"timeout": "2m", "max_rows": 1}`: {Timeout: 2 * time.Minute, MaxRows: 1},
+	} {
+		p, err := Load(ctx, "data.curral.allow", []string{write(body)}, "data.curral.limits")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if l, err := p.Limits(ctx, map[string]any{}); err != nil || l != want {
+			t.Errorf("%s: %+v %v", body, l, err)
+		}
+	}
+	for _, body := range []string{`limits := "x"`, `limits := {"timeout": "soon"}`, `limits := {"rows": 1}`, `limits := {"max_rows": -1}`} {
+		p, _ := Load(ctx, "data.curral.allow", []string{write(body)}, "data.curral.limits")
+		if _, err := p.Limits(ctx, map[string]any{}); err == nil {
+			t.Errorf("%s: expected error", body)
+		}
 	}
 }
 

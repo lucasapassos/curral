@@ -68,3 +68,12 @@ denied_table if {
 	some role in input.roles
 	t in data.roles[role].deny_tables
 }
+
+# Optional per-request limits, enabled with --policy-limits-query data.curral.limits.
+# Evaluated only after allow; an undefined result means no limits. The global
+# --query-timeout and --max-rows still cap everything.
+limits := data.roles[role].limits if {
+	not "admin" in input.roles
+	count(input.roles) == 1
+	role := input.roles[0]
+}

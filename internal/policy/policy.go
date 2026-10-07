@@ -5,41 +5,119 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/rego"
 )
 
 type Policy struct {
-	query rego.PreparedEvalQuery
+	query  rego.PreparedEvalQuery
+	limits *rego.PreparedEvalQuery // optional per-request limits
 	// SHA256 identifies the policy and data files loaded, so audit records
 	// show which version of the rules made each decision.
 	SHA256 string
 }
 
 // Load compiles the given .rego files (and optional JSON/YAML data files,
-// loaded under data.*) once. query is the decision, e.g. data.curral.allow.
-func Load(ctx context.Context, query string, files []string) (*Policy, error) {
+// loaded under data.*) once. query is the decision, e.g. data.curral.allow;
+// limitsQuery (optional, e.g. data.curral.limits) yields per-request limits.
+func Load(ctx context.Context, query string, files []string, limitsQuery ...string) (*Policy, error) {
 	if len(files) == 0 {
 		return nil, fmt.Errorf("no policy files given")
 	}
-	pq, err := rego.New(
-		rego.Query(query),
-		rego.Load(files, nil),
-		rego.StrictBuiltinErrors(true),
-	).PrepareForEval(ctx)
+	prepare := func(q string) (rego.PreparedEvalQuery, error) {
+		return rego.New(
+			rego.Query(q),
+			rego.Load(files, nil),
+			rego.StrictBuiltinErrors(true),
+		).PrepareForEval(ctx)
+	}
+	pq, err := prepare(query)
 	if err != nil {
 		return nil, fmt.Errorf("policy: %w", err)
 	}
-	sum, err := hashFiles(files)
-	if err != nil {
+	p := &Policy{query: pq}
+	if len(limitsQuery) > 0 && limitsQuery[0] != "" {
+		lq, err := prepare(limitsQuery[0])
+		if err != nil {
+			return nil, fmt.Errorf("policy limits: %w", err)
+		}
+		p.limits = &lq
+	}
+	if p.SHA256, err = hashFiles(files); err != nil {
 		return nil, fmt.Errorf("policy: %w", err)
 	}
-	return &Policy{query: pq, SHA256: sum}, nil
+	return p, nil
+}
+
+// Limits narrow what an allowed request may use. Zero means no limit.
+type Limits struct {
+	Timeout time.Duration `json:"timeout,omitempty"`
+	MaxRows int64         `json:"max_rows,omitempty"`
+}
+
+// Limits evaluates the limits query, if configured. An undefined result means
+// no limits. timeout accepts a duration string ("30s") or seconds; max_rows a
+// number.
+func (p *Policy) Limits(ctx context.Context, input map[string]any) (Limits, error) {
+	var l Limits
+	if p.limits == nil {
+		return l, nil
+	}
+	v, err := ast.InterfaceToValue(input)
+	if err != nil {
+		return l, err
+	}
+	rs, err := p.limits.Eval(ctx, rego.EvalParsedInput(v))
+	if err != nil {
+		return l, err
+	}
+	if len(rs) == 0 || len(rs[0].Expressions) == 0 {
+		return l, nil
+	}
+	obj, ok := rs[0].Expressions[0].Value.(map[string]any)
+	if !ok {
+		return l, fmt.Errorf("limits must be an object, got %T", rs[0].Expressions[0].Value)
+	}
+	for k, val := range obj {
+		switch k {
+		case "timeout":
+			switch t := val.(type) {
+			case string:
+				if l.Timeout, err = time.ParseDuration(t); err != nil {
+					return l, fmt.Errorf("limits.timeout: %w", err)
+				}
+			case json.Number:
+				f, err := t.Float64()
+				if err != nil {
+					return l, fmt.Errorf("limits.timeout: %w", err)
+				}
+				l.Timeout = time.Duration(f * float64(time.Second))
+			default:
+				return l, fmt.Errorf("limits.timeout: unsupported %T", val)
+			}
+		case "max_rows":
+			n, ok := val.(json.Number)
+			if !ok {
+				return l, fmt.Errorf("limits.max_rows: unsupported %T", val)
+			}
+			if l.MaxRows, err = n.Int64(); err != nil {
+				return l, fmt.Errorf("limits.max_rows: %w", err)
+			}
+		default:
+			return l, fmt.Errorf("limits: unknown key %q", k)
+		}
+	}
+	if l.Timeout < 0 || l.MaxRows < 0 {
+		return l, fmt.Errorf("limits must not be negative")
+	}
+	return l, nil
 }
 
 // hashFiles hashes names and contents of the given files, walking

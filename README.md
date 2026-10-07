@@ -61,6 +61,7 @@ vírgula: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--users` | — | usuários, hash bcrypt e roles |
 | `--policy` | — | `.rego` ou dados JSON/YAML (`data.*`), repetível |
 | `--policy-query` | `data.curral.allow` | decisão que precisa ser `true` |
+| `--policy-limits-query` | (desligado) | regra opcional com limites por request, ex.: `data.curral.limits` |
 | `--max-concurrency` | 8 | queries executando ao mesmo tempo |
 | `--queue-timeout` | 5s | espera por um slot livre; depois disso responde 503 |
 | `--query-timeout` | 60s | duração máxima; depois disso responde 504 |
@@ -220,6 +221,52 @@ Alertas sugeridos:
 - `rate(curral_queries_total{status="503"}[5m]) > 0`: fila cheia ou auditoria fora.
 - `curral_queries_waiting > 0` por muito tempo: aumentar `--max-concurrency`.
 - Um pico em `curral_policy_decisions_total{decision="deny"}` ou em `curral_auth_failures_total`.
+
+## Reload sem restart
+
+`SIGHUP` (ou `docker compose kill -s HUP curral`) recarrega o **arquivo de
+usuários** e a **política** (`.rego` e dados) e reabre o log de auditoria.
+
+- **Arquivo novo inválido:** a versão anterior continua valendo e o erro vai para o log.
+- **Troca atômica:** requests em andamento terminam com a versão com que começaram.
+- **Cache de senhas:** é descartado, então usuários removidos ou com senha trocada perdem acesso na hora.
+- **Rastreio:** cada tentativa gera um evento `config_reload` na auditoria, com o `policy_sha256` novo ou o erro, e conta em `curral_config_reloads_total`. `curral_policy_info` mostra o hash em vigor.
+- **Catálogo:** é montado e travado no boot, então mudanças nele exigem restart.
+
+## Dry-run
+
+`"dry_run": true` no `/v1/query` faz a inspeção e avalia a política **sem
+executar**. É útil para escrever e depurar `.rego`:
+
+```sh
+curl -u analyst:analyst-pw -d '{"sql":"DELETE FROM orders WHERE id = 1","dry_run":true}' localhost:8080/v1/query
+```
+```json
+{"dry_run":true,"decision":"deny","decided_by":"policy","statement_type":"DELETE",
+ "database":"sales","tables":["sales.main.orders"],"targets":["sales.main.orders"],
+ "functions":[],"databases":["sales"],"resolved":true,"policy_sha256":"..."}
+```
+
+- **Negações do engine** (ATTACH, `UPDATE EXTENSIONS`...) aparecem como `"decided_by":"engine"`.
+- **SQL inválido** continua respondendo 400.
+- **Escopo:** o dry-run avalia a política para o próprio usuário autenticado. Ele vai para a auditoria como evento `dry_run`, mas fica fora das métricas de queries.
+
+## Limites por role
+
+Com `--policy-limits-query data.curral.limits`, depois que a política permite
+o request, essa regra pode devolver limites para ele:
+
+```rego
+limits := {"timeout": "30s", "max_rows": 10000} if "analyst" in input.roles
+```
+
+- **`timeout`:** aceita string de duração ou segundos e vale para a execução.
+- **`max_rows`:** corta a resposta, com o trailer `X-Curral-Error: row limit reached`.
+- **Teto global:** `--query-timeout` e `--max-rows` continuam valendo, e prevalece sempre o mais restritivo.
+- **Sem limites:** resultado indefinido significa nenhum limite.
+- **Fail-closed:** se a regra falhar (formato inválido, conflito de valores), o request é negado com 500.
+- **Onde aparecem:** na resposta do dry-run e no evento de auditoria (`limits`).
+- **Exemplo pronto:** `examples/policy.rego` lê os limites de `data.roles[role].limits`. No exemplo, o analyst tem 30 s e 10 mil linhas.
 
 ## Política (input)
 

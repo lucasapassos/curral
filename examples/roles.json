@@ -1,14 +1,31 @@
 {
-  "allowed_functions": ["range", "generate_series", "unnest"],
+  "allowed_functions": [
+    "range",
+    "generate_series",
+    "unnest"
+  ],
   "roles": {
     "analyst": {
-      "read": ["sales", "logs"],
+      "read": [
+        "sales",
+        "logs"
+      ],
       "write": [],
-      "deny_tables": ["sales.main.salaries"]
+      "deny_tables": [
+        "sales.main.salaries"
+      ],
+      "limits": {
+        "timeout": "30s",
+        "max_rows": 10000
+      }
     },
     "etl": {
-      "read": ["logs"],
-      "write": ["sales"],
+      "read": [
+        "logs"
+      ],
+      "write": [
+        "sales"
+      ],
       "deny_tables": []
     }
   }

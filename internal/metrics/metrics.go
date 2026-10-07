@@ -3,6 +3,7 @@ package metrics
 
 import (
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -17,7 +18,8 @@ type Sources struct {
 	CacheStats  func(database string) (hits, misses int64, ok bool)
 	CachedDBs   []string
 	AuditStats  func() (written, dropped int64, healthy bool) // nil: audit disabled
-	BuildLabels map[string]string                             // version, commit, duckdb, policy_sha256
+	PolicySHA   func() string                                 // hash of the policy in effect
+	BuildLabels map[string]string                             // version, commit, duckdb
 }
 
 type Metrics struct {
@@ -28,6 +30,17 @@ type Metrics struct {
 	rows      prometheus.Counter
 	bytes     prometheus.Counter
 	authFail  prometheus.Counter
+	reloads   *prometheus.CounterVec
+	policy    *policyCollector
+}
+
+// SetPolicySource sets where curral_policy_info reads the current hash.
+func (m *Metrics) SetPolicySource(f func() string) {
+	if m != nil {
+		m.policy.mu.Lock()
+		m.policy.sha = f
+		m.policy.mu.Unlock()
+	}
 }
 
 // Stages of a query, as reported in its timing.
@@ -65,8 +78,11 @@ func New(src Sources) *Metrics {
 		authFail: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "curral_auth_failures_total", Help: "Requests rejected for invalid credentials.",
 		}),
+		reloads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "curral_config_reloads_total", Help: "Users/policy reloads (SIGHUP) by result (ok, error).",
+		}, []string{"result"}),
 	}
-	reg.MustRegister(m.requests, m.decisions, m.stage, m.rows, m.bytes, m.authFail,
+	reg.MustRegister(m.requests, m.decisions, m.stage, m.rows, m.bytes, m.authFail, m.reloads,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	if src.Load != nil {
@@ -103,12 +119,32 @@ func New(src Sources) *Metrics {
 			"Catalog metadata cache lookups by database and result (hit, miss).",
 			[]string{"database", "result"}, nil)})
 	}
+	m.policy = &policyCollector{sha: src.PolicySHA, desc: prometheus.NewDesc(
+		"curral_policy_info", "The policy in effect, by hash of its files; always 1.", []string{"sha256"}, nil)}
+	reg.MustRegister(m.policy)
 	if src.BuildLabels != nil {
 		reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "curral_build_info", Help: "Build and policy identity; always 1.", ConstLabels: src.BuildLabels,
 		}, func() float64 { return 1 }))
 	}
 	return m
+}
+
+type policyCollector struct {
+	mu   sync.Mutex
+	sha  func() string
+	desc *prometheus.Desc
+}
+
+func (c *policyCollector) Describe(ch chan<- *prometheus.Desc) { ch <- c.desc }
+
+func (c *policyCollector) Collect(ch chan<- prometheus.Metric) {
+	c.mu.Lock()
+	f := c.sha
+	c.mu.Unlock()
+	if f != nil {
+		ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, 1, f())
+	}
 }
 
 type cacheCollector struct {
@@ -160,6 +196,12 @@ func (m *Metrics) ObserveQuery(q Query) {
 	}
 	m.rows.Add(float64(q.Rows))
 	m.bytes.Add(float64(q.Bytes))
+}
+
+func (m *Metrics) Reload(result string) {
+	if m != nil {
+		m.reloads.WithLabelValues(result).Inc()
+	}
 }
 
 func (m *Metrics) AuthFailure() {

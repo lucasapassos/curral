@@ -332,3 +332,21 @@ func TestSecretsNotExposed(t *testing.T) {
 		}
 	}
 }
+
+func TestExecTimeout(t *testing.T) {
+	e := newEngine(t, Options{QueryTimeout: time.Minute})
+	limit := 100 * time.Millisecond
+	start := time.Now()
+	_, _, err := run(e, Request{SQL: "SELECT count(*) FROM range(10000000000) a", ExecTimeout: &limit}, nil)
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 5*time.Second {
+		t.Fatalf("err=%v after %v", err, time.Since(start))
+	}
+	// A write within its limit still commits.
+	if _, _, err := run(e, Request{SQL: "INSERT INTO orders VALUES (7, 7)", ExecTimeout: &limit}, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, rows, _ := run(e, Request{SQL: "SELECT count(*) FROM orders WHERE id = 7"}, nil)
+	if rows[0][0] != int64(1) {
+		t.Fatalf("write with exec timeout not committed: %v", rows)
+	}
+}

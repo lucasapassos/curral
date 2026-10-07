@@ -1,13 +1,27 @@
 {
-  "allowed_functions": ["range", "generate_series", "unnest"],
+  "allowed_functions": [
+    "range",
+    "generate_series",
+    "unnest"
+  ],
   "roles": {
     "analyst": {
-      "read": ["lake"],
+      "read": [
+        "lake"
+      ],
       "write": [],
-      "deny_tables": ["lake.restricted.customers_pii"]
+      "deny_tables": [
+        "lake.restricted.customers_pii"
+      ],
+      "limits": {
+        "timeout": "30s",
+        "max_rows": 10000
+      }
     },
     "etl": {
-      "read": ["lake"],
+      "read": [
+        "lake"
+      ],
       "write": [],
       "deny_tables": []
     }

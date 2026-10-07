@@ -278,6 +278,10 @@ type Request struct {
 	Params   []any
 	Database string  // catalog to USE; empty means the default
 	Timing   *Timing // filled in when not nil
+	// ExecTimeout, read once authorize returns, bounds execution (e.g. a
+	// per-role limit from the policy). The engine's QueryTimeout still caps
+	// the whole request.
+	ExecTimeout *time.Duration
 }
 
 // Timing breaks a request's time down by stage.
@@ -386,6 +390,9 @@ func (e *Engine) Query(ctx context.Context, req Request,
 		}
 	}()
 
+	// Narrowed by ExecTimeout after authorization; also covers COMMIT.
+	execCtx, cancelExec := ctx, context.CancelFunc(func() {})
+	defer func() { cancelExec() }()
 	err = conn.Raw(func(dc any) error {
 		c := dc.(*duckdb.Conn)
 		// Prepare (not PrepareContext): it refuses multi-statement input
@@ -419,7 +426,10 @@ func (e *Engine) Query(ctx context.Context, req Request,
 			return err
 		}
 
-		dr, err := st.QueryContext(ctx, args)
+		if req.ExecTimeout != nil && *req.ExecTimeout > 0 {
+			execCtx, cancelExec = context.WithTimeout(ctx, *req.ExecTimeout)
+		}
+		dr, err := st.QueryContext(execCtx, args)
 		if err != nil {
 			return &QueryError{err}
 		}
@@ -439,7 +449,10 @@ func (e *Engine) Query(ctx context.Context, req Request,
 	if err != nil {
 		return err
 	}
-	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+	if err := execCtx.Err(); err != nil {
+		return err // timed out while streaming: roll back
+	}
+	if _, err := conn.ExecContext(execCtx, "COMMIT"); err != nil {
 		return &QueryError{err}
 	}
 	committed = true

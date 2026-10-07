@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -75,9 +76,12 @@ func newServerWithAudit(t *testing.T, auditPath string) (*httptest.Server, *audi
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { eng.Close() })
-	s := &Server{Engine: eng, Auth: auth.New(users, time.Minute), Policy: pol, Log: log, MaxBody: 1 << 20, Version: "test"}
+	s := &Server{Engine: eng, Log: log, MaxBody: 1 << 20, Version: "test"}
+	s.SetAuth(auth.New(users, time.Minute))
+	s.SetPolicy(pol)
 	s.Metrics = metrics.New(metrics.Sources{
-		Load: eng.Load, BuildLabels: map[string]string{"version": "test", "policy_sha256": pol.SHA256},
+		Load: eng.Load, PolicySHA: func() string { return s.Policy().SHA256 },
+		BuildLabels: map[string]string{"version": "test"},
 	})
 	lastServer = s
 	var aw *audit.Writer
@@ -304,7 +308,8 @@ func TestMetrics(t *testing.T) {
 		`curral_query_slots 4`,
 		`curral_queries_running 0`,
 		`curral_query_stage_seconds_count{stage="total"} 5`,
-		`curral_build_info{policy_sha256="` + s.Policy.SHA256 + `",version="test"} 1`,
+		`curral_build_info{version="test"} 1`,
+		`curral_policy_info{sha256="` + s.Policy().SHA256 + `"} 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing %s", want)
@@ -316,5 +321,171 @@ func TestMetrics(t *testing.T) {
 				t.Log(l)
 			}
 		}
+	}
+}
+
+func TestReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	ts, aw := newServerWithAudit(t, path)
+	s := lastServer
+	before := s.Policy().SHA256
+
+	if r := do(t, ts, "analyst", `{"sql":"SELECT id FROM orders"}`); r.status != 200 {
+		t.Fatalf("before reload: %d", r.status)
+	}
+
+	// A broken policy file keeps the previous policy in effect.
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "bad.rego")
+	os.WriteFile(bad, []byte("package curral\nallow if {"), 0o600)
+	_, err := policy.Load(context.Background(), "data.curral.allow", []string{bad})
+	s.Reload(nil, nil, err)
+	if s.Policy().SHA256 != before {
+		t.Fatal("failed reload replaced the policy")
+	}
+
+	// New policy: deny everything for non-admins; new users file without analyst.
+	strict := filepath.Join(dir, "strict.rego")
+	os.WriteFile(strict, []byte("package curral\nimport rego.v1\ndefault allow := false\nallow if \"admin\" in input.roles\n"), 0o600)
+	pol, err := policy.Load(context.Background(), "data.curral.allow", []string{strict})
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, _ := config.LoadUsers("../../examples/users.yaml")
+	var kept config.Users
+	for _, u := range all.Users {
+		if u.Name != "analyst" {
+			kept.Users = append(kept.Users, u)
+		}
+	}
+	s.Reload(auth.New(&kept, time.Minute), pol, nil)
+
+	if r := do(t, ts, "analyst", `{"sql":"SELECT id FROM orders"}`); r.status != 401 {
+		t.Fatalf("removed user still authenticates (cached?): %d", r.status)
+	}
+	if r := do(t, ts, "etl", `{"sql":"INSERT INTO orders VALUES (5, 1)"}`); r.status != 403 {
+		t.Fatalf("new policy not applied: %d", r.status)
+	}
+	if r := do(t, ts, "admin", `{"sql":"SELECT 1"}`); r.status != 200 {
+		t.Fatalf("admin after reload: %d", r.status)
+	}
+
+	aw.Close()
+	var reloads []audit.Event
+	var last audit.Event
+	for _, ev := range readAudit(t, path) {
+		if ev.Event == "config_reload" {
+			reloads = append(reloads, ev)
+		}
+		last = ev
+	}
+	if len(reloads) != 2 || reloads[0].Decision != "error" || reloads[0].PolicySHA256 != before ||
+		reloads[1].Decision != "allow" || reloads[1].PolicySHA256 != pol.SHA256 {
+		t.Fatalf("reload events: %+v", reloads)
+	}
+	if last.PolicySHA256 != pol.SHA256 {
+		t.Fatalf("queries after reload must record the new policy hash: %+v", last)
+	}
+}
+
+func TestDryRun(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	ts, aw := newServerWithAudit(t, path)
+	type resp struct {
+		DryRun    bool     `json:"dry_run"`
+		Decision  string   `json:"decision"`
+		DecidedBy string   `json:"decided_by"`
+		Tables    []string `json:"tables"`
+		Targets   []string `json:"targets"`
+		Resolved  bool     `json:"resolved"`
+	}
+	check := func(user, body string, status int, want resp) {
+		t.Helper()
+		r := do(t, ts, user, body)
+		var got resp
+		json.Unmarshal([]byte(r.body), &got)
+		if r.status != status || (status == 200 && (got.Decision != want.Decision || got.DecidedBy != want.DecidedBy ||
+			!slices.Equal(got.Tables, want.Tables) || !slices.Equal(got.Targets, want.Targets))) {
+			t.Errorf("%s %s: status=%d body=%s", user, body, r.status, r.body)
+		}
+	}
+	check("analyst", `{"sql":"SELECT * FROM orders","dry_run":true}`, 200,
+		resp{Decision: "allow", DecidedBy: "policy", Tables: []string{"sales.main.orders"}, Targets: []string{}})
+	check("analyst", `{"sql":"SELECT * FROM salaries","dry_run":true}`, 200,
+		resp{Decision: "deny", DecidedBy: "policy", Tables: []string{"sales.main.salaries"}, Targets: []string{}})
+	check("etl", `{"sql":"DELETE FROM orders WHERE id = 1","dry_run":true}`, 200,
+		resp{Decision: "allow", DecidedBy: "policy", Tables: []string{"sales.main.orders"}, Targets: []string{"sales.main.orders"}})
+	check("admin", `{"sql":"ATTACH ':memory:' AS m","dry_run":true}`, 200,
+		resp{Decision: "deny", DecidedBy: "engine", Tables: []string{}, Targets: []string{}})
+	check("analyst", `{"sql":"SELEC 1","dry_run":true}`, 400, resp{})
+
+	// The allowed DELETE must not have run.
+	if r := do(t, ts, "admin", `{"sql":"SELECT count(*) AS n FROM orders"}`); !strings.Contains(r.body, `"n":2`) {
+		t.Fatalf("dry run executed: %s", r.body)
+	}
+	aw.Close()
+	var dry int
+	for _, ev := range readAudit(t, path) {
+		if ev.Event == "dry_run" {
+			dry++
+		}
+	}
+	if dry != 5 {
+		t.Fatalf("dry_run audit events = %d", dry)
+	}
+}
+
+func TestPolicyLimits(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	ts, aw := newServerWithAudit(t, path)
+	f := filepath.Join(t.TempDir(), "limits.rego")
+	os.WriteFile(f, []byte(`package curral
+import rego.v1
+allow := true
+limits := {"timeout": "100ms", "max_rows": 1} if "analyst" in input.roles
+`), 0o600)
+	pol, err := policy.Load(context.Background(), "data.curral.allow", []string{f}, "data.curral.limits")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastServer.SetPolicy(pol)
+
+	r := do(t, ts, "analyst", `{"sql":"SELECT * FROM range(5)","format":"ndjson"}`)
+	if r.status != 200 || strings.Count(r.body, "\n") != 1 || r.trailer.Get("X-Curral-Error") != "row limit reached" {
+		t.Fatalf("max_rows: status=%d body=%q trailer=%v", r.status, r.body, r.trailer)
+	}
+	if r := do(t, ts, "admin", `{"sql":"SELECT * FROM range(5)","format":"ndjson"}`); strings.Count(r.body, "\n") != 5 {
+		t.Fatalf("admin must be unlimited: %q", r.body)
+	}
+	start := time.Now()
+	if r := do(t, ts, "analyst", `{"sql":"SELECT count(*) FROM range(10000000000)"}`); r.status != 504 || time.Since(start) > 5*time.Second {
+		t.Fatalf("timeout: status=%d after %v", r.status, time.Since(start))
+	}
+	r = do(t, ts, "analyst", `{"sql":"SELECT 1","dry_run":true}`)
+	if !strings.Contains(r.body, `"limits":{"max_rows":1,"timeout":"100ms"}`) {
+		t.Fatalf("dry run limits: %s", r.body)
+	}
+
+	// A limits rule that fails to evaluate denies the request.
+	os.WriteFile(f, []byte(`package curral
+import rego.v1
+allow := true
+limits := {"timeout": "soon"}
+`), 0o600)
+	pol, _ = policy.Load(context.Background(), "data.curral.allow", []string{f}, "data.curral.limits")
+	lastServer.SetPolicy(pol)
+	if r := do(t, ts, "admin", `{"sql":"SELECT 1"}`); r.status != 500 {
+		t.Fatalf("broken limits must fail closed: %d %s", r.status, r.body)
+	}
+
+	aw.Close()
+	var limited bool
+	for _, ev := range readAudit(t, path) {
+		if ev.User == "analyst" && ev.Limits["max_rows"] == float64(1) {
+			limited = true
+		}
+	}
+	if !limited {
+		t.Fatal("limits missing from audit events")
 	}
 }

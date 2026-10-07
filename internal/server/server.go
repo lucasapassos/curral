@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"curral/internal/audit"
@@ -34,8 +35,6 @@ const (
 
 type Server struct {
 	Engine  *engine.Engine
-	Auth    *auth.Authenticator
-	Policy  *policy.Policy
 	Log     *slog.Logger
 	MaxRows int64
 	MaxBody int64
@@ -44,6 +43,38 @@ type Server struct {
 	Audit    *audit.Writer    // nil disables auditing
 	AuditSQL string           // redacted (default), full or hash
 	Version  string
+
+	// Swapped atomically on reload; in-flight requests keep the version
+	// they started with.
+	authn atomic.Pointer[auth.Authenticator]
+	pol   atomic.Pointer[policy.Policy]
+}
+
+func (s *Server) SetAuth(a *auth.Authenticator) { s.authn.Store(a) }
+func (s *Server) SetPolicy(p *policy.Policy)    { s.pol.Store(p) }
+func (s *Server) Policy() *policy.Policy        { return s.pol.Load() }
+
+// Reload swaps in new users and policy (validated by the caller) and records
+// the change in the audit log. A non-nil err reports a failed reload attempt;
+// the previous configuration stays in effect.
+func (s *Server) Reload(a *auth.Authenticator, p *policy.Policy, err error) {
+	ev := &audit.Event{TS: time.Now().UTC(), Event: "config_reload", Version: s.Version}
+	if err != nil {
+		ev.Decision, ev.Error = "error", oneLine(err.Error())
+		ev.PolicySHA256 = s.Policy().SHA256
+		s.Log.Error("reload failed; keeping previous users and policy", "err", err)
+		s.Metrics.Reload("error")
+	} else {
+		old := s.Policy().SHA256
+		s.SetAuth(a)
+		s.SetPolicy(p)
+		ev.Decision, ev.PolicySHA256 = "allow", p.SHA256
+		s.Log.Info("users and policy reloaded", "policy_sha256", p.SHA256, "policy_changed", old != p.SHA256)
+		s.Metrics.Reload("ok")
+	}
+	if s.Audit != nil {
+		s.Audit.Record(ev)
+	}
 }
 
 // errAudit means the query was refused because it could not be audited.
@@ -87,7 +118,7 @@ func (s *Server) authed(h handler) http.HandlerFunc {
 		user, pass, ok := r.BasicAuth()
 		var p *auth.Principal
 		if ok {
-			p = s.Auth.Authenticate(user, pass)
+			p = s.authn.Load().Authenticate(user, pass)
 		}
 		if p == nil {
 			w.Header().Set("WWW-Authenticate", `Basic realm="curral", charset="UTF-8"`)
@@ -118,8 +149,8 @@ func (s *Server) newEvent(r *http.Request, kind string, p *auth.Principal) *audi
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		ev.RemoteAddr = host
 	}
-	if s.Policy != nil {
-		ev.PolicySHA256 = s.Policy.SHA256
+	if pol := s.Policy(); pol != nil {
+		ev.PolicySHA256 = pol.SHA256
 	}
 	if p != nil {
 		ev.User, ev.Roles = p.Name, p.Roles
@@ -148,6 +179,27 @@ type queryRequest struct {
 	Params   []any  `json:"params"`
 	Database string `json:"database"`
 	Format   string `json:"format"`
+	DryRun   bool   `json:"dry_run"` // inspect and decide, never execute
+}
+
+// errDryRun stops a dry run right after the policy decision.
+var errDryRun = errors.New("dry run")
+
+// dryRunResponse is what a dry run reports instead of executing.
+type dryRunResponse struct {
+	DryRun        bool           `json:"dry_run"`
+	Decision      string         `json:"decision"`
+	DecidedBy     string         `json:"decided_by"`
+	Reason        string         `json:"reason,omitempty"`
+	StatementType string         `json:"statement_type,omitempty"`
+	Database      string         `json:"database,omitempty"`
+	Tables        []string       `json:"tables"`
+	Targets       []string       `json:"targets"`
+	Functions     []string       `json:"functions"`
+	Databases     []string       `json:"databases"`
+	Resolved      bool           `json:"resolved"`
+	Limits        map[string]any `json:"limits,omitempty"`
+	PolicySHA256  string         `json:"policy_sha256"`
 }
 
 type countingWriter struct {
@@ -204,6 +256,10 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		return
 	}
 
+	// One policy version for the whole request, recorded in its audit event.
+	pol := s.Policy()
+	ev.PolicySHA256 = pol.SHA256
+
 	var (
 		insp         engine.Inspection
 		rows         int64
@@ -214,13 +270,15 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		policyE      error
 		auditE       error
 		reservation  *audit.Reservation
+		limits       policy.Limits
+		execTimeout  time.Duration
 		timing       engine.Timing
 	)
 	bytes.w = w
 	authorize := func(ctx context.Context, i engine.Inspection) error {
 		insp = i
 		policyCalled = true
-		ok, err := s.Policy.Allow(ctx, map[string]any{
+		input := map[string]any{
 			"user":           p.Name,
 			"roles":          p.Roles,
 			"sql":            req.SQL,
@@ -231,10 +289,21 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 			"functions":      i.Functions,
 			"databases":      i.Databases,
 			"resolved":       i.Resolved,
-		})
+		}
+		ok, err := pol.Allow(ctx, input)
+		if err == nil && ok {
+			// Limits are part of the decision: if they cannot be
+			// computed, the request is not allowed.
+			limits, err = pol.Limits(ctx, input)
+			execTimeout = limits.Timeout
+		}
 		if err != nil {
 			policyE = err
 			return err
+		}
+		if req.DryRun {
+			allowed = ok
+			return errDryRun
 		}
 		if !ok {
 			return engine.ErrForbidden
@@ -258,7 +327,7 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		w.WriteHeader(http.StatusOK)
 		rc := http.NewResponseController(w)
 		n, err := encode.Write(&bytes, format, cols, rs, encode.Options{
-			MaxRows: s.MaxRows,
+			MaxRows: minLimit(s.MaxRows, limits.MaxRows),
 			Flush:   func() { _ = rc.Flush() },
 		})
 		rows = n
@@ -269,7 +338,14 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		return err
 	}
 
-	err = s.Engine.Query(r.Context(), engine.Request{SQL: req.SQL, Params: params, Database: req.Database, Timing: &timing}, authorize, emit)
+	err = s.Engine.Query(r.Context(), engine.Request{
+		SQL: req.SQL, Params: params, Database: req.Database, Timing: &timing, ExecTimeout: &execTimeout,
+	}, authorize, emit)
+
+	if req.DryRun {
+		s.finishDryRun(w, ev, insp, limits, err, allowed, policyCalled, policyE)
+		return
+	}
 
 	status := http.StatusOK
 	if err != nil && !started {
@@ -325,6 +401,7 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		ev.Resolved = &resolved
 	}
 	ev.Status, ev.Rows, ev.Bytes = status, rows, bytes.n
+	ev.Limits = limitsJSON(limits)
 	if err != nil {
 		ev.Error = oneLine(err.Error())
 	}
@@ -341,6 +418,88 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 	} else {
 		s.Audit.Record(ev)
 	}
+}
+
+// finishDryRun answers a dry run with the inspection and the decision. SQL
+// errors and policy failures are reported as for a real query.
+func (s *Server) finishDryRun(w http.ResponseWriter, ev *audit.Event, insp engine.Inspection,
+	limits policy.Limits, err error, allowed, policyCalled bool, policyE error,
+) {
+	resp := dryRunResponse{
+		DryRun: true, PolicySHA256: ev.PolicySHA256,
+		StatementType: insp.StatementType, Database: insp.Database,
+		Tables: nonNil(insp.Tables), Targets: nonNil(insp.Targets),
+		Functions: nonNil(insp.Functions), Databases: nonNil(insp.Databases),
+		Resolved: insp.Resolved,
+	}
+	status := http.StatusOK
+	switch {
+	case policyCalled && policyE == nil:
+		resp.DecidedBy = "policy"
+		resp.Decision = "deny"
+		if allowed {
+			resp.Decision = "allow"
+			resp.Limits = limitsJSON(limits)
+			ev.Limits = resp.Limits
+		}
+	case errors.Is(err, engine.ErrForbidden):
+		resp.Decision, resp.DecidedBy, resp.Reason = "deny", "engine", err.Error()
+	default:
+		status = statusOf(err, policyE)
+		msg := err.Error()
+		if policyE != nil {
+			msg = "policy evaluation failed"
+		}
+		writeError(w, status, msg)
+	}
+	if status == http.StatusOK {
+		writeJSON(w, status, resp)
+	}
+	if s.Audit != nil {
+		ev.Event, ev.Status = "dry_run", status
+		if insp.StatementType != "" {
+			ev.StatementType, ev.Database = insp.StatementType, insp.Database
+			ev.Tables, ev.Targets, ev.Functions = insp.Tables, insp.Targets, insp.Functions
+			resolved := insp.Resolved
+			ev.Resolved = &resolved
+		}
+		if resp.Decision != "" {
+			ev.Decision, ev.DecidedBy = resp.Decision, resp.DecidedBy
+		} else {
+			ev.Decision, ev.DecidedBy, ev.Error = "error", "engine", oneLine(err.Error())
+		}
+		s.Audit.Record(ev)
+	}
+}
+
+// limitsJSON renders policy limits for responses and audit events.
+func limitsJSON(l policy.Limits) map[string]any {
+	if l == (policy.Limits{}) {
+		return nil
+	}
+	m := map[string]any{}
+	if l.Timeout > 0 {
+		m["timeout"] = l.Timeout.String()
+	}
+	if l.MaxRows > 0 {
+		m["max_rows"] = l.MaxRows
+	}
+	return m
+}
+
+// minLimit is the stricter of two limits where 0 means unlimited.
+func minLimit(a, b int64) int64 {
+	if a == 0 || (b > 0 && b < a) {
+		return b
+	}
+	return a
+}
+
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }
 
 // decisionOf classifies the outcome for the audit log: whether the request
