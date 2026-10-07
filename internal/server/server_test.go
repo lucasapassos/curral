@@ -458,7 +458,8 @@ limits := {"timeout": "100ms", "max_rows": 1} if "analyst" in input.roles
 	lastServer.SetPolicy(pol)
 
 	r := do(t, ts, "analyst", `{"sql":"SELECT * FROM range(5)","format":"ndjson"}`)
-	if r.status != 200 || strings.Count(r.body, "\n") != 1 || r.trailer.Get("X-Curral-Error") != "row limit reached" {
+	if r.status != 200 || strings.Count(r.body, "\n") != 1 || r.trailer.Get("X-Curral-Error") != "row limit reached" ||
+		r.header.Get("X-Curral-Max-Rows") != "1" {
 		t.Fatalf("max_rows: status=%d body=%q trailer=%v", r.status, r.body, r.trailer)
 	}
 	if r := do(t, ts, "admin", `{"sql":"SELECT * FROM range(5)","format":"ndjson"}`); strings.Count(r.body, "\n") != 5 {

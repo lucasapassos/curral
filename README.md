@@ -14,6 +14,46 @@ cliente ─HTTP─▶ curral
                  └─ EXECUTE ─▶ CSV / JSON / NDJSON em streaming
 ```
 
+## Instalação
+
+Pelos [releases](https://github.com/lucasapassos/curral/releases), há duas opções:
+
+```sh
+# imagem multi-arch (linux/amd64, linux/arm64), pública no Docker Hub
+docker pull lucasapassos/curral:latest
+
+# binário (Linux, glibc 2.35+), com as extensões httpfs/avro/iceberg já instaladas
+tar xzf curral_v0.1.0_linux_amd64.tar.gz && cd curral_v0.1.0_linux_amd64
+./curral serve --extension-dir ./extensions --catalog ... --users ... --policy ...
+```
+
+A imagem é pública. Os binários ficam nos releases do GitHub, cujo acesso
+segue a visibilidade do repositório.
+
+**Publicar uma versão:** acrescente a seção `## [vX.Y.Z]` ao `CHANGELOG.md`
+e envie a tag. O workflow `release` então:
+1. roda os testes;
+2. compila os binários das duas arquiteturas;
+3. publica a imagem no Docker Hub (precisa do secret `DOCKERHUB_TOKEN`);
+4. cria o release com as notas da seção.
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+## Cliente
+
+```sh
+export CURRAL_URL=https://curral.example.com CURRAL_TOKEN=curral_...   # ou CURRAL_USER/CURRAL_PASSWORD
+curral query "SELECT * FROM orders LIMIT 10"                          # CSV no stdout
+curral query -f arrow -o orders.arrow "SELECT * FROM orders"
+curral query -p 42 "SELECT * FROM orders WHERE id = \$1"
+echo "DELETE FROM orders" | curral query --dry-run -f json
+```
+
+O `curral query` sai com código de erro em respostas de erro e quando o
+resultado chega incompleto. Para Python, veja `clients/python`.
+
 ## Build
 
 Requer Go 1.25+ e um compilador C (cgo, por causa do DuckDB).

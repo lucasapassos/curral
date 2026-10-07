@@ -493,6 +493,11 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		h.Set("Content-Type", format.ContentType())
 		h.Set("X-Curral-Statement-Type", insp.StatementType)
 		h.Set("Trailer", "X-Curral-Error, X-Curral-Row-Count")
+		if max := minLimit(s.MaxRows, limits.MaxRows); max > 0 {
+			// Clients that cannot read trailers can still tell that a
+			// result with exactly this many rows may have been cut.
+			h.Set("X-Curral-Max-Rows", strconv.FormatInt(max, 10))
+		}
 		w.WriteHeader(http.StatusOK)
 		rc := http.NewResponseController(w)
 		n, err := encode.Write(&bytes, format, cols, rs, encode.Options{
@@ -513,6 +518,11 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		h.Set("Content-Type", contentType)
 		h.Set("X-Curral-Statement-Type", insp.StatementType)
 		h.Set("Trailer", "X-Curral-Error, X-Curral-Row-Count")
+		if max := minLimit(s.MaxRows, limits.MaxRows); max > 0 {
+			// Clients that cannot read trailers can still tell that a
+			// result with exactly this many rows may have been cut.
+			h.Set("X-Curral-Max-Rows", strconv.FormatInt(max, 10))
+		}
 		w.WriteHeader(http.StatusOK)
 	}
 	var emitArrow func(engine.ArrowWriter) error
@@ -589,6 +599,14 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 			metrics.StageTotal: total,
 		},
 	})
+
+	// A real failure after the 200 went out: abort the connection so every
+	// HTTP client sees an incomplete body, not a short result that looks
+	// complete (many clients cannot read the X-Curral-Error trailer). The
+	// row limit is not a failure; it ends cleanly.
+	if started && err != nil && !errors.Is(err, engine.ErrMaxRows) {
+		defer panic(http.ErrAbortHandler)
+	}
 
 	if s.Audit == nil {
 		return

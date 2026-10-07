@@ -1,0 +1,153 @@
+name: release
+
+# Push a tag like v0.1.0 to publish: tests, linux amd64/arm64 binaries,
+# a multi-arch image on Docker Hub and a GitHub release with notes from
+# CHANGELOG.md.
+#
+# Needs the repository secret DOCKERHUB_TOKEN (a Docker Hub access token with
+# Read & Write) and, if the namespace is not lucasapassos, the repository
+# variable DOCKERHUB_USERNAME.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME || 'lucasapassos' }}
+  IMAGE: docker.io/${{ vars.DOCKERHUB_USERNAME || 'lucasapassos' }}/curral
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: check Docker Hub credentials
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: test -n "$DOCKERHUB_TOKEN" || { echo "::error::repository secret DOCKERHUB_TOKEN is not set"; exit 1; }
+      - run: go vet -tags duckdb_arrow ./... && go test -count=1 -tags duckdb_arrow ./...
+
+  binaries:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          # 22.04 (glibc 2.35) so the binaries also run on older distributions.
+          - { runner: ubuntu-22.04, arch: amd64 }
+          - { runner: ubuntu-22.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: build
+        run: |
+          name=curral_${GITHUB_REF_NAME}_linux_${{ matrix.arch }}
+          mkdir -p dist/$name
+          CGO_ENABLED=1 go build -trimpath -tags duckdb_arrow \
+            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME} -X main.commit=${GITHUB_SHA}" \
+            -o dist/$name/curral ./cmd/curral
+          dist/$name/curral version
+          dist/$name/curral install-extensions --extension-dir dist/$name/extensions httpfs avro iceberg
+          cp README.md CHANGELOG.md dist/$name/
+          cp -r examples dist/$name/
+          tar -C dist -czf dist/$name.tar.gz $name
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.arch }}
+          path: dist/*.tar.gz
+
+  image:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-latest, platform: linux/amd64, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, platform: linux/arm64, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # Each architecture builds natively (no QEMU for the cgo/DuckDB build)
+      # and is pushed by digest; the manifest job joins them under the tags.
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+      - run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+
+  manifest:
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: tag multi-arch image
+        working-directory: digests
+        run: |
+          docker buildx imagetools create -t "$IMAGE:$GITHUB_REF_NAME" -t "$IMAGE:latest" \
+            $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:$GITHUB_REF_NAME"
+
+  release:
+    needs: [binaries, manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+      - name: notes from CHANGELOG
+        run: |
+          # The section for this version: from its "## [vX.Y.Z]" heading to the next "## ".
+          awk -v v="## [${GITHUB_REF_NAME}]" 'index($0, v) == 1 {on=1; next} on && /^## / {exit} on' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no section for ${GITHUB_REF_NAME}"; exit 1; }
+          printf '\n**Image:** `%s:%s` (linux/amd64, linux/arm64)\n' "$IMAGE" "$GITHUB_REF_NAME" >> notes.md
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist && sha256sum *.tar.gz > SHA256SUMS && cd ..
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+            --title "curral $GITHUB_REF_NAME" --notes-file notes.md

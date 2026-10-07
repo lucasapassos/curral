@@ -37,6 +37,7 @@ Usage:
   curral serve          [flags]   start the HTTP server
   curral check          [flags]   validate catalog, users and policy, then exit
   curral hash-password            read a password and print its bcrypt hash
+  curral query          [flags] [SQL]  run a statement on a curral server (client)
   curral gen-api-key NAME [ROLE...]
                                   create an API key; prints the key once and the users-file entry
   curral install-extensions --extension-dir DIR NAME...
@@ -66,6 +67,8 @@ func main() {
 		err = runHash()
 	case "gen-api-key":
 		err = runGenAPIKey(os.Args[2:])
+	case "query":
+		err = runQuery(os.Args[2:])
 	case "install-extensions":
 		err = runInstallExtensions(os.Args[2:])
 	case "healthcheck":
@@ -581,6 +584,8 @@ func runGenAPIKey(args []string) error {
 	fmt.Fprintf(os.Stderr, "  - name: %s\n    key_sha256: %s\n    roles: %s\n    # expires: 2027-12-31\n", args[0], hash, roles)
 	return nil
 }
+
+func readPassword(fd int) ([]byte, error) { return term.ReadPassword(fd) }
 
 func runHash() error {
 	var pass string
