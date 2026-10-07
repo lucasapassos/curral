@@ -9,7 +9,15 @@ import (
 	"slices"
 	"strings"
 
+	mapping "github.com/duckdb/duckdb-go-bindings"
 	duckdb "github.com/duckdb/duckdb-go/v2"
+)
+
+// Statement types the driver does not export constants for.
+var (
+	stmtMergeInto        = duckdb.StmtType(mapping.StatementTypeMergeInto)
+	stmtCopyDatabase     = duckdb.StmtType(mapping.StatementTypeCopyDatabase)
+	stmtUpdateExtensions = duckdb.StmtType(mapping.StatementTypeUpdateExtensions)
 )
 
 var stmtTypeNames = map[duckdb.StmtType]string{
@@ -41,6 +49,9 @@ var stmtTypeNames = map[duckdb.StmtType]string{
 	duckdb.STATEMENT_TYPE_ATTACH:       "ATTACH",
 	duckdb.STATEMENT_TYPE_DETACH:       "DETACH",
 	duckdb.STATEMENT_TYPE_MULTI:        "MULTI",
+	stmtMergeInto:                      "MERGE",
+	stmtCopyDatabase:                   "COPY_DATABASE",
+	stmtUpdateExtensions:               "UPDATE_EXTENSIONS",
 }
 
 func stmtTypeName(t duckdb.StmtType) string {
@@ -57,6 +68,20 @@ var planned = map[duckdb.StmtType]bool{
 	duckdb.STATEMENT_TYPE_UPDATE: true,
 	duckdb.STATEMENT_TYPE_DELETE: true,
 	duckdb.STATEMENT_TYPE_CREATE: true,
+	stmtMergeInto:                true,
+}
+
+// Statement types whose writes the tokenizer extracts.
+var writes = map[duckdb.StmtType]bool{
+	duckdb.STATEMENT_TYPE_INSERT:      true,
+	duckdb.STATEMENT_TYPE_UPDATE:      true,
+	duckdb.STATEMENT_TYPE_DELETE:      true,
+	duckdb.STATEMENT_TYPE_CREATE:      true,
+	duckdb.STATEMENT_TYPE_CREATE_FUNC: true,
+	duckdb.STATEMENT_TYPE_DROP:        true,
+	duckdb.STATEMENT_TYPE_ALTER:       true,
+	duckdb.STATEMENT_TYPE_COPY:        true,
+	stmtMergeInto:                     true,
 }
 
 // inspect resolves what a prepared statement reads and writes. Reads come from
@@ -117,12 +142,16 @@ func (e *Engine) inspect(ctx context.Context, c *duckdb.Conn, typ duckdb.StmtTyp
 		}
 	}
 
-	switch typ {
-	case duckdb.STATEMENT_TYPE_INSERT, duckdb.STATEMENT_TYPE_UPDATE, duckdb.STATEMENT_TYPE_DELETE,
-		duckdb.STATEMENT_TYPE_CREATE, duckdb.STATEMENT_TYPE_CREATE_FUNC, duckdb.STATEMENT_TYPE_DROP,
-		duckdb.STATEMENT_TYPE_ALTER, duckdb.STATEMENT_TYPE_COPY, duckdb.STATEMENT_TYPE_INVALID:
-		targets, reads, ok := writeTargets(query)
-		if !ok {
+	if !planned[typ] && !writes[typ] {
+		// No way to tell what this statement type touches (CALL, VACUUM,
+		// COPY DATABASE, future types...): leave it to the policy, fail closed.
+		insp.Resolved = false
+	}
+	if writes[typ] {
+		verb, targets, reads, ok := writeTargets(query)
+		// The verb the tokenizer found must be the statement DuckDB prepared;
+		// anything else means the two parsers disagree, so fail closed.
+		if !ok || !verbMatches(verb, typ) {
 			insp.Resolved = false
 		}
 		for _, t := range targets {
@@ -145,6 +174,28 @@ func (e *Engine) inspect(ctx context.Context, c *duckdb.Conn, typ duckdb.StmtTyp
 	}
 	insp.Databases = uniq(dbs)
 	return insp, nil
+}
+
+func verbMatches(verb string, typ duckdb.StmtType) bool {
+	switch verb {
+	case "INSERT":
+		return typ == duckdb.STATEMENT_TYPE_INSERT
+	case "UPDATE":
+		return typ == duckdb.STATEMENT_TYPE_UPDATE
+	case "DELETE", "TRUNCATE":
+		return typ == duckdb.STATEMENT_TYPE_DELETE
+	case "CREATE":
+		return typ == duckdb.STATEMENT_TYPE_CREATE || typ == duckdb.STATEMENT_TYPE_CREATE_FUNC
+	case "DROP":
+		return typ == duckdb.STATEMENT_TYPE_DROP
+	case "ALTER":
+		return typ == duckdb.STATEMENT_TYPE_ALTER
+	case "COPY":
+		return typ == duckdb.STATEMENT_TYPE_COPY
+	case "MERGE":
+		return typ == stmtMergeInto
+	}
+	return false
 }
 
 func restartTx(ctx context.Context, c *duckdb.Conn) error {

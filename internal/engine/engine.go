@@ -287,6 +287,7 @@ var alwaysDenied = map[duckdb.StmtType]bool{
 	duckdb.STATEMENT_TYPE_DETACH:    true,
 	duckdb.STATEMENT_TYPE_LOAD:      true,
 	duckdb.STATEMENT_TYPE_EXTENSION: true,
+	stmtUpdateExtensions:            true,
 }
 
 // Query inspects the statement, asks authorize, executes it and hands the

@@ -196,7 +196,12 @@ Proteções que valem independentemente da política:
 - **`lock_configuration`**: depois do boot a configuração fica travada e os clientes não conseguem mudar settings.
 - **Acesso externo**: `enable_external_access=false` por padrão. `read_*`, `COPY ... TO` e `ATTACH` novos ficam bloqueados.
 - **Extensões**: autoinstall/autoload e extensões community ficam desligados.
-- **Statements sempre negados**: `ATTACH`, `DETACH`, `LOAD` e `INSTALL`, qualquer que seja a política.
+- **Statements sempre negados**: `ATTACH`, `DETACH`, `LOAD`, `INSTALL` e `UPDATE EXTENSIONS`, qualquer que seja a política.
+- **Inspeção fail-closed**:
+  - Statements com construções léxicas que o tokenizer não modela igual ao DuckDB (`$$...$$`, comentários aninhados, `E'...'`) ficam com `resolved=false`.
+  - O verbo encontrado pelo tokenizer precisa bater com o tipo que o DuckDB preparou.
+  - Tipos sem tratamento explícito (CALL, VACUUM, COPY DATABASE...) também ficam com `resolved=false`.
+- **Ambiente limpo**: as variáveis referenciadas no catálogo (`${R2_TOKEN}`...) são removidas do ambiente do processo depois do boot.
 - **Multi-statement**: rejeitado antes de executar qualquer coisa.
 - **Conexão nova por request**: tabelas TEMP, variáveis e `USE` não vazam entre usuários.
 - **Uma transação por request**: inspeção, autorização e execução veem o mesmo snapshot. Os metadados de catálogos remotos são buscados uma vez por request; falhas fazem rollback.

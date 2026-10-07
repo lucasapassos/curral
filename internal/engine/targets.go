@@ -22,8 +22,13 @@ type token struct {
 // tokenize is a minimal SQL lexer: enough to find statement keywords and
 // object names. It understands comments, strings and quoted identifiers so
 // keywords inside them are never matched.
-func tokenize(s string) []token {
-	var out []token
+//
+// ok is false when the input uses lexical constructs this lexer does not model
+// exactly like DuckDB's parser (dollar-quoted strings, nested block comments,
+// E” escape strings, unterminated literals). Those could make it see a
+// different statement than DuckDB executes, so callers must fail closed.
+func tokenize(s string) (out []token, ok bool) {
+	ok = true
 	for i := 0; i < len(s); {
 		c := s[i]
 		switch {
@@ -36,13 +41,24 @@ func tokenize(s string) []token {
 		case c == '/' && i+1 < len(s) && s[i+1] == '*':
 			end := strings.Index(s[i+2:], "*/")
 			if end < 0 {
-				i = len(s)
-			} else {
-				i += end + 4
+				return out, false
 			}
+			if strings.Contains(s[i+2:i+2+end], "/*") {
+				return out, false // nested comment
+			}
+			i += end + 4
+		case c == '$' && (i+1 >= len(s) || !(s[i+1] >= '0' && s[i+1] <= '9')) && dollarQuote(s[i:]):
+			return out, false
 		case c == '\'' || c == '"':
+			if c == '\'' && len(out) > 0 {
+				// E'...' strings honour backslash escapes.
+				if prev := out[len(out)-1]; prev.kind == tokWord && prev.up == "E" && prev.pos+1 == i {
+					return out, false
+				}
+			}
 			start := i
 			var b strings.Builder
+			closed := false
 			i++
 			for i < len(s) {
 				if s[i] == c {
@@ -52,10 +68,14 @@ func tokenize(s string) []token {
 						continue
 					}
 					i++
+					closed = true
 					break
 				}
 				b.WriteByte(s[i])
 				i++
+			}
+			if !closed {
+				return out, false
 			}
 			k := tokQuoted
 			if c == '\'' {
@@ -77,7 +97,23 @@ func tokenize(s string) []token {
 			i++
 		}
 	}
-	return out
+	return out, ok
+}
+
+// dollarQuote reports whether s starts a dollar-quoted string: $$ or $tag$.
+// A plain $name parameter does not.
+func dollarQuote(s string) bool {
+	for j := 1; j < len(s); j++ {
+		switch c := s[j]; {
+		case c == '$':
+			return true
+		case isWordByte(c) || (j > 1 && c >= '0' && c <= '9'):
+			continue
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 func isWordByte(c byte) bool {
@@ -136,7 +172,11 @@ func (c *cursor) name() ([]string, bool) {
 // stripExplain removes EXPLAIN [ANALYZE] [(options)] and reports whether
 // ANALYZE (which executes the statement) was present.
 func stripExplain(q string) (inner string, analyze, ok bool) {
-	c := &cursor{toks: tokenize(q)}
+	toks, lexOK := tokenize(q)
+	if !lexOK {
+		return "", false, false
+	}
+	c := &cursor{toks: toks}
 	if !c.accept("EXPLAIN") {
 		return "", false, false
 	}
@@ -174,9 +214,13 @@ const secretMark = "\x00secret"
 var objectKinds = []string{"TABLE", "VIEW", "SCHEMA", "SEQUENCE", "MACRO", "FUNCTION", "TYPE", "INDEX", "SECRET"}
 
 // writeTargets finds the objects a DML/DDL statement writes, plus tables a
-// COPY ... TO reads. ok is false when the statement shape is not understood.
-func writeTargets(q string) (targets, reads [][]string, ok bool) {
-	toks := tokenize(q)
+// COPY ... TO reads, and the statement verb it found. ok is false when the
+// statement shape is not understood.
+func writeTargets(q string) (verb string, targets, reads [][]string, ok bool) {
+	toks, lexOK := tokenize(q)
+	if !lexOK {
+		return "", nil, nil, false
+	}
 	// The verb is the first statement keyword outside parentheses, which
 	// skips over a WITH clause's CTE bodies.
 	depth, start := 0, -1
@@ -196,9 +240,14 @@ func writeTargets(q string) (targets, reads [][]string, ok bool) {
 		}
 	}
 	if start < 0 {
-		return nil, nil, false
+		return "", nil, nil, false
 	}
-	c := &cursor{toks: toks, i: start}
+	verb = toks[start].up
+	t, r, ok := parseTarget(&cursor{toks: toks, i: start})
+	return verb, t, r, ok
+}
+
+func parseTarget(c *cursor) (targets, reads [][]string, ok bool) {
 	one := func() ([][]string, [][]string, bool) {
 		n, ok := c.name()
 		if !ok {

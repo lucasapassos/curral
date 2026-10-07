@@ -242,6 +242,11 @@ func runServe(args []string, checkOnly bool) error {
 		return err
 	}
 	defer eng.Close()
+	// The catalog's credentials now live inside DuckDB; keep them out of the
+	// process environment so nothing that can read it later finds them.
+	for _, name := range cat.EnvRefs {
+		os.Unsetenv(name)
+	}
 
 	dbs := make([]string, 0, len(eng.Databases()))
 	for _, d := range eng.Databases() {

@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -299,5 +301,34 @@ func TestQueryTimeout(t *testing.T) {
 	}
 	if time.Since(start) > 5*time.Second {
 		t.Fatal("query was not interrupted")
+	}
+}
+
+// Secrets created from the catalog must not be readable through SQL.
+func TestSecretsNotExposed(t *testing.T) {
+	const value = "curral-test-secret-value-1234"
+	cat := &config.Catalog{
+		Extensions: []string{"httpfs"},
+		Secrets: []config.Secret{{Name: "s", Type: "s3", Params: map[string]any{
+			"KEY_ID": "AKIA-curral-test", "SECRET": value,
+		}}},
+		Databases: []config.Database{{Name: "m", Path: ":memory:"}},
+	}
+	e, err := Open(context.Background(), cat, Options{MaxConcurrency: 1}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Skipf("httpfs unavailable: %v", err)
+	}
+	defer e.Close()
+	for _, q := range []string{
+		"SELECT * FROM duckdb_secrets()",
+		"SELECT secret_string FROM duckdb_secrets()",
+		"SELECT which_secret('s3://bucket/x', 's3')",
+		"SELECT current_setting('s3_secret_access_key')",
+		"SELECT * FROM duckdb_settings()",
+	} {
+		_, rows, err := run(e, Request{SQL: q}, nil)
+		if strings.Contains(fmt.Sprint(rows, err), value) {
+			t.Errorf("%s exposed the secret", q)
+		}
 	}
 }

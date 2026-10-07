@@ -43,6 +43,9 @@ databases:
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(c.EnvRefs) != 1 || c.EnvRefs[0] != "CURRAL_T_SECRET" {
+		t.Fatalf("env refs = %v", c.EnvRefs)
+	}
 	if c.Default != "lake" || c.Secrets[0].Params["SECRET"] != "abc" {
 		t.Fatalf("%+v", c)
 	}

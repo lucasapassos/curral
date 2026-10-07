@@ -19,6 +19,10 @@ type Catalog struct {
 	Databases  []Database     `yaml:"databases"`
 	Default    string         `yaml:"default"`
 	InitSQL    []string       `yaml:"init_sql"`
+
+	// EnvRefs lists the environment variables the file referenced, so the
+	// server can drop them from its environment once they are consumed.
+	EnvRefs []string `yaml:"-"`
 }
 
 // Secret becomes CREATE SECRET name (TYPE type, key value, ...).
@@ -110,8 +114,15 @@ func LoadCatalog(path string) (*Catalog, error) {
 	if err := loadYAML(path, &c); err != nil {
 		return nil, err
 	}
-	if err := c.expand(); err != nil {
+	refs := map[string]bool{}
+	expandHook = func(name string) { refs[name] = true }
+	err := c.expand()
+	expandHook = nil
+	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	for name := range refs {
+		c.EnvRefs = append(c.EnvRefs, name)
 	}
 	if err := c.validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
@@ -244,6 +255,9 @@ func loadYAML(path string, out any) error {
 	return nil
 }
 
+// expandHook, when set, sees every variable name ExpandEnv resolves.
+var expandHook func(name string)
+
 var envRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(:-([^}]*))?\}`)
 
 // ExpandEnv replaces ${VAR} and ${VAR:-default}. A missing variable without a
@@ -252,6 +266,9 @@ func ExpandEnv(s string) (string, error) {
 	var missing []string
 	out := envRe.ReplaceAllStringFunc(s, func(m string) string {
 		g := envRe.FindStringSubmatch(m)
+		if expandHook != nil {
+			expandHook(g[1])
+		}
 		if v, ok := os.LookupEnv(g[1]); ok {
 			return v
 		}
