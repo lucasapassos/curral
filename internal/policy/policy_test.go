@@ -144,3 +144,46 @@ func BenchmarkAllow(b *testing.B) {
 		}
 	}
 }
+
+func TestMasks(t *testing.T) {
+	ctx := context.Background()
+	f := filepath.Join(t.TempDir(), "m.rego")
+	os.WriteFile(f, []byte(`package curral
+import rego.v1
+allow := true
+masks := {"lake.s.pii": {"cpf": "last:2", "nome": "redact", "dn": "null", "email": {"sql": "'x@' || 'y'"}}} if not "pii_reader" in input.roles
+`), 0o600)
+	p, err := LoadQueries(ctx, []string{f}, Queries{Allow: "data.curral.allow", Masks: "data.curral.masks"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := p.Masks(ctx, map[string]any{"roles": []string{"analyst"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"cpf": `'***' || right(CAST("cpf" AS VARCHAR), 2)`, "nome": "'***'",
+		"dn": `CASE WHEN false THEN "dn" END`, "email": "'x@' || 'y'",
+	}
+	for col, w := range want {
+		if m["lake.s.pii"][col] != w {
+			t.Errorf("%s = %q", col, m["lake.s.pii"][col])
+		}
+	}
+	if m, err := p.Masks(ctx, map[string]any{"roles": []string{"pii_reader"}}); err != nil || m != nil {
+		t.Fatalf("reader: %v %v", m, err)
+	}
+	for _, body := range []string{
+		`masks := {"pii": {"c": "null"}}`, `masks := {"a.b.c": {"c": "hash"}}`, `masks := {"a.b.c": {"c": "last:x"}}`,
+		`masks := {"a.b.c": {"c": {"sql": ""}}}`, `masks := {"a.b.c": {"c": {"sql": "1", "x": 2}}}`, `masks := {"a.b.c": "x"}`,
+	} {
+		os.WriteFile(f, []byte("package curral\nimport rego.v1\nallow := true\n"+body), 0o600)
+		p, err := LoadQueries(ctx, []string{f}, Queries{Allow: "data.curral.allow", Masks: "data.curral.masks"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.Masks(ctx, map[string]any{}); err == nil {
+			t.Errorf("%s accepted", body)
+		}
+	}
+}

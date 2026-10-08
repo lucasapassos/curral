@@ -10,6 +10,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/open-policy-agent/opa/v1/ast"
@@ -19,6 +21,7 @@ import (
 type Policy struct {
 	query  rego.PreparedEvalQuery
 	limits *rego.PreparedEvalQuery // optional per-request limits
+	masks  *rego.PreparedEvalQuery // optional column masks
 	// SHA256 identifies the policy and data files loaded, so audit records
 	// show which version of the rules made each decision.
 	SHA256 string
@@ -28,6 +31,23 @@ type Policy struct {
 // loaded under data.*) once. query is the decision, e.g. data.curral.allow;
 // limitsQuery (optional, e.g. data.curral.limits) yields per-request limits.
 func Load(ctx context.Context, query string, files []string, limitsQuery ...string) (*Policy, error) {
+	q := Queries{Allow: query}
+	if len(limitsQuery) > 0 {
+		q.Limits = limitsQuery[0]
+	}
+	return LoadQueries(ctx, files, q)
+}
+
+// Queries names the rules a policy is evaluated with.
+type Queries struct {
+	Allow  string // required decision, e.g. data.curral.allow
+	Limits string // optional, e.g. data.curral.limits
+	Masks  string // optional, e.g. data.curral.masks
+}
+
+// LoadQueries compiles the policy files once for every configured query.
+func LoadQueries(ctx context.Context, files []string, q Queries) (*Policy, error) {
+	query := q.Allow
 	if len(files) == 0 {
 		return nil, fmt.Errorf("no policy files given")
 	}
@@ -43,12 +63,19 @@ func Load(ctx context.Context, query string, files []string, limitsQuery ...stri
 		return nil, fmt.Errorf("policy: %w", err)
 	}
 	p := &Policy{query: pq}
-	if len(limitsQuery) > 0 && limitsQuery[0] != "" {
-		lq, err := prepare(limitsQuery[0])
+	if q.Limits != "" {
+		lq, err := prepare(q.Limits)
 		if err != nil {
 			return nil, fmt.Errorf("policy limits: %w", err)
 		}
 		p.limits = &lq
+	}
+	if q.Masks != "" {
+		mq, err := prepare(q.Masks)
+		if err != nil {
+			return nil, fmt.Errorf("policy masks: %w", err)
+		}
+		p.masks = &mq
 	}
 	if p.SHA256, err = hashFiles(files); err != nil {
 		return nil, fmt.Errorf("policy: %w", err)
@@ -136,6 +163,77 @@ func (p *Policy) Limits(ctx context.Context, input map[string]any) (Limits, erro
 		return l, fmt.Errorf("limits must not be negative")
 	}
 	return l, nil
+}
+
+// Masks evaluates the masks query, if configured: table -> column -> SQL
+// expression replacing the column. An undefined result means no masks.
+// Values are presets ("null", "redact", "last:N") or {"sql": "..."}.
+// Anything malformed is an error, so the request is refused.
+func (p *Policy) Masks(ctx context.Context, input map[string]any) (map[string]map[string]string, error) {
+	if p.masks == nil {
+		return nil, nil
+	}
+	v, err := ast.InterfaceToValue(input)
+	if err != nil {
+		return nil, err
+	}
+	rs, err := p.masks.Eval(ctx, rego.EvalParsedInput(v))
+	if err != nil {
+		return nil, err
+	}
+	if len(rs) == 0 || len(rs[0].Expressions) == 0 {
+		return nil, nil
+	}
+	tables, ok := rs[0].Expressions[0].Value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("masks must be an object of tables, got %T", rs[0].Expressions[0].Value)
+	}
+	out := map[string]map[string]string{}
+	for table, cols := range tables {
+		if len(strings.Split(table, ".")) != 3 {
+			return nil, fmt.Errorf("masks: table %q must be catalog.schema.table", table)
+		}
+		colMap, ok := cols.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("masks.%s must be an object of columns", table)
+		}
+		out[table] = map[string]string{}
+		for col, m := range colMap {
+			expr, err := maskSQL(col, m)
+			if err != nil {
+				return nil, fmt.Errorf("masks.%s.%s: %w", table, col, err)
+			}
+			out[table][col] = expr
+		}
+	}
+	return out, nil
+}
+
+func maskSQL(col string, m any) (string, error) {
+	c := `"` + strings.ReplaceAll(col, `"`, `""`) + `"`
+	switch v := m.(type) {
+	case string:
+		switch {
+		case v == "null":
+			return "CASE WHEN false THEN " + c + " END", nil // NULL of the column's type
+		case v == "redact":
+			return "'***'", nil
+		case strings.HasPrefix(v, "last:"):
+			n, err := strconv.Atoi(strings.TrimPrefix(v, "last:"))
+			if err != nil || n < 0 {
+				return "", fmt.Errorf("invalid preset %q", v)
+			}
+			return fmt.Sprintf("'***' || right(CAST(%s AS VARCHAR), %d)", c, n), nil
+		}
+		return "", fmt.Errorf("unknown preset %q (null, redact, last:N or {\"sql\": ...})", v)
+	case map[string]any:
+		s, ok := v["sql"].(string)
+		if !ok || strings.TrimSpace(s) == "" || len(v) != 1 {
+			return "", fmt.Errorf(`custom masks are {"sql": "<expression>"}`)
+		}
+		return s, nil
+	}
+	return "", fmt.Errorf("unsupported mask %T", m)
 }
 
 // hashFiles hashes names and contents of the given files, walking

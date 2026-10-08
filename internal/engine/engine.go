@@ -13,6 +13,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -73,6 +74,8 @@ type Engine struct {
 	schemas   map[string]string // name -> schema used by USE
 	scanFuncs map[string]bool   // table functions that scan attached non-DuckDB catalogs
 	caches    map[string]*catalogcache.Proxy
+	subqCache sync.Map     // protection SQL -> serialized statement (immutable once stored)
+	subqCount atomic.Int64 // entries in subqCache, bounded by maxSubqCache
 	waiting   atomic.Int64 // requests waiting for a slot
 	log       *slog.Logger
 }
@@ -316,6 +319,14 @@ type Request struct {
 	// EmitArrow, when set, replaces emit: the result goes out as an Arrow
 	// IPC stream written by the ArrowWriter it is handed.
 	EmitArrow func(ArrowWriter) error
+	// Protect, read once authorize returns, maps qualified tables to the
+	// row filter and column masks they must be read with. Only SELECT can
+	// read protected tables; the statement is rewritten to apply them.
+	Protect *map[string]Protection
+	// User and Roles are exposed to filters and masks as the session
+	// variables curral_user and curral_roles (getvariable(...)).
+	User  string
+	Roles []string
 }
 
 // Timing breaks a request's time down by stage.
@@ -335,6 +346,10 @@ type Inspection struct {
 	Functions     []string `json:"functions"` // table functions used as sources (read_csv, range, ...)
 	Databases     []string `json:"databases"`
 	Resolved      bool     `json:"resolved"` // false: tables/targets may be incomplete
+
+	// Raw plan sources (with repeats), reused by the protection rewrite.
+	planTables, planFuncs []string
+	planned               bool
 }
 
 // Column describes a result column.
@@ -465,12 +480,33 @@ func (e *Engine) Query(ctx context.Context, req Request,
 			return err
 		}
 
+		execSQL := req.SQL
+		if req.Protect != nil && len(*req.Protect) > 0 {
+			if typ != duckdb.STATEMENT_TYPE_SELECT {
+				return errProtected("protected tables can only be read with SELECT")
+			}
+			rewritten, err := e.protect(ctx, c, req.SQL, args, database, *req.Protect, insp)
+			if err != nil {
+				return err
+			}
+			if err := setSessionVariables(ctx, c, req.User, req.Roles); err != nil {
+				return err
+			}
+			rs, err := c.Prepare(rewritten)
+			if err != nil {
+				return &QueryError{fmt.Errorf("applying row filters/masks: %w", err)}
+			}
+			defer rs.Close()
+			st, execSQL = rs.(*duckdb.Stmt), rewritten
+			lap(&tm.Authorize)
+		}
+
 		if req.ExecTimeout != nil && *req.ExecTimeout > 0 {
 			execCtx, cancelExec = context.WithTimeout(ctx, *req.ExecTimeout)
 		}
 		if req.EmitArrow != nil {
 			return req.EmitArrow(func(w io.Writer, maxRows int64) (int64, error) {
-				return writeArrow(execCtx, c, req.SQL, args, w, maxRows)
+				return writeArrow(execCtx, c, execSQL, args, w, maxRows)
 			})
 		}
 		dr, err := st.QueryContext(execCtx, args)
@@ -501,6 +537,27 @@ func (e *Engine) Query(ctx context.Context, req Request,
 	}
 	committed = true
 	return nil
+}
+
+// setSessionVariables exposes the caller to filters and masks. The
+// connection is new for this request, and users cannot run SET VARIABLE
+// themselves (one statement per request, and it would be the statement).
+func setSessionVariables(ctx context.Context, c *duckdb.Conn, user string, roles []string) error {
+	rl := make([]any, len(roles))
+	for i, r := range roles {
+		rl[i] = r
+	}
+	list, err := literal(rl)
+	if err != nil {
+		return err
+	}
+	if len(roles) == 0 {
+		list = "[]::VARCHAR[]"
+	}
+	// One round trip; both statements are built here, not from user input.
+	_, err = c.ExecContext(ctx, "SET VARIABLE curral_user = "+quoteString(user)+
+		"; SET VARIABLE curral_roles = "+list, nil)
+	return err
 }
 
 func (e *Engine) acquire(ctx context.Context) error {

@@ -1,0 +1,17 @@
+# Row-level security (--row-filters examples/rls.yaml). Reloaded on SIGHUP.
+#
+# Per table (catalog.schema.table), each rule limits the rows seen by the users
+# it matches: any of roles, or users (exact name or *@domain). A user matching
+# several rules sees the union (OR). Users matching no rule are not limited:
+# whether they may read the table at all is up to the policy.
+#
+# In where, getvariable('curral_user') is the user name and
+# getvariable('curral_roles') the list of roles, e.g. for an ACL table:
+#   where: "region IN (SELECT region FROM ctl.main.acl WHERE usr = getvariable('curral_user'))"
+tables:
+  sales.main.orders:
+    rules:
+      - roles: [analyst]
+        where: "amount < 500"
+      - users: ["auditor@example.com"]
+        where: "true"

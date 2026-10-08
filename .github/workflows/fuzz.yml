@@ -1,7 +1,10 @@
 name: fuzz
 
-# Differential fuzzing of the write-target inspection: executes generated
-# statements and fails if one changes an object its inspection did not report.
+# Differential fuzzing:
+# - write-target inspection: fails if a statement changes an object its
+#   inspection did not report;
+# - row filters/masks: fails if a protected query returns anything other than
+#   the same query over a pre-filtered, pre-masked copy of the table.
 on:
   schedule:
     - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC
@@ -21,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [FuzzWriteTargets, FuzzWriteTargetsGrammar]
+        target: [FuzzWriteTargets, FuzzWriteTargetsGrammar, FuzzProtectDifferential]
     steps:
       - uses: actions/checkout@v5
 

@@ -29,5 +29,10 @@
       ],
       "deny_tables": []
     }
+  },
+  "masks": {
+    "sales.main.orders": {
+      "amount": "null"
+    }
   }
 }

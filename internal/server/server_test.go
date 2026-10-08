@@ -30,6 +30,7 @@ import (
 	"curral/internal/engine"
 	"curral/internal/metrics"
 	"curral/internal/policy"
+	"curral/internal/rls"
 )
 
 func newServer(t testing.TB) *httptest.Server {
@@ -823,5 +824,85 @@ func TestConcurrencyPerUser(t *testing.T) {
 	}
 	if throttled != 3 {
 		t.Fatalf("throttled audit events = %d", throttled)
+	}
+}
+
+func TestRowFiltersAndMasks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	ts, aw := newServerWithAudit(t, path)
+	s := lastServer
+	if r := do(t, ts, "admin", `{"sql":"INSERT INTO salaries VALUES ('Ana', 100), ('Bia', 200), ('Caio', 300)"}`); r.status != 200 {
+		t.Fatalf("seed: %d %s", r.status, r.body)
+	}
+	dir := t.TempDir()
+	pf := filepath.Join(dir, "p.rego")
+	os.WriteFile(pf, []byte(`package curral
+import rego.v1
+allow := true
+masks := {"sales.main.salaries": {"value": "null", "name": "last:1"}} if not "admin" in input.roles
+`), 0o600)
+	pol, err := policy.LoadQueries(context.Background(), []string{pf}, policy.Queries{Allow: "data.curral.allow", Masks: "data.curral.masks"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetPolicy(pol)
+	rf := filepath.Join(dir, "rls.yaml")
+	os.WriteFile(rf, []byte(`tables:
+  sales.main.salaries:
+    rules:
+      - roles: [analyst]
+        where: "name = 'Ana'"
+      - users: [etl]
+        where: "value >= 200"
+`), 0o600)
+	rules, err := rls.Load(rf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetRowFilters(rules)
+
+	q := `{"sql":"SELECT name, value FROM salaries ORDER BY name","format":"csv"}`
+	for user, want := range map[string]string{
+		"analyst": "name,value\n***a,\n",                      // only Ana, masked
+		"etl":     "name,value\n***a,\n***o,\n",               // value >= 200: Bia, Caio
+		"admin":   "name,value\nAna,100\nBia,200\nCaio,300\n", // no rule, no mask
+	} {
+		if r := do(t, ts, user, q); r.status != 200 || r.body != want {
+			t.Errorf("%s: %d %q", user, r.status, r.body)
+		}
+	}
+	// No oracle: filtering on the real value finds nothing.
+	if r := do(t, ts, "etl", `{"sql":"SELECT count(*) AS n FROM salaries WHERE value = 300"}`); !strings.Contains(r.body, `"n":0`) {
+		t.Errorf("filter on masked value: %s", r.body)
+	}
+	// Writes and indirect reads of protected tables are refused.
+	if r := do(t, ts, "etl", `{"sql":"INSERT INTO orders SELECT 9, value FROM salaries"}`); r.status != 403 {
+		t.Errorf("non-SELECT: %d %s", r.status, r.body)
+	}
+	// Dry run reports what would apply.
+	r := do(t, ts, "analyst", `{"sql":"SELECT * FROM salaries","dry_run":true}`)
+	if !strings.Contains(r.body, `"row_filters":["sales.main.salaries"]`) || !strings.Contains(r.body, `"masked_columns":{"sales.main.salaries":["name","value"]}`) {
+		t.Errorf("dry run: %s", r.body)
+	}
+	// Reloaded rules apply at once.
+	os.WriteFile(rf, []byte("tables:\n  sales.main.salaries:\n    rules:\n      - roles: [analyst]\n        where: \"name <> 'Ana'\"\n"), 0o600)
+	rules, _ = rls.Load(rf)
+	s.SetRowFilters(rules)
+	if r := do(t, ts, "analyst", q); r.body != "name,value\n***a,\n***o,\n" {
+		t.Errorf("after reload: %q", r.body)
+	}
+
+	aw.Close()
+	var audited, denied bool
+	for _, ev := range readAudit(t, path) {
+		if ev.User == "analyst" && len(ev.RowFilters) == 1 && len(ev.MaskedColumns["sales.main.salaries"]) == 2 {
+			audited = true
+		}
+		if ev.User == "etl" && ev.DecidedBy == "protection" && ev.Status == 403 {
+			denied = true
+		}
+	}
+	if !audited || !denied {
+		t.Fatalf("audit: filters recorded=%v protection denial=%v", audited, denied)
 	}
 }

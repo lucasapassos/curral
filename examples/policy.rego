@@ -12,6 +12,9 @@
 #   databases       catalogs touched by tables + targets
 #   resolved        false when tables/targets could not be fully determined
 #
+# Row filters (who sees which rows) live in the --row-filters file; see
+# examples/rls.yaml.
+#
 # data.roles comes from roles.json (pass it with another --policy flag).
 package curral
 
@@ -80,4 +83,13 @@ limits := data.roles[role].limits if {
 	not "admin" in input.roles
 	count(input.roles) == 1
 	role := input.roles[0]
+}
+
+# Optional column masks, enabled with --policy-masks-query data.curral.masks:
+# {table: {column: mask}}, with mask "null", "redact", "last:N" or {"sql": "..."}.
+# Masked values are computed before the user's query sees the table, so it
+# cannot filter, join or group on the real values.
+masks := data.masks if {
+	not "admin" in input.roles
+	not "pii_reader" in input.roles
 }

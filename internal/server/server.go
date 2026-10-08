@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -24,6 +26,7 @@ import (
 	"curral/internal/engine"
 	"curral/internal/metrics"
 	"curral/internal/policy"
+	"curral/internal/rls"
 )
 
 // SQL text modes for audit events.
@@ -60,13 +63,46 @@ type Server struct {
 
 	// Swapped atomically on reload; in-flight requests keep the version
 	// they started with.
-	authn atomic.Pointer[auth.Authenticator]
-	pol   atomic.Pointer[policy.Policy]
+	authn      atomic.Pointer[auth.Authenticator]
+	pol        atomic.Pointer[policy.Policy]
+	rowFilters atomic.Pointer[rls.Rules]
 }
 
 func (s *Server) SetAuth(a *auth.Authenticator) { s.authn.Store(a) }
-func (s *Server) SetPolicy(p *policy.Policy)    { s.pol.Store(p) }
-func (s *Server) Policy() *policy.Policy        { return s.pol.Load() }
+
+// SetRowFilters swaps in a validated RLS rule set (nil: none).
+func (s *Server) SetRowFilters(r *rls.Rules) { s.rowFilters.Store(r) }
+
+// protections combines the caller's row filters (RLS file) and column masks
+// (policy) for the tables the statement reads. Tables with neither are
+// left out, so their queries run unchanged.
+func (s *Server) protections(ctx context.Context, pol *policy.Policy, input map[string]any,
+	insp engine.Inspection, p *auth.Principal,
+) (map[string]engine.Protection, error) {
+	masks, err := pol.Masks(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	rules := s.rowFilters.Load()
+	out := map[string]engine.Protection{}
+	for _, t := range insp.Tables {
+		var pr engine.Protection
+		if where, ok := rules.Filter(t, p.Name, p.Roles); ok {
+			pr.Filter = where
+		}
+		for mt, cols := range masks {
+			if strings.EqualFold(mt, t) {
+				pr.Masks = cols
+			}
+		}
+		if pr.Filter != "" || len(pr.Masks) > 0 {
+			out[t] = pr
+		}
+	}
+	return out, nil
+}
+func (s *Server) SetPolicy(p *policy.Policy) { s.pol.Store(p) }
+func (s *Server) Policy() *policy.Policy     { return s.pol.Load() }
 
 // Reload swaps in new users and policy (validated by the caller) and records
 // the change in the audit log. A non-nil err reports a failed reload attempt;
@@ -319,19 +355,21 @@ var errDryRun = errors.New("dry run")
 
 // dryRunResponse is what a dry run reports instead of executing.
 type dryRunResponse struct {
-	DryRun        bool           `json:"dry_run"`
-	Decision      string         `json:"decision"`
-	DecidedBy     string         `json:"decided_by"`
-	Reason        string         `json:"reason,omitempty"`
-	StatementType string         `json:"statement_type,omitempty"`
-	Database      string         `json:"database,omitempty"`
-	Tables        []string       `json:"tables"`
-	Targets       []string       `json:"targets"`
-	Functions     []string       `json:"functions"`
-	Databases     []string       `json:"databases"`
-	Resolved      bool           `json:"resolved"`
-	Limits        map[string]any `json:"limits,omitempty"`
-	PolicySHA256  string         `json:"policy_sha256"`
+	DryRun        bool                `json:"dry_run"`
+	Decision      string              `json:"decision"`
+	DecidedBy     string              `json:"decided_by"`
+	Reason        string              `json:"reason,omitempty"`
+	StatementType string              `json:"statement_type,omitempty"`
+	Database      string              `json:"database,omitempty"`
+	Tables        []string            `json:"tables"`
+	Targets       []string            `json:"targets"`
+	Functions     []string            `json:"functions"`
+	Databases     []string            `json:"databases"`
+	Resolved      bool                `json:"resolved"`
+	Limits        map[string]any      `json:"limits,omitempty"`
+	RowFilters    []string            `json:"row_filters,omitempty"`
+	MaskedColumns map[string][]string `json:"masked_columns,omitempty"`
+	PolicySHA256  string              `json:"policy_sha256"`
 }
 
 // startOnWrite calls start before the first write.
@@ -418,6 +456,7 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		auditE       error
 		reservation  *audit.Reservation
 		limits       policy.Limits
+		protect      map[string]engine.Protection
 		throttled    bool
 		heldGroup    string
 		execTimeout  time.Duration
@@ -445,6 +484,11 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 			// computed, the request is not allowed.
 			limits, err = pol.Limits(ctx, input)
 			execTimeout = limits.Timeout
+			if err == nil {
+				// Row filters and masks, like limits, are part of the
+				// decision: failing to compute them refuses the request.
+				protect, err = s.protections(ctx, pol, input, i, p)
+			}
 		}
 		if err != nil {
 			policyE = err
@@ -546,10 +590,11 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 	err = s.Engine.Query(r.Context(), engine.Request{
 		EmitArrow: emitArrow,
 		SQL:       req.SQL, Params: params, Database: req.Database, Timing: &timing, ExecTimeout: &execTimeout,
+		Protect: &protect, User: p.Name, Roles: p.Roles,
 	}, authorize, emit)
 
 	if req.DryRun {
-		s.finishDryRun(w, ev, insp, limits, err, allowed, policyCalled, policyE)
+		s.finishDryRun(w, ev, insp, limits, protect, err, allowed, policyCalled, policyE)
 		return
 	}
 
@@ -620,6 +665,10 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 	}
 	ev.Status, ev.Rows, ev.Bytes = status, rows, bytes.n
 	ev.Limits = limitsJSON(limits)
+	ev.RowFilters, ev.MaskedColumns = protectionSummary(protect)
+	if len(protect) > 0 && err == nil {
+		s.Metrics.Rewritten()
+	}
 	if err != nil {
 		ev.Error = oneLine(err.Error())
 	}
@@ -641,7 +690,7 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 // finishDryRun answers a dry run with the inspection and the decision. SQL
 // errors and policy failures are reported as for a real query.
 func (s *Server) finishDryRun(w http.ResponseWriter, ev *audit.Event, insp engine.Inspection,
-	limits policy.Limits, err error, allowed, policyCalled bool, policyE error,
+	limits policy.Limits, protect map[string]engine.Protection, err error, allowed, policyCalled bool, policyE error,
 ) {
 	resp := dryRunResponse{
 		DryRun: true, PolicySHA256: ev.PolicySHA256,
@@ -659,6 +708,8 @@ func (s *Server) finishDryRun(w http.ResponseWriter, ev *audit.Event, insp engin
 			resp.Decision = "allow"
 			resp.Limits = limitsJSON(limits)
 			ev.Limits = resp.Limits
+			resp.RowFilters, resp.MaskedColumns = protectionSummary(protect)
+			ev.RowFilters, ev.MaskedColumns = resp.RowFilters, resp.MaskedColumns
 		}
 	case errors.Is(err, engine.ErrForbidden):
 		resp.Decision, resp.DecidedBy, resp.Reason = "deny", "engine", err.Error()
@@ -688,6 +739,24 @@ func (s *Server) finishDryRun(w http.ResponseWriter, ev *audit.Event, insp engin
 		}
 		s.Audit.Record(ev)
 	}
+}
+
+// protectionSummary lists filtered tables and masked columns (names only)
+// for audit events and dry runs.
+func protectionSummary(prot map[string]engine.Protection) (filtered []string, masked map[string][]string) {
+	for t, p := range prot {
+		if p.Filter != "" {
+			filtered = append(filtered, t)
+		}
+		if len(p.Masks) > 0 {
+			if masked == nil {
+				masked = map[string][]string{}
+			}
+			masked[t] = slices.Sorted(maps.Keys(p.Masks))
+		}
+	}
+	slices.Sort(filtered)
+	return filtered, masked
 }
 
 // limitsJSON renders policy limits for responses and audit events.
@@ -732,6 +801,8 @@ func decisionOf(err error, allowed, policyCalled bool, policyE, auditE error) (d
 	switch {
 	case auditE != nil:
 		return "error", "audit"
+	case allowed && errors.Is(err, engine.ErrForbidden):
+		return "deny", "protection" // filters/masks could not be applied safely
 	case allowed:
 		return "allow", "policy" // execution errors are in the error field
 	case policyE != nil:

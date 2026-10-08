@@ -105,6 +105,8 @@ vírgula: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--policy` | — | `.rego` ou dados JSON/YAML (`data.*`), repetível |
 | `--policy-query` | `data.curral.allow` | decisão que precisa ser `true` |
 | `--policy-limits-query` | (desligado) | regra opcional com limites por request, ex.: `data.curral.limits` |
+| `--policy-masks-query` | (desligado) | regra opcional com máscaras de colunas, ex.: `data.curral.masks` |
+| `--row-filters` | (desligado) | arquivo de RLS: quais linhas cada usuário vê, por tabela; recarrega no `SIGHUP` |
 | `--max-concurrency` | 8 | queries executando ao mesmo tempo |
 | `--queue-timeout` | 5s | espera por um slot livre; depois disso responde 503 |
 | `--max-concurrency-per-user` | 0 (sem limite) | queries simultâneas por usuário quando a política não define `max_concurrency` |
@@ -441,6 +443,74 @@ serialização), numa máquina de 6 cores:
 - **Queries pequenas:** a latência é dominada pelo custo fixo do DuckDB. Cerca
   de 0,25 ms vêm de garantias que foram mantidas de propósito: conexão nova por
   request (isolamento entre usuários) e a inspeção que alimenta a política.
+
+## Proteção de dados: filtro de linhas (RLS) e mascaramento
+
+Além de liberar ou negar tabelas, o curral pode limitar **quais linhas** um
+usuário vê e **mascarar colunas** sensíveis.
+
+**Filtro de linhas** (`--row-filters rls.yaml`, recarrega no `SIGHUP`):
+
+```yaml
+tables:
+  lake.analytics.customers:          # catalog.schema.table
+    rules:
+      - roles: [analyst_north]
+        where: "region = 'north'"
+      - users: ["ana@gmail.com", "*@corp.com"]
+        where: "region IN (SELECT region FROM ctl.main.acl WHERE usr = getvariable('curral_user'))"
+```
+
+- **Alcance das regras:** as regras valem só para quem casa com elas, por role
+  ou por usuário (exato ou `*@domínio`). Várias regras para o mesmo usuário
+  entram com `OR`.
+- **Quem não casa com nenhuma regra** não é filtrado. Se essa pessoa pode ler a
+  tabela, quem decide é a política.
+- **Contexto do usuário:** `getvariable('curral_user')` e
+  `getvariable('curral_roles')` permitem usar uma tabela de ACL, de modo que o
+  acesso muda editando dados, não configuração.
+- **Validação:** cada `where` é validado contra a tabela real no boot, no
+  `check` e no reload. Um erro aborta o boot; no reload, mantém o arquivo
+  anterior.
+
+**Mascaramento**, pela política (`--policy-masks-query data.curral.masks`):
+
+```rego
+masks := {"lake.analytics.customers": {"cpf": "last:2", "nome": "redact", "birth_date": "null"}} if {
+	not "pii_reader" in input.roles
+}
+```
+
+- **Presets:** `null` (preserva o tipo da coluna), `redact` (`'***'`) e
+  `last:N`. Para casos específicos, `{"sql": "<expressão>"}`.
+
+**Como é aplicado.** Cada referência à tabela na query do usuário vira, na
+árvore sintática do próprio DuckDB, uma subquery que **primeiro** filtra as
+linhas e mascara as colunas. A query original roda por cima dessa subquery, o
+que tem três consequências:
+- **Sem oráculo:** `WHERE cpf = '...'`, joins e agrupamentos operam sobre os
+  valores mascarados, então não dá para descobrir o valor real por exclusão.
+- **Só SELECT:** um não-SELECT que leia uma tabela protegida (`INSERT ...
+  SELECT`, `CREATE TABLE AS`) recebe 403.
+- **Fail-closed:** a query também é negada, com
+  `decided_by: protection` na auditoria, quando:
+  - a tabela é lida **indiretamente**, por uma view ou macro (o número de
+    scans no plano não bate com as referências na query);
+  - a query não sobrevive intacta à ida e volta SQL → árvore → SQL;
+  - a tabela usa `TABLESAMPLE` ou time travel (`AT`);
+  - a query é `PIVOT`.
+
+**Rastreio:** o dry-run e a auditoria mostram `row_filters` e
+`masked_columns`, e as queries reescritas contam em
+`curral_queries_rewritten_total`.
+
+**Verificação:** um teste diferencial compara cada query protegida com a mesma
+query sobre uma cópia da tabela já filtrada e mascarada; os resultados precisam
+ser idênticos. Ele roda no CI, e o fuzz `FuzzProtectDifferential` roda toda
+semana.
+
+**Custo:** cerca de +1,6 ms por query que toca uma tabela protegida. As demais
+não mudam.
 
 ## Justiça entre usuários
 

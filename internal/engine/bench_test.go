@@ -46,3 +46,13 @@ func BenchmarkPlanTables(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkQueryProtected(b *testing.B) {
+	e := newEngine(b, Options{MaxConcurrency: 8})
+	prot := map[string]Protection{"sales.main.orders": {Filter: "id > 0", Masks: map[string]string{"amount": "0"}}}
+	for b.Loop() {
+		if _, err := runProtected(e, "SELECT * FROM orders WHERE id = 1", prot); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

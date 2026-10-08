@@ -136,6 +136,7 @@ func (e *Engine) inspect(ctx context.Context, c *duckdb.Conn, typ duckdb.StmtTyp
 			}
 			insp.Resolved = false
 		} else {
+			insp.planTables, insp.planFuncs, insp.planned = slices.Clone(tables), slices.Clone(funcs), true
 			insp.Tables = tables
 			insp.Functions = funcs
 			e.resolveCatalogScans(ctx, c, typ, query, database, &insp)

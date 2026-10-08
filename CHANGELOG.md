@@ -3,6 +3,24 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
+## [v0.2.0] - 2026-10-08
+
+### Data protection
+- Row-level security from a file (`--row-filters`): per table, rules by role
+  or user (exact or `*@domain`) with a SQL predicate; matching rules are OR-ed;
+  users matching no rule are not filtered. `getvariable('curral_user')` and
+  `getvariable('curral_roles')` allow ACL tables. Validated against the real
+  tables at boot, `check` and reload (SIGHUP).
+- Column masking decided by the policy (`--policy-masks-query`): presets
+  `null`, `redact`, `last:N`, or custom SQL.
+- Applied by rewriting DuckDB's own parse tree: each protected table becomes a
+  filtered, masked subquery, so user predicates never see real values.
+  Fail-closed: non-SELECT statements on protected tables, indirect reads
+  (views/macros), unstable round trips, TABLESAMPLE/AT and PIVOT are refused.
+- Dry runs and audit events show `row_filters` and `masked_columns`;
+  `curral_queries_rewritten_total` counts rewritten queries.
+- Differential test and weekly fuzz against a pre-filtered, pre-masked copy.
+
 ## [v0.1.0] - 2026-10-07
 
 First release. A single Go binary that embeds DuckDB and serves SQL over REST

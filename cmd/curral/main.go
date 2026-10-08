@@ -28,6 +28,7 @@ import (
 	"curral/internal/engine"
 	"curral/internal/metrics"
 	"curral/internal/policy"
+	"curral/internal/rls"
 	"curral/internal/server"
 )
 
@@ -103,6 +104,8 @@ type serveFlags struct {
 	policies       listFlag
 	policyQuery    string
 	limitsQuery    string
+	masksQuery     string
+	rowFilters     string
 	maxConcurrency int
 	perUserConc    int64
 	queueTimeout   time.Duration
@@ -147,6 +150,8 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.StringVar(&f.users, "users", "", "users file with bcrypt password hashes and roles (required)")
 	fs.Var(&f.policies, "policy", "Rego policy file, or JSON/YAML data file exposed as data.* (repeatable, required)")
 	fs.StringVar(&f.policyQuery, "policy-query", "data.curral.allow", "Rego decision that must evaluate to true")
+	fs.StringVar(&f.masksQuery, "policy-masks-query", "", "optional Rego rule with column masks per table, e.g. data.curral.masks")
+	fs.StringVar(&f.rowFilters, "row-filters", "", "row-level security file (per table, which rows matching users see); reloaded on SIGHUP")
 	fs.StringVar(&f.limitsQuery, "policy-limits-query", "", "optional Rego rule with per-request limits {timeout, max_rows}, e.g. data.curral.limits")
 	fs.IntVar(&f.maxConcurrency, "max-concurrency", 8, "queries executing at the same time")
 	fs.Int64Var(&f.perUserConc, "max-concurrency-per-user", 0, "queries one user may run at once when the policy sets no max_concurrency (0 = no limit)")
@@ -280,7 +285,12 @@ func runServe(args []string, checkOnly bool) error {
 	if err != nil {
 		return err
 	}
-	pol, err := policy.Load(ctx, f.policyQuery, f.policies, f.limitsQuery)
+	loadPolicy := func(ctx context.Context) (*policy.Policy, error) {
+		return policy.LoadQueries(ctx, f.policies, policy.Queries{
+			Allow: f.policyQuery, Limits: f.limitsQuery, Masks: f.masksQuery,
+		})
+	}
+	pol, err := loadPolicy(ctx)
 	if err != nil {
 		return err
 	}
@@ -310,9 +320,13 @@ func runServe(args []string, checkOnly bool) error {
 	for _, d := range eng.Databases() {
 		dbs = append(dbs, d.Name)
 	}
+	rowRules, err := loadRowFilters(ctx, f.rowFilters, eng)
+	if err != nil {
+		return err
+	}
 	if checkOnly {
-		fmt.Printf("ok: %d database(s) [%s], %d user(s), %d api key(s), %d identit(ies), policy %s\n",
-			len(dbs), strings.Join(dbs, ", "), len(users.Users), len(users.APIKeys), len(users.Identities), f.policyQuery)
+		fmt.Printf("ok: %d database(s) [%s], %d user(s), %d api key(s), %d identit(ies), %d table(s) with row filters, policy %s\n",
+			len(dbs), strings.Join(dbs, ", "), len(users.Users), len(users.APIKeys), len(users.Identities), rowRules.Len(), f.policyQuery)
 		return nil
 	}
 
@@ -383,6 +397,10 @@ func runServe(args []string, checkOnly bool) error {
 	}
 	srv.SetAuth(auth.New(users, f.authCacheTTL))
 	srv.SetPolicy(pol)
+	srv.SetRowFilters(rowRules)
+	if rowRules.Len() > 0 {
+		log.Info("row filters enabled", "file", f.rowFilters, "tables", rowRules.Len())
+	}
 	if mtr != nil {
 		mtr.SetPolicySource(func() string { return srv.Policy().SHA256 })
 	}
@@ -416,12 +434,17 @@ func runServe(args []string, checkOnly bool) error {
 			users, err := config.LoadUsers(f.users)
 			var newPol *policy.Policy
 			if err == nil {
-				newPol, err = policy.Load(context.Background(), f.policyQuery, f.policies, f.limitsQuery)
+				newPol, err = loadPolicy(context.Background())
+			}
+			var newRules *rls.Rules
+			if err == nil {
+				newRules, err = loadRowFilters(context.Background(), f.rowFilters, eng)
 			}
 			if err != nil {
-				srv.Reload(nil, nil, err)
+				srv.Reload(nil, nil, err) // users, policy and row filters all stay as they were
 				continue
 			}
+			srv.SetRowFilters(newRules)
 			srv.Reload(auth.New(users, f.authCacheTTL), newPol, nil)
 		}
 	}()
@@ -485,6 +508,25 @@ var (
 	version = "dev"
 	commit  = "unknown"
 )
+
+// loadRowFilters reads the RLS file and prepares every rule against its
+// table, so a typo fails startup (or a reload) instead of every query.
+func loadRowFilters(ctx context.Context, path string, eng *engine.Engine) (*rls.Rules, error) {
+	if path == "" {
+		return nil, nil
+	}
+	r, err := rls.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	err = r.Each(func(table string, rule rls.Rule) error {
+		return eng.CheckProtection(ctx, table, engine.Protection{Filter: rule.Where})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return r, nil
+}
 
 // parsePrefixes accepts CIDRs and single addresses.
 func parsePrefixes(list []string) ([]netip.Prefix, error) {

@@ -22,33 +22,35 @@ import (
 
 // Event is one audit record. Fields are stable: consumers parse them.
 type Event struct {
-	TS            time.Time          `json:"ts"`
-	Event         string             `json:"event"` // query, auth_failure
-	RequestID     string             `json:"request_id"`
-	User          string             `json:"user"`
-	AuthMethod    string             `json:"auth_method,omitempty"` // basic, api_key, jwt
-	Roles         []string           `json:"roles,omitempty"`
-	RemoteAddr    string             `json:"remote_addr"`
-	ForwardedFor  string             `json:"forwarded_for,omitempty"`
-	Database      string             `json:"database,omitempty"`
-	StatementType string             `json:"statement_type,omitempty"`
-	SQL           string             `json:"sql,omitempty"`
-	SQLSHA256     string             `json:"sql_sha256,omitempty"`
-	ParamsCount   int                `json:"params_count"`
-	Tables        []string           `json:"tables,omitempty"`
-	Targets       []string           `json:"targets,omitempty"`
-	Functions     []string           `json:"functions,omitempty"`
-	Resolved      *bool              `json:"resolved,omitempty"`
-	Decision      string             `json:"decision"`   // allow, deny, error
-	DecidedBy     string             `json:"decided_by"` // policy, engine, auth, queue, audit, request
-	Limits        map[string]any     `json:"limits,omitempty"`
-	PolicySHA256  string             `json:"policy_sha256,omitempty"`
-	Status        int                `json:"status"`
-	Rows          int64              `json:"rows"`
-	Bytes         int64              `json:"bytes"`
-	TimingMS      map[string]float64 `json:"timing_ms,omitempty"`
-	Error         string             `json:"error,omitempty"`
-	Version       string             `json:"curral_version"`
+	TS            time.Time           `json:"ts"`
+	Event         string              `json:"event"` // query, auth_failure
+	RequestID     string              `json:"request_id"`
+	User          string              `json:"user"`
+	AuthMethod    string              `json:"auth_method,omitempty"` // basic, api_key, jwt
+	Roles         []string            `json:"roles,omitempty"`
+	RemoteAddr    string              `json:"remote_addr"`
+	ForwardedFor  string              `json:"forwarded_for,omitempty"`
+	Database      string              `json:"database,omitempty"`
+	StatementType string              `json:"statement_type,omitempty"`
+	SQL           string              `json:"sql,omitempty"`
+	SQLSHA256     string              `json:"sql_sha256,omitempty"`
+	ParamsCount   int                 `json:"params_count"`
+	Tables        []string            `json:"tables,omitempty"`
+	Targets       []string            `json:"targets,omitempty"`
+	Functions     []string            `json:"functions,omitempty"`
+	Resolved      *bool               `json:"resolved,omitempty"`
+	Decision      string              `json:"decision"`   // allow, deny, error
+	DecidedBy     string              `json:"decided_by"` // policy, engine, auth, queue, audit, request
+	Limits        map[string]any      `json:"limits,omitempty"`
+	RowFilters    []string            `json:"row_filters,omitempty"`    // tables read through an RLS filter
+	MaskedColumns map[string][]string `json:"masked_columns,omitempty"` // table -> masked columns
+	PolicySHA256  string              `json:"policy_sha256,omitempty"`
+	Status        int                 `json:"status"`
+	Rows          int64               `json:"rows"`
+	Bytes         int64               `json:"bytes"`
+	TimingMS      map[string]float64  `json:"timing_ms,omitempty"`
+	Error         string              `json:"error,omitempty"`
+	Version       string              `json:"curral_version"`
 }
 
 var (
