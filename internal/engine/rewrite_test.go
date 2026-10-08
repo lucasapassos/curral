@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 // runProtected runs sql with orders protected (only id=1 visible, amount
@@ -107,5 +109,81 @@ func TestCheckProtection(t *testing.T) {
 	}
 	if err := e.CheckProtection(ctx, "orders", Protection{}); err == nil {
 		t.Error("unqualified table accepted")
+	}
+}
+
+// The rewrite cache must not skip the indirect-read check: a cached query
+// whose view is later redefined to read the protected table is refused.
+func TestProtectCacheStillChecksPlan(t *testing.T) {
+	e := newEngine(t, Options{})
+	if _, err := e.db.Exec("CREATE VIEW sales.crm.v AS SELECT id FROM sales.crm.clients"); err != nil {
+		t.Fatal(err)
+	}
+	q := "SELECT count(*) FROM orders, crm.v"
+	for i := range 2 { // second run is served from the cache
+		if _, err := runProtected(e, q, nil); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+	}
+	if e.rewrites.len() == 0 {
+		t.Fatal("rewrite not cached")
+	}
+	if _, err := e.db.Exec("CREATE OR REPLACE VIEW sales.crm.v AS SELECT id FROM sales.main.orders"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runProtected(e, q, nil); !errors.Is(err, ErrForbidden) || !strings.Contains(err.Error(), "indirectly") {
+		t.Fatalf("redefined view through cached rewrite: %v", err)
+	}
+	// Same text, different protections: a separate cache entry.
+	prot := map[string]Protection{"sales.main.orders": {Filter: "id = 2"}}
+	if rows, err := runProtected(e, "SELECT id FROM orders", prot); err != nil || fmt.Sprint(rows) != "[[2]]" {
+		t.Fatalf("different protection: %v %v", rows, err)
+	}
+	if rows, err := runProtected(e, "SELECT id FROM orders", nil); err != nil || fmt.Sprint(rows) != "[[1]]" {
+		t.Fatalf("original protection: %v %v", rows, err)
+	}
+}
+
+func TestLRU(t *testing.T) {
+	c := newLRU[int](2)
+	c.put("a", 1)
+	c.put("b", 2)
+	c.get("a") // a is now most recent
+	c.put("c", 3)
+	if _, ok := c.get("b"); ok {
+		t.Fatal("b should have been evicted")
+	}
+	if v, ok := c.get("a"); !ok || v != 1 || c.len() != 2 {
+		t.Fatalf("a=%v ok=%v len=%d", v, ok, c.len())
+	}
+}
+
+func TestUsesSessionVariables(t *testing.T) {
+	e := newEngine(t, Options{})
+	if _, err := e.db.Exec("CREATE MACRO sales.main.my_user() AS getvariable('curral_user')"); err != nil {
+		t.Fatal(err)
+	}
+	conn, _ := e.db.Conn(context.Background())
+	defer conn.Close()
+	for filter, want := range map[string]bool{
+		"id > 1":                                  false,
+		"upper(CAST(id AS VARCHAR)) <> 'x'":       false,
+		"getvariable('curral_user') = 'ana'":      true,
+		"GETVARIABLE('curral_roles') IS NOT NULL": true,
+		"sales.main.my_user() = 'ana'":            true, // a user macro might read variables
+	} {
+		var got bool
+		conn.Raw(func(dc any) error {
+			got, _ = e.usesSessionVariables(context.Background(), dc.(*duckdb.Conn), protectionSQL("sales.main.orders", Protection{Filter: filter}))
+			return nil
+		})
+		if got != want {
+			t.Errorf("%s: got %v", filter, got)
+		}
+	}
+	// A filter through a user macro still sees the caller.
+	prot := map[string]Protection{"sales.main.orders": {Filter: "sales.main.my_user() = 'ana'"}}
+	if rows, err := runProtected(e, "SELECT count(*) FROM orders", prot); err != nil || fmt.Sprint(rows) != "[[2]]" {
+		t.Fatalf("macro filter: %v %v", rows, err)
 	}
 }

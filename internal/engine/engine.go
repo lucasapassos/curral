@@ -74,9 +74,10 @@ type Engine struct {
 	schemas   map[string]string // name -> schema used by USE
 	scanFuncs map[string]bool   // table functions that scan attached non-DuckDB catalogs
 	caches    map[string]*catalogcache.Proxy
-	subqCache sync.Map     // protection SQL -> serialized statement (immutable once stored)
-	subqCount atomic.Int64 // entries in subqCache, bounded by maxSubqCache
-	waiting   atomic.Int64 // requests waiting for a slot
+	subqCache sync.Map       // protection SQL -> serialized statement (immutable once stored)
+	subqCount atomic.Int64   // entries in subqCache, bounded by maxSubqCache
+	rewrites  *lru[*rewrite] // statement+protections -> rewritten statement
+	waiting   atomic.Int64   // requests waiting for a slot
 	log       *slog.Logger
 }
 
@@ -104,6 +105,7 @@ func Open(ctx context.Context, cat *config.Catalog, opts Options, log *slog.Logg
 		schemas:   map[string]string{},
 		scanFuncs: map[string]bool{},
 		caches:    map[string]*catalogcache.Proxy{},
+		rewrites:  newLRU[*rewrite](4096),
 		log:       log,
 	}
 	for _, d := range cat.Databases {
@@ -489,12 +491,14 @@ func (e *Engine) Query(ctx context.Context, req Request,
 			if typ != duckdb.STATEMENT_TYPE_SELECT {
 				return errProtected("protected tables can only be read with SELECT")
 			}
-			rewritten, err := e.protect(ctx, c, req.SQL, args, database, *req.Protect, insp)
+			rewritten, needVars, err := e.protect(ctx, c, req.SQL, args, database, *req.Protect, insp)
 			if err != nil {
 				return err
 			}
-			if err := setSessionVariables(ctx, c, req.User, req.Roles); err != nil {
-				return err
+			if needVars {
+				if err := setSessionVariables(ctx, c, req.User, req.Roles); err != nil {
+					return err
+				}
 			}
 			rs, err := c.Prepare(rewritten)
 			if err != nil {

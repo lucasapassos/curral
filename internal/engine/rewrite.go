@@ -44,7 +44,81 @@ func errProtected(format string, a ...any) error {
 // a macro), or when a reference uses sampling or time travel.
 func (e *Engine) protect(ctx context.Context, c *duckdb.Conn, query string, args []driver.NamedValue,
 	database string, prot map[string]Protection, insp Inspection,
-) (string, error) {
+) (string, bool, error) {
+	// The rewrite depends only on the statement, the current database and
+	// the protections, so repeated queries reuse it. The check against the
+	// plan below runs on every request: a view created later is still seen.
+	key := rewriteKey(query, database, prot)
+	rw, ok := e.rewrites.get(key)
+	if !ok {
+		var err error
+		if rw, err = e.buildRewrite(ctx, c, query, database, prot); err != nil {
+			return "", false, err
+		}
+		e.rewrites.put(key, rw)
+	}
+
+	// Every read of a protected table must be one of the references the
+	// rewrite replaced; a view or macro reading it would bypass protection.
+	tables, funcs := insp.planTables, insp.planFuncs
+	if !insp.planned { // not expected for SELECT, but never skip the check
+		var err error
+		if tables, funcs, err = planSources(ctx, c, query, args); err != nil {
+			return "", false, errProtected("cannot plan statement: %v", err)
+		}
+	}
+	scans := map[string]int{}
+	for _, t := range tables {
+		scans[strings.ToLower(t)]++
+	}
+	remoteScans := 0
+	for _, f := range funcs {
+		if e.scanFuncs[f] {
+			remoteScans++
+		}
+	}
+	for _, t := range slices.Sorted(maps.Keys(prot)) {
+		if e.IsRemote(t) {
+			if remoteScans != rw.remoteRefs {
+				return "", false, errProtected("%s may be read indirectly (view or macro); query it directly", t)
+			}
+			continue
+		}
+		if scans[strings.ToLower(t)] != rw.refs[t] {
+			return "", false, errProtected("%s is read indirectly (view or macro); query it directly", t)
+		}
+	}
+	return rw.sql, rw.needVars, nil
+}
+
+// rewrite is a statement with its protected tables replaced, plus how many
+// direct references it had (per protected table, and to remote catalogs).
+type rewrite struct {
+	sql        string
+	refs       map[string]int
+	remoteRefs int
+	// needVars: some filter or mask reads getvariable() directly or calls a
+	// user macro (which might), so the session variables must be set.
+	needVars bool
+}
+
+// rewriteKey identifies a rewrite: statement, database and protections.
+func rewriteKey(query, database string, prot map[string]Protection) string {
+	var b strings.Builder
+	b.WriteString(database)
+	b.WriteByte(0)
+	b.WriteString(query)
+	for _, t := range slices.Sorted(maps.Keys(prot)) {
+		p := prot[t]
+		fmt.Fprintf(&b, "\x00%s\x00%s", t, p.Filter)
+		for _, col := range slices.Sorted(maps.Keys(p.Masks)) {
+			fmt.Fprintf(&b, "\x00%s=%s", col, p.Masks[col])
+		}
+	}
+	return b.String()
+}
+
+func (e *Engine) buildRewrite(ctx context.Context, c *duckdb.Conn, query, database string, prot map[string]Protection) (*rewrite, error) {
 	byKey := map[string]string{} // lower(qualified) -> qualified
 	for t := range prot {
 		byKey[strings.ToLower(t)] = t
@@ -52,14 +126,14 @@ func (e *Engine) protect(ctx context.Context, c *duckdb.Conn, query string, args
 
 	raw, again, err := serializeRoundTrip(ctx, c, query)
 	if err != nil {
-		return "", errProtected("statement cannot be checked for protected tables: %v", err)
+		return nil, errProtected("statement cannot be checked for protected tables: %v", err)
 	}
 	if err := checkRoundTrip(raw, again); err != nil {
-		return "", err
+		return nil, err
 	}
 	doc, err := decodeJSON(raw)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	// Replace references, counting them per table (and references to remote
@@ -126,44 +200,68 @@ func (e *Engine) protect(ctx context.Context, c *duckdb.Conn, query string, args
 	}
 	walk(doc, nil)
 	if subqueryErr != nil {
-		return "", subqueryErr
+		return nil, subqueryErr
 	}
-
-	// Every read of a protected table must be one of the references just
-	// rewritten; a view or macro reading it would bypass the protection.
-	tables, funcs := insp.planTables, insp.planFuncs
-	if !insp.planned { // not expected for SELECT, but never skip the check
-		if tables, funcs, err = planSources(ctx, c, query, args); err != nil {
-			return "", errProtected("cannot plan statement: %v", err)
-		}
-	}
-	scans := map[string]int{}
-	for _, t := range tables {
-		scans[strings.ToLower(t)]++
-	}
-	remoteScans := 0
-	for _, f := range funcs {
-		if e.scanFuncs[f] {
-			remoteScans++
-		}
-	}
-	for _, t := range slices.Sorted(maps.Keys(prot)) {
-		if e.IsRemote(t) {
-			if remoteScans != remoteRefs {
-				return "", errProtected("%s may be read indirectly (view or macro); query it directly", t)
-			}
-			continue
-		}
-		if scans[strings.ToLower(t)] != refs[t] {
-			return "", errProtected("%s is read indirectly (view or macro); query it directly", t)
-		}
-	}
-
 	out, err := json.Marshal(doc)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return deserializeSQL(ctx, c, string(out))
+	sql, err := deserializeSQL(ctx, c, string(out))
+	if err != nil {
+		return nil, err
+	}
+	needVars := false
+	for _, t := range slices.Sorted(maps.Keys(prot)) {
+		if needVars {
+			break
+		}
+		if needVars, err = e.usesSessionVariables(ctx, c, protectionSQL(t, prot[t])); err != nil {
+			return nil, err
+		}
+	}
+	return &rewrite{sql: sql, refs: refs, remoteRefs: remoteRefs, needVars: needVars}, nil
+}
+
+// usesSessionVariables reports whether a protection query calls
+// getvariable() or any user-defined macro (which could call it).
+func (e *Engine) usesSessionVariables(ctx context.Context, c *duckdb.Conn, query string) (bool, error) {
+	raw, err := serializeSQL(ctx, c, query)
+	if err != nil {
+		return true, nil // cannot tell: set them
+	}
+	doc, err := decodeJSON(raw)
+	if err != nil {
+		return true, nil
+	}
+	var names []string
+	var walk func(n any)
+	walk = func(n any) {
+		switch v := n.(type) {
+		case []any:
+			for _, x := range v {
+				walk(x)
+			}
+		case map[string]any:
+			if fn, ok := v["function_name"].(string); ok {
+				names = append(names, strings.ToLower(fn))
+			}
+			for _, x := range v {
+				walk(x)
+			}
+		}
+	}
+	walk(doc)
+	if slices.Contains(names, "getvariable") {
+		return true, nil
+	}
+	for _, n := range names {
+		macro, err := scalarString(ctx, c,
+			"SELECT count(*)::VARCHAR FROM duckdb_functions() WHERE NOT internal AND lower(function_name) = $1", n)
+		if err != nil || macro != "0" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // protectionSQL is the query a protected table is replaced with.

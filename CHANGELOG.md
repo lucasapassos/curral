@@ -3,6 +3,18 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
+## [v0.2.2] - 2026-10-08
+
+### Performance
+- Row filters/masks: rewrites are cached (LRU, 4096 entries) by statement,
+  database and protections; the indirect-read check still runs on every
+  request against that request's plan, so a view redefined later is caught
+  (tested). Session variables are only set when a filter or mask calls
+  getvariable() or a user macro (detected on DuckDB's parse tree).
+- Fixed overhead per protected query: ~1.6 ms -> ~0.2 ms (engine benchmark).
+  Local point lookups at 8 clients lose ~20% throughput vs unprotected
+  (was ~58%); on R2 the p50 overhead is ~1.5-2.5 ms (was ~3.5 ms).
+
 ## [v0.2.1] - 2026-10-08
 
 ### Security

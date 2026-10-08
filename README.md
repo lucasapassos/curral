@@ -514,8 +514,21 @@ query sobre uma cópia da tabela já filtrada e mascarada; os resultados precisa
 ser idênticos. Ele roda no CI, e o fuzz `FuzzProtectDifferential` roda toda
 semana.
 
-**Custo:** cerca de +1,6 ms por query que toca uma tabela protegida. As demais
-não mudam.
+**Custo:** a reescrita de cada query fica em cache, por texto da query e
+regras aplicadas. A checagem de leitura indireta continua rodando a cada
+request, com o plano daquele request. As variáveis de sessão só são definidas
+quando alguma regra usa `getvariable()` ou uma macro de usuário. Medido via
+HTTP:
+
+| Point lookup | sem proteção | RLS | máscara | RLS + máscara |
+|---|---|---|---|---|
+| local, p50 com 1 cliente | 1,3 ms | 1,7 ms | 1,7 ms | 1,8 ms |
+| local, vazão com 8 clientes | 2.524 req/s | 2.098 | 1.879 | 1.992 |
+| Iceberg no R2, p50 com 1 cliente | 7,2 ms | 8,6 ms | 9,7 ms | 8,7 ms |
+
+Em agregações sobre a tabela inteira a diferença some no tempo da própria
+query. Com RLS, a query pode até ficar mais rápida, porque o filtro reduz os
+dados lidos. Queries sem tabela protegida não mudam.
 
 ## Justiça entre usuários
 
