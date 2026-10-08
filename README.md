@@ -495,7 +495,12 @@ que tem três consequências:
 - **Fail-closed:** a query também é negada, com
   `decided_by: protection` na auditoria, quando:
   - a tabela é lida **indiretamente**, por uma view ou macro (o número de
-    scans no plano não bate com as referências na query);
+    scans no plano não bate com as referências na query). Isso inclui uma
+    view local sobre uma tabela do lake: o plano do Iceberg não diz qual
+    tabela foi lida. Nesse caso a inspeção fica `resolved: false`, com
+    `hidden_remote_scans > 0`, e quem tem filtro ou máscara em alguma tabela
+    do lake é negado mesmo sob uma política que aceite queries não
+    resolvidas;
   - a query não sobrevive intacta à ida e volta SQL → árvore → SQL;
   - a tabela usa `TABLESAMPLE` ou time travel (`AT`);
   - a query é `PIVOT`.
@@ -564,6 +569,7 @@ outro fazendo uma query simples:
   - Formatos: `secret:<nome>` para secrets e `db.schema.*` para schemas.
 - **`functions`**: table functions usadas como fonte (`read_parquet`, `range`, ...). Elas não passam por grants de tabela, então a política precisa liberá-las explicitamente.
 - **`EXPLAIN ANALYZE <stmt>`**: é autorizado como `<stmt>`, porque executa o statement.
+- **`hidden_remote_scans`**: scans de tabelas do lake (Iceberg) que não são referências diretas na query, por exemplo uma view local sobre uma tabela do lake. As tabelas lidas assim são desconhecidas, então `resolved` é `false`.
 - **Catálogos externos (Iceberg etc.)**: o plano do DuckDB não traz o nome da tabela nesses scans. Para SELECT, as tabelas vêm da AST do parser (`json_serialize_sql`), respeitando o escopo dos CTEs. Qualquer outro statement que leia esses catálogos (ex.: `INSERT ... SELECT`, `CREATE TABLE AS`) chega com `resolved=false`.
 
 `examples/policy.rego` traz um modelo com `admin` (tudo), `analyst` (leitura

@@ -17,30 +17,50 @@ import (
 // supports for SELECT; anything else that reads such a catalog is marked
 // unresolved so the policy fails closed.
 func (e *Engine) resolveCatalogScans(ctx context.Context, c *duckdb.Conn, typ duckdb.StmtType, query, database string, insp *Inspection) {
-	var scans bool
+	scans := 0
 	others := []string{}
 	for _, f := range insp.Functions {
 		if e.scanFuncs[f] {
-			scans = true
+			scans++
 		} else {
 			others = append(others, f)
 		}
 	}
-	if !scans {
+	if scans == 0 {
 		return
 	}
 	if typ != duckdb.STATEMENT_TYPE_SELECT {
 		insp.Resolved = false
+		insp.HiddenRemoteScans = scans // none can be attributed to a table
 		return
 	}
 	tables, funcs, err := astSources(ctx, c, query)
 	if err != nil {
 		e.log.Debug("json_serialize_sql failed", "err", err)
 		insp.Resolved = false
+		insp.HiddenRemoteScans = scans
 		return
 	}
+	// Every remote scan in the plan must be a direct reference in the
+	// statement: a table of a remote catalog, or a direct scan function
+	// call (kept in Functions for the allowlist). More scans than that
+	// means a view or macro reads a remote table the policy cannot see.
+	direct := 0
 	for _, t := range tables {
-		insp.Tables = append(insp.Tables, e.qualify(t, database))
+		q := e.qualify(t, database)
+		insp.Tables = append(insp.Tables, q)
+		if e.IsRemote(q) {
+			direct++
+		}
+	}
+	for _, f := range funcs {
+		if e.scanFuncs[f] {
+			direct++
+		}
+	}
+	if scans > direct {
+		insp.Resolved = false
+		insp.HiddenRemoteScans = scans - direct
 	}
 	// A direct iceberg_scan('s3://...') call shows up here as a table
 	// function and stays subject to the function allowlist.

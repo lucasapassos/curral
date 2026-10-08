@@ -99,7 +99,7 @@ func (e *Engine) protect(ctx context.Context, c *duckdb.Conn, query string, args
 					}
 				}
 				qualified := e.qualify(parts, database)
-				if e.isRemote(qualified) {
+				if e.IsRemote(qualified) {
 					remoteRefs++
 				}
 				table, ok := byKey[strings.ToLower(qualified)]
@@ -148,7 +148,7 @@ func (e *Engine) protect(ctx context.Context, c *duckdb.Conn, query string, args
 		}
 	}
 	for _, t := range slices.Sorted(maps.Keys(prot)) {
-		if e.isRemote(t) {
+		if e.IsRemote(t) {
 			if remoteScans != remoteRefs {
 				return "", errProtected("%s may be read indirectly (view or macro); query it directly", t)
 			}
@@ -258,9 +258,9 @@ func (e *Engine) protectedSubquery(ctx context.Context, c *duckdb.Conn, table st
 	}, nil
 }
 
-// isRemote reports whether a qualified table lives in an attached
+// IsRemote reports whether a qualified table lives in an attached
 // non-DuckDB catalog (e.g. Iceberg), whose plan scans have no table name.
-func (e *Engine) isRemote(qualified string) bool {
+func (e *Engine) IsRemote(qualified string) bool {
 	cat := strings.SplitN(qualified, ".", 2)[0]
 	for _, d := range e.databases {
 		if strings.EqualFold(d.Name, cat) {

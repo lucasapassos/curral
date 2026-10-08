@@ -346,6 +346,10 @@ type Inspection struct {
 	Functions     []string `json:"functions"` // table functions used as sources (read_csv, range, ...)
 	Databases     []string `json:"databases"`
 	Resolved      bool     `json:"resolved"` // false: tables/targets may be incomplete
+	// HiddenRemoteScans counts scans of remote catalogs (Iceberg...) that are
+	// not direct references in the statement, e.g. a view over a lake table.
+	// Their tables are unknown, so Resolved is false.
+	HiddenRemoteScans int `json:"hidden_remote_scans,omitempty"`
 
 	// Raw plan sources (with repeats), reused by the protection rewrite.
 	planTables, planFuncs []string

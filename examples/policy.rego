@@ -11,6 +11,7 @@
 #   functions       ["read_parquet"]       table functions used as sources (not tables!)
 #   databases       catalogs touched by tables + targets
 #   resolved        false when tables/targets could not be fully determined
+#   hidden_remote_scans  lake (Iceberg) scans behind views/macros; tables unknown
 #
 # Row filters (who sees which rows) live in the --row-filters file; see
 # examples/rls.yaml.

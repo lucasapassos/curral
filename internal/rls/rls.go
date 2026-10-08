@@ -129,6 +129,23 @@ func (r *Rules) Filter(tableName, user string, roles []string) (where string, ok
 	return strings.Join(parts, " OR "), true
 }
 
+// TablesFor lists the tables where some rule limits this user.
+func (r *Rules) TablesFor(user string, roles []string) []string {
+	if r == nil {
+		return nil
+	}
+	var out []string
+	for _, k := range slices.Sorted(maps.Keys(r.tables)) {
+		for _, rule := range r.tables[k].rules {
+			if matches(rule, user, roles) {
+				out = append(out, r.tables[k].name)
+				break
+			}
+		}
+	}
+	return out
+}
+
 // Len is the number of tables with rules.
 func (r *Rules) Len() int {
 	if r == nil {

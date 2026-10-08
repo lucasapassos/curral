@@ -84,6 +84,21 @@ func (s *Server) protections(ctx context.Context, pol *policy.Policy, input map[
 		return nil, err
 	}
 	rules := s.rowFilters.Load()
+	// Remote tables (Iceberg) read through a view or macro are invisible to
+	// the rewrite. If this user is filtered or masked on any remote table,
+	// such a statement could read it unprotected: refuse it.
+	if insp.HiddenRemoteScans > 0 {
+		limited := rules.TablesFor(p.Name, p.Roles)
+		for t := range masks {
+			limited = append(limited, t)
+		}
+		for _, t := range limited {
+			if s.Engine.IsRemote(t) {
+				return nil, fmt.Errorf("%w: %s may be read indirectly (view or macro over a lake table); query it directly",
+					errProtection, t)
+			}
+		}
+	}
 	out := map[string]engine.Protection{}
 	for _, t := range insp.Tables {
 		var pr engine.Protection
@@ -126,6 +141,9 @@ func (s *Server) Reload(a *auth.Authenticator, p *policy.Policy, err error) {
 		s.Audit.Record(ev)
 	}
 }
+
+// errProtection means row filters or masks could not be guaranteed.
+var errProtection = engine.ErrForbidden
 
 // errConcurrency means the caller already runs its share of queries.
 var errConcurrency = errors.New("too many concurrent queries for this user")
@@ -446,21 +464,22 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 	ev.PolicySHA256 = pol.SHA256
 
 	var (
-		insp         engine.Inspection
-		rows         int64
-		bytes        countingWriter
-		started      bool
-		policyCalled bool
-		allowed      bool
-		policyE      error
-		auditE       error
-		reservation  *audit.Reservation
-		limits       policy.Limits
-		protect      map[string]engine.Protection
-		throttled    bool
-		heldGroup    string
-		execTimeout  time.Duration
-		timing       engine.Timing
+		insp             engine.Inspection
+		rows             int64
+		bytes            countingWriter
+		started          bool
+		policyCalled     bool
+		allowed          bool
+		policyE          error
+		auditE           error
+		reservation      *audit.Reservation
+		limits           policy.Limits
+		protect          map[string]engine.Protection
+		throttled        bool
+		protectionDenied bool
+		heldGroup        string
+		execTimeout      time.Duration
+		timing           engine.Timing
 	)
 	bytes.w = w
 	authorize := func(ctx context.Context, i engine.Inspection) error {
@@ -477,6 +496,8 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 			"functions":      i.Functions,
 			"databases":      i.Databases,
 			"resolved":       i.Resolved,
+			// Lake scans behind views/macros, whose tables are unknown.
+			"hidden_remote_scans": i.HiddenRemoteScans,
 		}
 		ok, err := pol.Allow(ctx, input)
 		if err == nil && ok {
@@ -488,6 +509,10 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 				// Row filters and masks, like limits, are part of the
 				// decision: failing to compute them refuses the request.
 				protect, err = s.protections(ctx, pol, input, i, p)
+				if errors.Is(err, engine.ErrForbidden) {
+					protectionDenied = true
+					return err
+				}
 			}
 		}
 		if err != nil {
@@ -626,6 +651,9 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		decision, decidedBy = "error", "concurrency"
 		s.Metrics.Throttled()
 	}
+	if protectionDenied {
+		decision, decidedBy = "deny", "protection"
+	}
 	policyResult := ""
 	switch {
 	case allowed:
@@ -662,6 +690,7 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		ev.Tables, ev.Targets, ev.Functions = insp.Tables, insp.Targets, insp.Functions
 		resolved := insp.Resolved
 		ev.Resolved = &resolved
+		ev.HiddenRemoteScans = insp.HiddenRemoteScans
 	}
 	ev.Status, ev.Rows, ev.Bytes = status, rows, bytes.n
 	ev.Limits = limitsJSON(limits)

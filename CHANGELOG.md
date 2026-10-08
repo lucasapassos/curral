@@ -3,6 +3,17 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
+## [v0.2.1] - 2026-10-08
+
+### Security
+- Fixed: a local view over a lake (Iceberg) table bypassed row filters, masks
+  and table-level policy, because DuckDB's plan does not name the Iceberg table
+  behind the view. Inspection now counts lake scans against direct references;
+  extra scans (`hidden_remote_scans`) make the statement unresolved, and users
+  with any filter or mask on a lake table are refused such statements even
+  under a policy that accepts unresolved ones. Found by validating against
+  the real R2 catalog; covered by R2 integration tests.
+
 ## [v0.2.0] - 2026-10-08
 
 ### Data protection

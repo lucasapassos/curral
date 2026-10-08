@@ -170,6 +170,57 @@ func TestR2Engine(t *testing.T) {
 	}
 }
 
+// TestR2HiddenScans: a local view over a lake table hides the table from the
+// plan; inspection must flag it (unresolved, hidden scans) so the policy and
+// row filters cannot be bypassed through the view.
+func TestR2HiddenScans(t *testing.T) {
+	table := r2Env(t)
+	e, err := Open(context.Background(), r2Catalog(t), Options{MaxConcurrency: 1, ExternalAccess: true}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if _, err := e.db.Exec("CREATE VIEW memory.main.v AS SELECT * FROM lake." + table); err != nil {
+		t.Fatal(err)
+	}
+	for sql, hidden := range map[string]int{
+		"SELECT count(*) FROM memory.main.v":                                 1,
+		"SELECT count(*) FROM lake." + table:                                 0,
+		"SELECT count(*) FROM lake." + table + " a, memory.main.v b LIMIT 1": 1,
+	} {
+		var insp Inspection
+		run(e, Request{SQL: sql}, func(_ context.Context, i Inspection) error { insp = i; return ErrForbidden })
+		if insp.HiddenRemoteScans != hidden || insp.Resolved == (hidden > 0) {
+			t.Errorf("%s: hidden=%d resolved=%v", sql, insp.HiddenRemoteScans, insp.Resolved)
+		}
+	}
+}
+
+// TestR2Protection applies a row filter and a mask to a real lake table and
+// compares with the same filter written by hand.
+func TestR2Protection(t *testing.T) {
+	table := r2Env(t)
+	e, err := Open(context.Background(), r2Catalog(t), Options{MaxConcurrency: 1, ExternalAccess: true}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	q := "lake." + table
+	prot := map[string]Protection{q: {Filter: "region = 'north'", Masks: map[string]string{"customer": "'***'"}}}
+	got, err := runProtected(e, "SELECT count(*), count(DISTINCT region), count(*) FILTER (customer <> '***') FROM "+q, prot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, want, err := run(e, Request{SQL: "SELECT count(*), 1::BIGINT, 0::BIGINT FROM " + q + " WHERE region = 'north'"}, nil)
+	if err != nil || fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("protected %v, expected %v (err %v)", got, want, err)
+	}
+	// A join with another lake table goes through the rewrite as well.
+	if _, err := runProtected(e, "SELECT count(*) FROM "+q+" a JOIN "+q+" b USING (contract_id) WHERE a.customer = b.customer", prot); err != nil {
+		t.Fatalf("self-join: %v", err)
+	}
+}
+
 func oneLineErr(err error) string {
 	if err == nil {
 		return "<nil>"
