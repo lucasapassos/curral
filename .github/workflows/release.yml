@@ -55,7 +55,7 @@ jobs:
             -o dist/$name/curral ./cmd/curral
           dist/$name/curral version
           dist/$name/curral install-extensions --extension-dir dist/$name/extensions httpfs avro iceberg
-          cp README.md CHANGELOG.md dist/$name/
+          cp README.md CHANGELOG.md LICENSE dist/$name/
           cp -r examples dist/$name/
           tar -C dist -czf dist/$name.tar.gz $name
       - uses: actions/upload-artifact@v4

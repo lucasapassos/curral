@@ -1,10 +1,9 @@
 # curral serving a Cloudflare R2 Data Catalog (Iceberg).
 #
-# Credentials come from .env next to this file (never committed). Either the
-# R2_* names or the LAKE_* names work:
-#   R2_CATALOG_URI / R2_CATALOG_URI
-#   R2_WAREHOUSE   / R2_WAREHOUSE
-#   R2_TOKEN       / R2_TOKEN
+# Credentials come from .env next to this file (never committed):
+#   R2_CATALOG_URI   "Catalog URI" of the bucket's R2 Data Catalog
+#   R2_WAREHOUSE     "Warehouse name" of the same catalog
+#   R2_TOKEN         Cloudflare API token (R2 Data Catalog + R2 Storage)
 # Required as well (in .env or the shell):
 #   R2_SCHEMA        namespace for unqualified names, e.g. analytics
 #   R2_ALLOWED_PATH  storage prefix of the tables, e.g. s3://my-bucket/
@@ -46,9 +45,9 @@ services:
       # Only Caddy may set X-Forwarded-For. Never trust the whole subnet: it
       # includes the Docker gateway, i.e. anything reaching published ports.
       CURRAL_TRUSTED_PROXY: ${CURRAL_PROXY_IP:-172.31.247.10}
-      R2_CATALOG_URI: ${R2_CATALOG_URI:-${R2_CATALOG_URI:?set R2_CATALOG_URI}}
-      R2_WAREHOUSE: ${R2_WAREHOUSE:-${R2_WAREHOUSE:?set R2_WAREHOUSE}}
-      R2_TOKEN: ${R2_TOKEN:-${R2_TOKEN:?set R2_TOKEN}}
+      R2_CATALOG_URI: ${R2_CATALOG_URI:?set R2_CATALOG_URI}
+      R2_WAREHOUSE: ${R2_WAREHOUSE:?set R2_WAREHOUSE}
+      R2_TOKEN: ${R2_TOKEN:?set R2_TOKEN}
       R2_SCHEMA: ${R2_SCHEMA:?set R2_SCHEMA (Iceberg namespace)}
       R2_CACHE_TTL: ${R2_CACHE_TTL:-30s}
     volumes:

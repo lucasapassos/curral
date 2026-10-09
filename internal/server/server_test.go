@@ -70,6 +70,13 @@ func newServerWithAudit(t testing.TB, auditPath string) (*httptest.Server, *audi
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The example leaves READ_ONLY commented out so it boots on an empty data
+	// directory; the tests cover a read-only database.
+	for i := range cat.Databases {
+		if cat.Databases[i].Name == "logs" {
+			cat.Databases[i].Options = map[string]any{"READ_ONLY": true}
+		}
+	}
 	users, err := config.LoadUsers("../../examples/users.yaml")
 	if err != nil {
 		t.Fatal(err)

@@ -1,0 +1,40 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security issues (policy bypass, data or metadata leaks, auth flaws) must be
+        reported privately: see SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: curral version
+      description: Output of `curral version`
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How do you run it?
+      options: [Docker image, Release binary, Built from source]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: Minimal catalog/policy/users files and the request. Remove any credentials.
+      render: shell
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      render: text

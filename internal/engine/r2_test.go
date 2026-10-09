@@ -143,7 +143,7 @@ func TestR2Engine(t *testing.T) {
 			}{
 				{"SELECT * FROM " + table + " LIMIT 3", qualified, "", true},
 				{"SELECT count(*) FROM " + qualified, qualified, "", true},
-				{"WITH x AS (SELECT * FROM " + qualified + ") SELECT count(*) FROM x a JOIN x b USING (customer)", qualified, "", true},
+				{"WITH x AS (SELECT * FROM " + qualified + ") SELECT count(*) FROM (FROM x LIMIT 1) a, (FROM x LIMIT 1) b", qualified, "", true},
 				{"SELECT * FROM iceberg_scan('s3://nowhere/t') LIMIT 1", "", "iceberg_scan", true},
 				{"CREATE TEMP TABLE tmp AS SELECT * FROM " + qualified, "", "iceberg_scan", false},
 			}
@@ -206,19 +206,39 @@ func TestR2Protection(t *testing.T) {
 	}
 	defer e.Close()
 	q := "lake." + table
-	prot := map[string]Protection{q: {Filter: "region = 'north'", Masks: map[string]string{"customer": "'***'"}}}
-	got, err := runProtected(e, "SELECT count(*), count(DISTINCT region), count(*) FILTER (customer <> '***') FROM "+q, prot)
+	name, col, val := r2Probe(t, e, q)
+	filter := col + " = " + val
+	prot := map[string]Protection{q: {Filter: filter, Masks: map[string]string{name: "'***'"}}}
+	got, err := runProtected(e, "SELECT count(*), count(DISTINCT "+col+"), count(*) FILTER ("+col+" <> '***') FROM "+q, prot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, want, err := run(e, Request{SQL: "SELECT count(*), 1::BIGINT, 0::BIGINT FROM " + q + " WHERE region = 'north'"}, nil)
+	_, want, err := run(e, Request{SQL: "SELECT count(*), 1::BIGINT, 0::BIGINT FROM " + q + " WHERE " + filter}, nil)
 	if err != nil || fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("protected %v, expected %v (err %v)", got, want, err)
 	}
 	// A join with another lake table goes through the rewrite as well.
-	if _, err := runProtected(e, "SELECT count(*) FROM "+q+" a JOIN "+q+" b USING (contract_id) WHERE a.customer = b.customer", prot); err != nil {
+	if _, err := runProtected(e, "SELECT count(*) FROM "+q+" a JOIN "+q+" b USING ("+col+")", prot); err != nil {
 		t.Fatalf("self-join: %v", err)
 	}
+}
+
+// r2Probe picks the first VARCHAR column of a lake table (its name and the
+// quoted identifier) and its rarest value as a SQL literal, so the protection
+// tests run on any table.
+func r2Probe(t *testing.T, e *Engine, table string) (name, col, val string) {
+	t.Helper()
+	err := e.db.QueryRow("SELECT column_name FROM (DESCRIBE " + table + ") WHERE column_type = 'VARCHAR' LIMIT 1").Scan(&name)
+	if err == sql.ErrNoRows {
+		t.Skipf("%s has no VARCHAR column", table)
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	col = `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+	if err := e.db.QueryRow("SELECT " + col + " FROM " + table + " WHERE " + col + " IS NOT NULL GROUP BY 1 ORDER BY count(*), 1 LIMIT 1").Scan(&val); err != nil {
+		t.Fatal(err)
+	}
+	return name, col, "'" + strings.ReplaceAll(val, "'", "''") + "'"
 }
 
 func oneLineErr(err error) string {
@@ -244,7 +264,7 @@ func TestR2CacheProbe(t *testing.T) {
 	}
 	queries := []string{
 		"SELECT count(*) FROM " + table,
-		"SELECT region, sum(revenue) FROM " + table + " GROUP BY 1",
+		"SELECT min(COLUMNS(*)), max(COLUMNS(*)) FROM " + table,
 	}
 	for _, c := range configs {
 		t.Run(c.name, func(t *testing.T) {

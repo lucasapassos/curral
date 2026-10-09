@@ -3,6 +3,16 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
+## [Unreleased]
+
+### Changed
+- Licensed under Apache 2.0; release tarballs include the `LICENSE`.
+- Documentation rewritten in English: a shorter README and reference pages
+  under `docs/`.
+- `examples/catalog.yaml` no longer attaches `logs` as `READ_ONLY`, which
+  failed on a fresh data directory; the example policy grants no writes
+  there anyway.
+
 ## [v0.3.3] - 2026-10-09
 
 ### Security

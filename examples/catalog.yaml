@@ -19,7 +19,8 @@ databases:
     path: ${CURRAL_DATA:-./data}/sales.duckdb
   - name: logs
     path: ${CURRAL_DATA:-./data}/logs.duckdb
-    options: { READ_ONLY: true }
+    # READ_ONLY needs an existing file; the example policy grants no writes here.
+    # options: { READ_ONLY: true }
 
 # Catalog used for unqualified names (USE). Defaults to the first database.
 default: sales

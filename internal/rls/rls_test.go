@@ -39,7 +39,7 @@ tables:
 		{"lake.analytics.customers", "ANA@gmail.com", nil, "(state = 'CA')", true},
 		{"lake.analytics.customers", "bob@corp.com", []string{"south"}, "(region = 'south') OR (state = 'CA')", true},
 		{"lake.analytics.customers", "bob@corp.com.evil", []string{"other"}, "", false}, // no rule: not limited
-		{"lake.analytics.outra", "x", []string{"north"}, "", false},
+		{"lake.analytics.other", "x", []string{"north"}, "", false},
 	}
 	for _, c := range cases {
 		got, ok := r.Filter(c.table, c.user, c.roles)
