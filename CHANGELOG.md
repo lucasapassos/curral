@@ -3,11 +3,17 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
-## [Unreleased]
+## [v0.4.1] - 2026-10-09
 
 ### Changed
 - The Go module path is now `github.com/lucasapassos/curral`, so
-  `go install github.com/lucasapassos/curral/cmd/curral@latest` works.
+  `go install -tags duckdb_arrow github.com/lucasapassos/curral/cmd/curral@latest`
+  works.
+- Dependencies: arrow-go 18.8.0 and golang.org/x/sync 0.24.0.
+- The deployment guide and the agent skill under `skills/curral` are now in
+  English.
+- The Docker Hub page carries an overview of the image, kept in sync from
+  `.github/DOCKERHUB.md`.
 
 ## [v0.4.0] - 2026-10-09
 
