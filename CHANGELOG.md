@@ -3,6 +3,14 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
+## [v0.3.3] - 2026-10-09
+
+### Security
+- Fixed: on a bind failure the policy saw the names in the statement, so a
+  view over a denied table passed as readable and its errors (unknown
+  column, types) mapped that table. Each name is now resolved as
+  `SELECT * FROM name` would be, views to their base tables.
+
 ## [v0.3.2] - 2026-10-09
 
 ### Security

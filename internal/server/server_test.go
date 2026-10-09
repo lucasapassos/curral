@@ -1087,6 +1087,16 @@ func TestBinderErrorsBehindPolicy(t *testing.T) {
 			t.Errorf("%s: %d %s, want %d %s", q, r.status, r.body, denied.status, denied.body)
 		}
 	}
+	// A view over a denied table is denied like the table itself.
+	if r := do(t, ts, "admin", `{"sql":"CREATE VIEW sales.main.pay AS SELECT name, value FROM salaries"}`); r.status != 200 {
+		t.Fatal(r.body)
+	}
+	for _, q := range []string{`SELECT name FROM pay`, `SELECT nope FROM pay`, `SELECT name + 1 FROM pay`} {
+		r := do(t, ts, "analyst", `{"sql":`+strconv.Quote(q)+`}`)
+		if r.status != denied.status || r.body != denied.body {
+			t.Errorf("view %s: %d %s", q, r.status, r.body)
+		}
+	}
 	// Dry runs too: same decision as for a valid statement.
 	dv := do(t, ts, "analyst", `{"sql":"SELECT name FROM salaries","dry_run":true}`)
 	dn := do(t, ts, "analyst", `{"sql":"SELECT nope FROM salaries","dry_run":true}`)

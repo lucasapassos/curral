@@ -651,10 +651,12 @@ func (e *Engine) failedBeforePolicy(ctx context.Context, c *duckdb.Conn, query, 
 	if restartTx(ctx, c) == nil {
 		if tables, funcs, aerr := astSources(ctx, c, query); aerr == nil {
 			insp.StatementType, insp.Resolved = "SELECT", true
-			for _, t := range tables {
-				insp.Tables = append(insp.Tables, e.qualify(t, database))
-			}
 			insp.Functions = funcs
+			// Names alone would let a view stand in for the tables it
+			// reads: resolve each one as a query on it would be.
+			for _, t := range tables {
+				e.expandRef(ctx, c, e.qualify(t, database), database, &insp)
+			}
 		} else if verb, targets, reads, ok := writeTargets(query); ok {
 			// The lexer may miss reads of a write: let the policy fail closed.
 			insp.StatementType = verb
@@ -676,6 +678,32 @@ func (e *Engine) failedBeforePolicy(ctx context.Context, c *duckdb.Conn, query, 
 		return aerr
 	}
 	return err
+}
+
+// expandRef adds to insp what "SELECT * FROM name" reads: a view's base
+// tables, a lake table's remote scan. A name that does not resolve (the
+// typo behind the error, say) is added as written.
+func (e *Engine) expandRef(ctx context.Context, c *duckdb.Conn, name, database string, insp *Inspection) {
+	parts := strings.SplitN(name, ".", 3)
+	q := "SELECT * FROM "
+	for i, p := range parts {
+		if i > 0 {
+			q += "."
+		}
+		q += quoteIdent(p)
+	}
+	if ds, err := c.Prepare(q); err == nil {
+		ds.Close()
+		if sub, err := e.inspect(ctx, c, duckdb.STATEMENT_TYPE_SELECT, q, nil, database); err == nil {
+			insp.Tables = append(insp.Tables, sub.Tables...)
+			insp.Functions = append(insp.Functions, sub.Functions...)
+			insp.Resolved = insp.Resolved && sub.Resolved
+			insp.HiddenRemoteScans += sub.HiddenRemoteScans
+			return
+		}
+	}
+	_ = restartTx(ctx, c) // a failed prepare may abort the transaction
+	insp.Tables = append(insp.Tables, name)
 }
 
 // setSessionVariables exposes the caller to filters and masks. The
