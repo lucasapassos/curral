@@ -379,6 +379,16 @@ func TestInspectDescribe(t *testing.T) {
 		{"SHOW TABLES", []string{}, false},
 		{"SHOW ALL TABLES", []string{}, false},
 		{"SELECT id FROM orders ORDER BY id DESC", []string{"sales.main.orders"}, true},
+		{"EXPLAIN DESCRIBE salaries", []string{"sales.main.salaries"}, true},
+		// Writes that would store DESCRIBE output: DuckDB cannot serialize
+		// them to JSON, so they are unresolved.
+		{"INSERT INTO orders SELECT 1, length(column_name) FROM (DESCRIBE salaries)", []string{}, false},
+		{"CREATE TABLE leak AS SELECT * FROM (DESC salaries)", []string{}, false},
+		{"CREATE VIEW leakv AS SELECT * FROM (SHOW salaries)", []string{}, false},
+		// Ordinary writes stay resolved, DESC included.
+		{"INSERT INTO orders SELECT id + 10, amount FROM orders ORDER BY id DESC", []string{"sales.main.orders"}, true},
+		{"INSERT INTO orders SELECT id, amount FROM orders ORDER BY abs(id) DESC, \"amount\" DESC NULLS LAST", []string{"sales.main.orders"}, true},
+		{"INSERT INTO orders VALUES (5, 1) -- describe show", []string{}, true},
 	}
 	for _, c := range cases {
 		insp, _, err := run(e, Request{SQL: c.sql}, func(context.Context, Inspection) error { return ErrForbidden })
@@ -442,6 +452,12 @@ func TestCatalogListingsRefused(t *testing.T) {
 		"/* x */ CALL \"duckdb_columns\"()",
 		"EXPLAIN SELECT * FROM duckdb_schemas()",
 		"SELECT * FROM orders WHERE id IN (SELECT 1 FROM duckdb_functions())",
+		"SET VARIABLE n = (SELECT count(*) FROM duckdb_views())",
+		"CREATE TABLE leak AS FROM information_schema.tables",
+		"INSERT INTO orders SELECT 1, count(*) FROM duckdb_columns()",
+		"CALL query('SELECT * FROM duckdb_tables()')",
+		"CALL query_table('information_schema.tables')",
+		"SELECT * FROM query('SELECT * FROM duck' || 'db_tables()')",
 	} {
 		called := false
 		_, _, err := run(e, Request{SQL: q}, func(context.Context, Inspection) error { called = true; return nil })
@@ -452,6 +468,46 @@ func TestCatalogListingsRefused(t *testing.T) {
 	for _, q := range []string{"SELECT * FROM duckdb_databases()", "PRAGMA version", "DESCRIBE orders", "SELECT 'duckdb_tables' AS s"} {
 		if _, _, err := run(e, Request{SQL: q}, allowAll); err != nil {
 			t.Errorf("%s: %v", q, err)
+		}
+	}
+}
+
+// A view or table macro wrapping DESCRIBE describes a table nobody named in
+// the statement: the plan shows a bind-time result the statement does not
+// account for, so it is unresolved.
+func TestHiddenDescribe(t *testing.T) {
+	e := newEngine(t, Options{})
+	for _, q := range []string{
+		"CREATE VIEW meta AS SELECT * FROM (DESCRIBE salaries)",
+		"CREATE MACRO m() AS TABLE SELECT * FROM (DESCRIBE salaries)",
+	} {
+		if _, _, err := run(e, Request{SQL: q}, allowAll); err != nil {
+			t.Fatal(q, err)
+		}
+	}
+	for q, resolved := range map[string]bool{
+		"SELECT * FROM meta":                                  false,
+		"SELECT * FROM m()":                                   false,
+		"SELECT * FROM (DESCRIBE orders), meta":               false, // one DESCRIBE, two results
+		"INSERT INTO orders SELECT 1, 1 FROM meta":            false,
+		"SELECT * FROM (DESCRIBE orders)":                     true,
+		"SELECT * FROM (DESCRIBE orders), (SHOW logs.events)": true,
+	} {
+		insp, _, err := run(e, Request{SQL: q}, func(context.Context, Inspection) error { return ErrForbidden })
+		if !errors.Is(err, ErrForbidden) || insp.Resolved != resolved {
+			t.Errorf("%s: resolved=%v err=%v, want resolved=%v", q, insp.Resolved, err, resolved)
+		}
+	}
+}
+
+func TestPublicErrorAnyError(t *testing.T) {
+	for in, want := range map[string]string{
+		"Catalog Error: Type with name x does not exist! Did you mean \"secret_type\"?": "Catalog Error: Type with name x does not exist!",
+		"wrapped: Binder Error: no column\nCandidate bindings: \"cpf\"\n\nLINE 1":       "wrapped: Binder Error: no column\n\nLINE 1",
+	} {
+		got := PublicError(errors.New(in))
+		if !strings.HasPrefix(got, want) || strings.Contains(got, "secret_type") || strings.Contains(got, "cpf") {
+			t.Errorf("%q -> %q", in, got)
 		}
 	}
 }

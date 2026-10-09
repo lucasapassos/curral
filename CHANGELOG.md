@@ -3,6 +3,26 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
+## [v0.3.1] - 2026-10-09
+
+### Security
+- Fixed: a write reading DESCRIBE output (`INSERT ... SELECT ... FROM
+  (DESCRIBE t)`, `CREATE TABLE/VIEW ... AS ... (DESCRIBE t)`) still copied
+  the columns of a denied table, since only SELECT was checked. Writes that
+  contain DESCRIBE, SHOW or SUMMARIZE (or DESC starting a query) are now
+  unresolved, so the policy fails closed; `ORDER BY ... DESC` is unaffected.
+- Fixed: catalog listings were only refused when the plan named them, so
+  statements without a plan (`COPY (SELECT ... duckdb_tables()) ...`,
+  `SET VARIABLE x = (... duckdb_views())`) could still run them and crash
+  the server. Any mention of a listing function, pragma or catalog schema
+  in such a statement is refused, and so are `query()`, `query_table()`
+  and `json_execute_serialized_sql()`, whose SQL is a string.
+- Fixed: a view or table macro wrapping DESCRIBE revealed the columns of the
+  table it describes. A plan with more bind-time results (CHUNK_GET) than
+  the statement's own DESCRIBEs is now unresolved.
+- Fixed: error suggestions were only removed from SQL errors and when they
+  started a line; they are now removed from every error message.
+
 ## [v0.3.0] - 2026-10-09
 
 ### Security

@@ -403,9 +403,10 @@ var catalogListing = map[string]bool{
 var catalogPragmas = map[string]bool{"show_tables": true, "show_tables_expanded": true}
 
 // listsCatalog reports a catalog listing in the statement: from the plan's
-// table functions or, when the plan was not available (PRAGMA, CALL), from
-// the function or pragma name. An unresolved statement the lexer cannot
-// read reliably is refused too.
+// table functions or, when there is no plan to read (PRAGMA, CALL, COPY, SET
+// VARIABLE, ...), from any mention of a listing function, pragma or catalog
+// schema. An unresolved statement the lexer cannot read reliably is refused
+// too.
 func listsCatalog(query string, insp Inspection) (string, bool) {
 	for _, f := range insp.Functions {
 		if catalogListing[f] {
@@ -419,16 +420,29 @@ func listsCatalog(query string, insp Inspection) (string, bool) {
 	if !ok {
 		return "this statement", true
 	}
-	c := cursor{toks: toks}
-	if c.accept("CALL", "PRAGMA") {
-		if t := c.peek(); t.kind == tokWord || t.kind == tokQuoted {
-			name := strings.ToLower(t.text)
-			if catalogListing[name] || catalogPragmas[name] {
-				return name, true
-			}
+	// No plan to read the functions from (PRAGMA, CALL, COPY, SET
+	// VARIABLE, ...): refuse any mention of a listing function, pragma or
+	// catalog schema.
+	for _, t := range toks {
+		if t.kind != tokWord && t.kind != tokQuoted {
+			continue
+		}
+		name := strings.ToLower(t.text)
+		if catalogListing[name] || catalogPragmas[name] || catalogSchemas[name] || dynamicSQL[name] {
+			return name, true
 		}
 	}
 	return "", false
+}
+
+// Table functions running SQL given as a string, whose listing functions the
+// lexer cannot see; in a planned statement the plan shows what they run.
+var dynamicSQL = map[string]bool{"query": true, "query_table": true, "json_execute_serialized_sql": true}
+
+// Schemas made of views over the listing functions.
+var catalogSchemas = map[string]bool{
+	"information_schema": true, "pg_catalog": true,
+	"sqlite_master": true, "sqlite_schema": true, "sqlite_temp_master": true, "sqlite_temp_schema": true,
 }
 
 // Statement types that may add, drop or change tables, views or columns.
@@ -542,6 +556,9 @@ func (e *Engine) Query(ctx context.Context, req Request,
 			return err
 		}
 		if f, ok := listsCatalog(req.SQL, insp); ok {
+			if dynamicSQL[f] {
+				return fmt.Errorf("%w: %s runs SQL from a string, which cannot be checked for catalog listings in this statement", ErrForbidden, f)
+			}
 			return fmt.Errorf("%w: %s lists every attached catalog, which can crash the server on Iceberg catalogs; use GET /v1/schema", ErrForbidden, f)
 		}
 		err = authorize(ctx, insp)
@@ -661,19 +678,17 @@ func (e *Engine) acquire(ctx context.Context) error {
 // DuckDB's binder suggests close matches from the whole catalog ("Did you
 // mean "restricted.table"?", "Candidate bindings: ..."), before any policy
 // has run: they would reveal tables and columns the caller cannot read.
+// Suggestions may share a line with the error or follow it.
 var (
-	suggestion = regexp.MustCompile(`(?m)^[ \t]*(Did you mean\b|Candidate (bindings|tables)\b).*\n?`)
+	suggestion = regexp.MustCompile(`[ \t]*(Did you mean\b|Candidate (bindings|tables)\b)[^\n]*\n?`)
 	blankLines = regexp.MustCompile(`\n{3,}`)
 )
 
 // PublicError is the message a client may see for err. Catalog suggestions
-// are removed from SQL errors; logs and audit keep the full text.
+// are removed from every error (DuckDB's text also reaches clients through
+// wrapped errors); logs and audit keep the full text.
 func PublicError(err error) string {
 	msg := err.Error()
-	var qe *QueryError
-	if !errors.As(err, &qe) {
-		return msg
-	}
 	clean := suggestion.ReplaceAllString(msg, "")
 	if clean == msg {
 		return msg

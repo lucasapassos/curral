@@ -123,6 +123,48 @@ func mayShow(query string) bool {
 	return strings.Contains(q, "desc") || strings.Contains(q, "show") || strings.Contains(q, "summarize")
 }
 
+// showKeyword reports DESCRIBE, SHOW or SUMMARIZE in a statement, or DESC
+// used as DESCRIBE: at the start of a (sub)query rather than after an ORDER
+// BY expression. Statements the lexer cannot read reliably count as yes.
+func showKeyword(query string) bool {
+	toks, ok := tokenize(query)
+	if !ok {
+		return true
+	}
+	for i, t := range toks {
+		if t.kind != tokWord {
+			continue
+		}
+		switch t.up {
+		case "DESCRIBE", "SHOW", "SUMMARIZE":
+			return true
+		case "DESC":
+			if i == 0 {
+				return true
+			}
+			// After an expression (name, literal, closing parenthesis) DESC
+			// orders; anything else (an opening parenthesis, a keyword such
+			// as AS or UNION) starts a DESCRIBE.
+			p := toks[i-1]
+			switch {
+			case p.kind == tokQuoted, p.kind == tokNumber, p.kind == tokString,
+				p.kind == tokPunct && p.text == ")",
+				p.kind == tokWord && !showStarters[p.up]:
+			default:
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Keywords after which DESC begins a DESCRIBE rather than ordering.
+var showStarters = map[string]bool{
+	"AS": true, "UNION": true, "ALL": true, "INTERSECT": true, "EXCEPT": true,
+	"FROM": true, "JOIN": true, "SELECT": true, "INSERT": true, "INTO": true, "TABLE": true,
+	"DISTINCT": true, "BY": true, "WITH": true,
+}
+
 // inspectShows covers DESCRIBE and SHOW, which DuckDB answers while binding:
 // their plan reads no table (a CHUNK_GET), so the plan-based inspection sees
 // nothing and the metadata of any table would be readable. Each DESCRIBE's
@@ -130,12 +172,14 @@ func mayShow(query string) bool {
 // columns it reveals. SHOW of the catalog itself (SHOW TABLES, SHOW
 // DATABASES, ...) lists objects the policy cannot attribute: unresolved.
 // SUMMARIZE scans its input, so the plan already covers it.
-func (e *Engine) inspectShows(ctx context.Context, c *duckdb.Conn, query string, args []driver.NamedValue, database string, insp *Inspection) error {
+//
+// It returns the number of DESCRIBEs found, to be matched against the plan.
+func (e *Engine) inspectShows(ctx context.Context, c *duckdb.Conn, query string, args []driver.NamedValue, database string, insp *Inspection) (int, error) {
 	stmts, err := parseSQL(ctx, c, query)
 	if err != nil {
 		e.log.Debug("json_serialize_sql failed", "err", err)
 		insp.Resolved = false
-		return nil
+		return 0, nil
 	}
 	var inner []any
 	unresolved := false
@@ -171,7 +215,7 @@ func (e *Engine) inspectShows(ctx context.Context, c *duckdb.Conn, query string,
 			"statements": []any{map[string]any{"node": node, "named_param_map": []any{}}},
 		})
 		if err != nil {
-			return err
+			return 0, err
 		}
 		sub, err := scalar(ctx, c, "SELECT json_deserialize_sql($1::JSON)::VARCHAR", string(doc))
 		if err != nil {
@@ -181,14 +225,14 @@ func (e *Engine) inspectShows(ctx context.Context, c *duckdb.Conn, query string,
 		}
 		si, err := e.inspect(ctx, c, duckdb.STATEMENT_TYPE_SELECT, sub, args, database)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		insp.Tables = append(insp.Tables, si.Tables...)
 		insp.Functions = append(insp.Functions, si.Functions...)
 		insp.Resolved = insp.Resolved && si.Resolved
 		insp.HiddenRemoteScans += si.HiddenRemoteScans
 	}
-	return nil
+	return len(inner), nil
 }
 
 // astSources lists base table references (minus CTE names in scope) and table

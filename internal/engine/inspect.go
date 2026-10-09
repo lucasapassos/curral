@@ -125,7 +125,7 @@ func (e *Engine) inspect(ctx context.Context, c *duckdb.Conn, typ duckdb.StmtTyp
 	}
 
 	if planned[typ] {
-		tables, funcs, err := planSources(ctx, c, query, args)
+		tables, funcs, chunks, err := planSources(ctx, c, query, args)
 		if err != nil {
 			// Some statements (PRAGMA, ...) cannot be EXPLAINed. The failure
 			// aborted the request's transaction, so start a fresh one and
@@ -140,10 +140,23 @@ func (e *Engine) inspect(ctx context.Context, c *duckdb.Conn, typ duckdb.StmtTyp
 			insp.Tables = tables
 			insp.Functions = funcs
 			e.resolveCatalogScans(ctx, c, typ, query, database, &insp)
-			if typ == duckdb.STATEMENT_TYPE_SELECT && mayShow(query) {
-				if err := e.inspectShows(ctx, c, query, args, database, &insp); err != nil {
+			describes := 0
+			switch {
+			case typ == duckdb.STATEMENT_TYPE_SELECT && mayShow(query):
+				if describes, err = e.inspectShows(ctx, c, query, args, database, &insp); err != nil {
 					return insp, err
 				}
+			case typ != duckdb.STATEMENT_TYPE_SELECT && showKeyword(query):
+				// A write reading DESCRIBE output (INSERT ... FROM (DESCRIBE
+				// t), CREATE TABLE AS ...) would copy metadata the plan does
+				// not attribute; DuckDB only parses SELECT to JSON, so fail
+				// closed.
+				insp.Resolved = false
+			}
+			// More bind-time results than DESCRIBEs in the statement: a view
+			// or table macro wraps one, describing a table nobody named.
+			if chunks > describes {
+				insp.Resolved = false
 			}
 		}
 	}
@@ -259,15 +272,19 @@ var plainLeaves = map[string]bool{
 // planSources returns the tables (from scan nodes carrying a Table) and the
 // table functions (other leaf scans, e.g. read_csv, range) of the statement's
 // unoptimized logical plan.
-func planSources(ctx context.Context, c *duckdb.Conn, query string, args []driver.NamedValue) (tables, funcs []string, err error) {
+//
+// chunks counts CHUNK_GET leaves: results DuckDB materialized while binding.
+// Only DESCRIBE/SHOW produce them, whether written in the statement or
+// hidden in a view or table macro.
+func planSources(ctx context.Context, c *duckdb.Conn, query string, args []driver.NamedValue) (tables, funcs []string, chunks int, err error) {
 	ds, err := c.Prepare("EXPLAIN (FORMAT JSON) " + query)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	defer ds.Close()
 	rows, err := ds.(*duckdb.Stmt).QueryContext(ctx, args)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	defer rows.Close()
 
@@ -275,9 +292,9 @@ func planSources(ctx context.Context, c *duckdb.Conn, query string, args []drive
 	for {
 		if err := rows.Next(dest); err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil, nil, errors.New("no logical plan in EXPLAIN output")
+				return nil, nil, 0, errors.New("no logical plan in EXPLAIN output")
 			}
-			return nil, nil, err
+			return nil, nil, 0, err
 		}
 		if k, _ := dest[0].(string); k != "logical_plan" {
 			continue
@@ -285,7 +302,7 @@ func planSources(ctx context.Context, c *duckdb.Conn, query string, args []drive
 		plan, _ := dest[1].(string)
 		var roots []planNode
 		if err := json.Unmarshal([]byte(plan), &roots); err != nil {
-			return nil, nil, err
+			return nil, nil, 0, err
 		}
 		var walk func([]planNode)
 		walk = func(ns []planNode) {
@@ -296,6 +313,8 @@ func planSources(ctx context.Context, c *duckdb.Conn, query string, args []drive
 				switch {
 				case json.Unmarshal(n.ExtraInfo, &info) == nil && info.Table != "":
 					tables = append(tables, info.Table)
+				case n.Name == "CHUNK_GET":
+					chunks++
 				case len(n.Children) == 0 && !plainLeaves[n.Name]:
 					funcs = append(funcs, strings.ToLower(n.Name))
 				}
@@ -303,6 +322,6 @@ func planSources(ctx context.Context, c *duckdb.Conn, query string, args []drive
 			}
 		}
 		walk(roots)
-		return tables, funcs, nil
+		return tables, funcs, chunks, nil
 	}
 }

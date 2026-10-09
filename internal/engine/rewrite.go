@@ -63,7 +63,7 @@ func (e *Engine) protect(ctx context.Context, c *duckdb.Conn, query string, args
 	tables, funcs := insp.planTables, insp.planFuncs
 	if !insp.planned { // not expected for SELECT, but never skip the check
 		var err error
-		if tables, funcs, err = planSources(ctx, c, query, args); err != nil {
+		if tables, funcs, _, err = planSources(ctx, c, query, args); err != nil {
 			return "", false, errProtected("cannot plan statement: %v", err)
 		}
 	}

@@ -41,7 +41,7 @@ func BenchmarkPlanTables(b *testing.B) {
 	defer c.Close()
 	for b.Loop() {
 		c.Raw(func(dc any) error {
-			_, _, err := planSources(ctx, dc.(*duckdb.Conn), "SELECT * FROM orders WHERE id = 1", nil)
+			_, _, _, err := planSources(ctx, dc.(*duckdb.Conn), "SELECT * FROM orders WHERE id = 1", nil)
 			return err
 		})
 	}

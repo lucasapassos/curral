@@ -117,7 +117,7 @@ Gere uma senha forte e o hash bcrypt dela:
 
 ```sh
 openssl rand -base64 24                                        # guarde num gerenciador de senhas
-docker run --rm -it lucasapassos/curral:v0.3.0 hash-password   # digite a senha; imprime o hash
+docker run --rm -it lucasapassos/curral:v0.3.1 hash-password   # digite a senha; imprime o hash
 ```
 
 ```sh
@@ -190,7 +190,7 @@ EOF
 cat > docker-compose.yml <<'EOF'
 services:
   curral:
-    image: lucasapassos/curral:v0.3.0
+    image: lucasapassos/curral:v0.3.1
     environment:
       CURRAL_CATALOG: /etc/curral/catalog.yaml
       CURRAL_USERS: /etc/curral/users.yaml
@@ -249,7 +249,7 @@ EOF
   gateway do Docker.
 - **Sub-rede:** se `172.31.247.0/24` colidir com uma rede local, troque a
   sub-rede e o IP do Caddy nos dois lugares.
-- **Versão:** fixe a tag da imagem (`v0.3.0`) e atualize de propósito, não
+- **Versão:** fixe a tag da imagem (`v0.3.1`) e atualize de propósito, não
   com `latest`.
 
 ## 8. Subir
