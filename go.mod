@@ -11,7 +11,7 @@ require (
 	github.com/open-policy-agent/opa v1.21.1
 	github.com/prometheus/client_golang v1.24.1
 	golang.org/x/crypto v0.57.0
-	golang.org/x/sync v0.23.0
+	golang.org/x/sync v0.24.0
 	golang.org/x/term v0.46.0
 	gopkg.in/yaml.v3 v3.0.1
 )
