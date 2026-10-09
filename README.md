@@ -117,6 +117,7 @@ vírgula: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--external-access` | false | mantém `enable_external_access` ligado |
 | `--allowed-path` | | prefixo (diretório ou `s3://bucket/`) liberado com acesso externo desligado, repetível |
 | `--auth-cache-ttl` | 5m | cache de senhas já verificadas |
+| `--schema-cache-ttl` | 10m | reuso da listagem do `/v1/schema`; depois recarrega em segundo plano (0 = carrega a cada request) |
 | `--oidc-issuer` / `--oidc-audience` | (desligado) | aceita JWTs desse provedor OIDC; a audience é obrigatória |
 | `--oidc-user-claim` / `--oidc-roles-claim` | `sub` / `roles` | claims de usuário e roles (aceita caminho com ponto: `realm_access.roles`) |
 | `--oidc-skew` | 30s | tolerância de relógio para `exp`/`nbf` |
@@ -218,12 +219,64 @@ source .env.r2 && go test ./internal/engine -run R2 -v
 - **`format`**: `csv`, `json` (default), `ndjson` ou `arrow` (Arrow IPC stream,
   `application/vnd.apache.arrow.stream`). Também pode vir de `?format=` ou do header `Accept`.
 - **`database`**: catálogo usado para nomes não qualificados. O default vem do campo `default` do catálogo.
+- **`max_rows`**: limite de linhas desta resposta. Só **reduz** o limite em vigor: vale o menor entre `--max-rows`, o `max_rows` do papel na política e o pedido. Nenhum `LIMIT` é inserido no SQL: o servidor para de ler o resultado ao atingir o limite e sinaliza o corte (`X-Curral-Max-Rows`, trailer `X-Curral-Error: row limit reached`, campo `error` no JSON). Consultas com `ORDER BY`, agregação ou janela calculam tudo antes da primeira linha; para amostras baratas, coloque um `LIMIT` no próprio SQL.
+- **Funções de catálogo bloqueadas**: `duckdb_tables()`, `duckdb_views()`, `duckdb_columns()`, `duckdb_schemas()` e afins, as views `information_schema.*`, `pg_catalog.*` e `sqlite_master`, além de `SHOW TABLES` e `PRAGMA show_tables`, respondem 403 para qualquer papel. Elas percorrem todos os catálogos anexados, e duas delas rodando ao mesmo tempo sobre um catálogo Iceberg derrubam o processo (bug do DuckDB). Para listar o catálogo, use o `/v1/schema`.
 - **Resposta em JSON**: `{"columns":[{"name","type"}],"data":[{...}],"row_count":N}`.
 - **Tipos convertidos para string**: DECIMAL, HUGEINT e UUID, para não perder precisão.
 - **Erro no meio do stream**: com o status 200 já enviado, o erro vai no trailer `X-Curral-Error`. No JSON ele também aparece como campo `"error"`. O trailer `X-Curral-Row-Count` traz o total de linhas.
 - **Erros antes do stream**: `{"error": "..."}` com 400 (SQL inválido), 401, 403, 499 (cliente desconectou), 503 (fila cheia) ou 504 (timeout).
+- **Sem vazar metadados**: as sugestões do DuckDB nos erros ("Did you mean...?", "Candidate bindings: ...") podem citar tabelas e colunas que o usuário não pode ler, porque o binder roda antes da política. Por isso elas são removidas da resposta, mas continuam no log e na auditoria. Para descobrir nomes, o caminho é o `/v1/schema`. `DESCRIBE`/`SHOW` de uma tabela passam pela política como uma leitura dela.
 
-Outros endpoints: `GET /v1/databases` (autenticado) e `GET /healthz`.
+Outros endpoints: `GET /v1/schema` (abaixo), `GET /v1/databases` (autenticado) e `GET /healthz`.
+
+### Schema (`GET /v1/schema`)
+
+Lista as tabelas e views com suas colunas, para clientes e agentes de IA
+descobrirem a estrutura antes de escrever SQL. Cada usuário vê **só o que
+poderia consultar**: cada objeto passa pela mesma inspeção, política e
+proteções de um `SELECT * FROM objeto`. Uma tabela em `deny_tables` não
+aparece.
+
+```sh
+curl -u admin https://curral.example.com/v1/schema
+curl -u admin 'https://curral.example.com/v1/schema?database=lake&schema=analytics&table=monthly_revenue'
+```
+
+```json
+{"default_database":"lake",
+ "databases":[{"name":"lake","type":"iceberg","schema":"analytics","read_only":false}],
+ "tables":[{"database":"lake","schema":"analytics","name":"monthly_revenue","kind":"table",
+            "columns":[{"name":"customer","type":"VARCHAR","nullable":true},
+                       {"name":"cpf","type":"VARCHAR","nullable":true,"masked":true}],
+            "row_filtered":true}]}
+```
+
+- **Filtros:** `database`, `schema` e `table`, sem diferenciar maiúsculas.
+- **`masked`:** a coluna chega mascarada para este usuário.
+- **`row_filtered`:** a tabela é lida com filtro de linhas (RLS). Numa view,
+  as marcas vêm das tabelas base: a view é marcada quando alguma base é
+  filtrada, e as colunas quando têm o nome de uma coluna mascarada.
+- **`comment`:** comentários de tabela e coluna (`COMMENT ON`), quando
+  existem.
+- **`schema` em `databases`:** o schema usado para nomes não qualificados.
+- **Auditoria:** cada chamada gera um evento `schema` com a lista de tabelas
+  devolvidas.
+
+**Cache.** Carregar o schema de um catálogo remoto é lento: no Iceberg, cada
+tabela custa uma ida ao catálogo, cerca de 1 s a frio no R2. Por isso o
+curral guarda um snapshot de todos os objetos e filtra por usuário em
+memória a cada chamada:
+- **Desempenho:** com cache, a resposta não usa slot do DuckDB. Medido contra
+  o R2 com 4 tabelas: ~4 s a frio, ~0,5 ms com cache.
+- **Boot:** o snapshot é carregado em segundo plano logo no boot.
+- **Expiração:** depois de `--schema-cache-ttl`, a próxima chamada ainda
+  recebe o snapshot anterior, e um novo é carregado em segundo plano.
+- **DDL pelo curral** (`CREATE`, `DROP`, `ALTER`, `COMMENT`) recarrega o
+  snapshot na hora.
+- **Escritores externos:** tabelas criadas ou alteradas por outros
+  escritores do catálogo aparecem em até `--schema-cache-ttl`.
+- **Política e RLS:** mudanças valem na hora, sem esperar o cache,
+  porque o filtro roda a cada chamada.
 
 ## Autenticação
 

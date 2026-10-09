@@ -119,6 +119,7 @@ type serveFlags struct {
 	extensionDir   string
 	externalAccess bool
 	allowedPaths   listFlag
+	schemaTTL      time.Duration
 	authCacheTTL   time.Duration
 	auditLog       string
 	auditSQL       string
@@ -166,6 +167,7 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.StringVar(&f.extensionDir, "extension-dir", "", "DuckDB extension_directory (for offline/preinstalled extensions)")
 	fs.BoolVar(&f.externalAccess, "external-access", false, "keep enable_external_access on (lets queries read files/URLs)")
 	fs.Var(&f.allowedPaths, "allowed-path", "path or URL prefix still reachable with external access off (repeatable)")
+	fs.DurationVar(&f.schemaTTL, "schema-cache-ttl", 10*time.Minute, "reuse the /v1/schema listing for this long, then reload it in the background; DDL through curral reloads it at once (0 = load on every request)")
 	fs.DurationVar(&f.authCacheTTL, "auth-cache-ttl", 5*time.Minute, "cache successful password checks for this long (0 = off)")
 	fs.StringVar(&f.auditLog, "audit-log", "", "audit log file (JSON lines), '-' for stdout; empty disables auditing. Queries are refused while it cannot be written; SIGHUP reopens it")
 	fs.StringVar(&f.auditSQL, "audit-sql", server.AuditSQLRedacted, "SQL text in audit events: redacted (literals become ?), full or hash")
@@ -305,6 +307,7 @@ func runServe(args []string, checkOnly bool) error {
 		ExtensionDir:   f.extensionDir,
 		ExternalAccess: f.externalAccess,
 		AllowedPaths:   f.allowedPaths,
+		SchemaCacheTTL: f.schemaTTL,
 	}, log)
 	if err != nil {
 		return err
@@ -329,6 +332,8 @@ func runServe(args []string, checkOnly bool) error {
 			len(dbs), strings.Join(dbs, ", "), len(users.Users), len(users.APIKeys), len(users.Identities), rowRules.Len(), f.policyQuery)
 		return nil
 	}
+	// Remote catalogs take seconds to list; have /v1/schema ready early.
+	eng.WarmSchema()
 
 	var aw *audit.Writer
 	if f.auditLog != "" {

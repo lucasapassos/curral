@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -36,6 +37,9 @@ type Options struct {
 	ExtensionDir   string
 	ExternalAccess bool     // keep enable_external_access on (needed by some remote sources)
 	AllowedPaths   []string // extra allowed_directories when external access is off
+	// SchemaCacheTTL is how long a schema listing (Schema) is reused before
+	// it is reloaded in the background; 0 loads it on every call.
+	SchemaCacheTTL time.Duration
 }
 
 var (
@@ -78,6 +82,7 @@ type Engine struct {
 	subqCount atomic.Int64   // entries in subqCache, bounded by maxSubqCache
 	rewrites  *lru[*rewrite] // statement+protections -> rewritten statement
 	waiting   atomic.Int64   // requests waiting for a slot
+	schema    schemaCache
 	log       *slog.Logger
 }
 
@@ -306,6 +311,9 @@ func (e *Engine) Close() error {
 
 func (e *Engine) Databases() []DatabaseInfo { return e.databases }
 
+// Default is the catalog used for unqualified names.
+func (e *Engine) Default() string { return e.def }
+
 func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) }
 
 // Request is one statement to run.
@@ -377,6 +385,57 @@ var alwaysDenied = map[duckdb.StmtType]bool{
 	duckdb.STATEMENT_TYPE_LOAD:      true,
 	duckdb.STATEMENT_TYPE_EXTENSION: true,
 	stmtUpdateExtensions:            true,
+}
+
+// Table functions that list the objects of every attached catalog. Over an
+// Iceberg catalog DuckDB can crash (SIGSEGV) when two of them run at once,
+// e.g. information_schema.tables (a UNION ALL of duckdb_tables and
+// duckdb_views) next to other queries. They are refused for every role;
+// GET /v1/schema lists the catalog safely.
+var catalogListing = map[string]bool{
+	"duckdb_tables": true, "duckdb_views": true, "duckdb_columns": true,
+	"duckdb_schemas": true, "duckdb_indexes": true, "duckdb_sequences": true,
+	"duckdb_constraints": true, "duckdb_dependencies": true, "duckdb_types": true,
+	"duckdb_functions": true,
+}
+
+// PRAGMAs that expand to catalog listings.
+var catalogPragmas = map[string]bool{"show_tables": true, "show_tables_expanded": true}
+
+// listsCatalog reports a catalog listing in the statement: from the plan's
+// table functions or, when the plan was not available (PRAGMA, CALL), from
+// the function or pragma name. An unresolved statement the lexer cannot
+// read reliably is refused too.
+func listsCatalog(query string, insp Inspection) (string, bool) {
+	for _, f := range insp.Functions {
+		if catalogListing[f] {
+			return f, true
+		}
+	}
+	if insp.Resolved {
+		return "", false
+	}
+	toks, ok := tokenize(query)
+	if !ok {
+		return "this statement", true
+	}
+	c := cursor{toks: toks}
+	if c.accept("CALL", "PRAGMA") {
+		if t := c.peek(); t.kind == tokWord || t.kind == tokQuoted {
+			name := strings.ToLower(t.text)
+			if catalogListing[name] || catalogPragmas[name] {
+				return name, true
+			}
+		}
+	}
+	return "", false
+}
+
+// Statement types that may add, drop or change tables, views or columns.
+var schemaChanging = map[duckdb.StmtType]bool{
+	duckdb.STATEMENT_TYPE_CREATE: true,
+	duckdb.STATEMENT_TYPE_DROP:   true,
+	duckdb.STATEMENT_TYPE_ALTER:  true,
 }
 
 // Query inspects the statement, asks authorize, executes it and hands the
@@ -452,6 +511,7 @@ func (e *Engine) Query(ctx context.Context, req Request,
 
 	// Narrowed by ExecTimeout after authorization; also covers COMMIT.
 	execCtx, cancelExec := ctx, context.CancelFunc(func() {})
+	var ddl bool // committed changes invalidate the schema cache
 	defer func() { cancelExec() }()
 	err = conn.Raw(func(dc any) error {
 		c := dc.(*duckdb.Conn)
@@ -471,6 +531,7 @@ func (e *Engine) Query(ctx context.Context, req Request,
 		if alwaysDenied[typ] {
 			return fmt.Errorf("%w: %s statements are not allowed", ErrForbidden, stmtTypeName(typ))
 		}
+		ddl = schemaChanging[typ]
 		if typ == duckdb.STATEMENT_TYPE_TRANSACTION {
 			return &QueryError{errors.New("transaction statements are not supported: each request runs in its own transaction")}
 		}
@@ -479,6 +540,9 @@ func (e *Engine) Query(ctx context.Context, req Request,
 		lap(&tm.Inspect)
 		if err != nil {
 			return err
+		}
+		if f, ok := listsCatalog(req.SQL, insp); ok {
+			return fmt.Errorf("%w: %s lists every attached catalog, which can crash the server on Iceberg catalogs; use GET /v1/schema", ErrForbidden, f)
 		}
 		err = authorize(ctx, insp)
 		lap(&tm.Authorize)
@@ -544,6 +608,9 @@ func (e *Engine) Query(ctx context.Context, req Request,
 		return &QueryError{err}
 	}
 	committed = true
+	if ddl {
+		e.InvalidateSchema()
+	}
 	return nil
 }
 
@@ -589,4 +656,28 @@ func (e *Engine) acquire(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// DuckDB's binder suggests close matches from the whole catalog ("Did you
+// mean "restricted.table"?", "Candidate bindings: ..."), before any policy
+// has run: they would reveal tables and columns the caller cannot read.
+var (
+	suggestion = regexp.MustCompile(`(?m)^[ \t]*(Did you mean\b|Candidate (bindings|tables)\b).*\n?`)
+	blankLines = regexp.MustCompile(`\n{3,}`)
+)
+
+// PublicError is the message a client may see for err. Catalog suggestions
+// are removed from SQL errors; logs and audit keep the full text.
+func PublicError(err error) string {
+	msg := err.Error()
+	var qe *QueryError
+	if !errors.As(err, &qe) {
+		return msg
+	}
+	clean := suggestion.ReplaceAllString(msg, "")
+	if clean == msg {
+		return msg
+	}
+	clean = blankLines.ReplaceAllString(clean, "\n\n")
+	return strings.TrimRight(clean, "\n") + "\n(suggestions omitted: GET /v1/schema lists the tables and columns you can read)"
 }

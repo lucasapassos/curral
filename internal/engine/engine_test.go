@@ -185,7 +185,7 @@ func nonNil(s []string) []string {
 
 func TestPragmasAndTransactions(t *testing.T) {
 	e := newEngine(t, Options{})
-	for _, q := range []string{"PRAGMA version", "PRAGMA table_info('orders')", "SELECT * FROM duckdb_tables()", "CALL pragma_version()", "SHOW TABLES", "DESCRIBE orders", "SUMMARIZE orders"} {
+	for _, q := range []string{"PRAGMA version", "PRAGMA table_info('orders')", "SELECT * FROM duckdb_databases()", "CALL pragma_version()", "DESCRIBE orders", "SUMMARIZE orders"} {
 		if _, _, err := run(e, Request{SQL: q}, nil); err != nil {
 			t.Errorf("%s: %v", q, err)
 		}
@@ -355,5 +355,103 @@ func TestExecTimeout(t *testing.T) {
 	_, rows, _ := run(e, Request{SQL: "SELECT count(*) FROM orders WHERE id = 7"}, nil)
 	if rows[0][0] != int64(1) {
 		t.Fatalf("write with exec timeout not committed: %v", rows)
+	}
+}
+
+// DESCRIBE and SHOW are answered while binding: the plan reads no table, so
+// the tables whose metadata they reveal come from the parse tree.
+func TestInspectDescribe(t *testing.T) {
+	e := newEngine(t, Options{})
+	cases := []struct {
+		sql      string
+		tables   []string
+		resolved bool
+	}{
+		{"DESCRIBE salaries", []string{"sales.main.salaries"}, true},
+		{"DESC salaries", []string{"sales.main.salaries"}, true},
+		{"SHOW salaries", []string{"sales.main.salaries"}, true},
+		{"describe sales.crm.clients", []string{"sales.crm.clients"}, true},
+		{"SELECT * FROM (DESCRIBE salaries) WHERE column_name = 'value'", []string{"sales.main.salaries"}, true},
+		{"DESCRIBE SELECT name FROM salaries", []string{"sales.main.salaries"}, true},
+		{"SELECT * FROM orders, (DESCRIBE logs.events)", []string{"logs.main.events", "sales.main.orders"}, true},
+		{"DESCRIBE big_orders", []string{"sales.main.orders"}, true}, // a view: its base table
+		{"SUMMARIZE orders", []string{"sales.main.orders"}, true},
+		{"SHOW TABLES", []string{}, false},
+		{"SHOW ALL TABLES", []string{}, false},
+		{"SELECT id FROM orders ORDER BY id DESC", []string{"sales.main.orders"}, true},
+	}
+	for _, c := range cases {
+		insp, _, err := run(e, Request{SQL: c.sql}, func(context.Context, Inspection) error { return ErrForbidden })
+		if !errors.Is(err, ErrForbidden) {
+			t.Errorf("%s: %v", c.sql, err)
+			continue
+		}
+		if !slices.Equal(nonNil(insp.Tables), c.tables) || insp.Resolved != c.resolved {
+			t.Errorf("%s: tables=%v resolved=%v, want %v %v", c.sql, insp.Tables, insp.Resolved, c.tables, c.resolved)
+		}
+	}
+}
+
+func TestPublicErrorHidesSuggestions(t *testing.T) {
+	e := newEngine(t, Options{})
+	for _, c := range []struct{ sql, leak string }{
+		{"SELECT * FROM salarie", `"salaries"`}, // Did you mean "salaries"?
+		{"SELECT * FROM crm.client", "clients"}, // Did you mean "crm.clients"?
+		{"SELECT nam FROM salaries", `"name"`},  // Candidate bindings
+		{"SELECT * FROM orders o JOIN salaries s ON o.id = s.nam", `"name"`},
+	} {
+		_, _, err := run(e, Request{SQL: c.sql}, allowAll)
+		if err == nil {
+			t.Fatalf("%s: no error", c.sql)
+		}
+		if !strings.Contains(err.Error(), c.leak) {
+			t.Fatalf("%s: DuckDB no longer suggests %s (test needs updating): %q", c.sql, c.leak, err)
+		}
+		msg := PublicError(err)
+		if strings.Contains(msg, c.leak) || strings.Contains(msg, "Did you mean") || strings.Contains(msg, "Candidate") {
+			t.Errorf("%s: leaks: %q", c.sql, msg)
+		}
+		if !strings.Contains(msg, "/v1/schema") || !strings.Contains(msg, "LINE 1") {
+			t.Errorf("%s: message lost context: %q", c.sql, msg)
+		}
+	}
+	// Messages without suggestions are untouched.
+	_, _, err := run(e, Request{SQL: "SELEC 1"}, allowAll)
+	if PublicError(err) != err.Error() {
+		t.Errorf("parser error changed: %q", PublicError(err))
+	}
+}
+
+// Catalog listings can crash DuckDB on Iceberg catalogs: refused before the
+// policy is asked, whatever the caller's role.
+func TestCatalogListingsRefused(t *testing.T) {
+	e := newEngine(t, Options{})
+	for _, q := range []string{
+		"SELECT * FROM duckdb_tables()",
+		"FROM duckdb_views()",
+		"SELECT * FROM information_schema.tables",
+		"SELECT * FROM information_schema.columns",
+		"SELECT * FROM (SELECT table_name FROM duckdb_tables() UNION ALL SELECT view_name FROM duckdb_views())",
+		"SELECT * FROM pg_catalog.pg_class",
+		"SELECT * FROM sqlite_master",
+		"SHOW TABLES",
+		"SHOW ALL TABLES",
+		"PRAGMA show_tables",
+		"pragma SHOW_TABLES_EXPANDED",
+		"CALL duckdb_tables()",
+		"/* x */ CALL \"duckdb_columns\"()",
+		"EXPLAIN SELECT * FROM duckdb_schemas()",
+		"SELECT * FROM orders WHERE id IN (SELECT 1 FROM duckdb_functions())",
+	} {
+		called := false
+		_, _, err := run(e, Request{SQL: q}, func(context.Context, Inspection) error { called = true; return nil })
+		if !errors.Is(err, ErrForbidden) || called {
+			t.Errorf("%s: err=%v policy asked=%v", q, err, called)
+		}
+	}
+	for _, q := range []string{"SELECT * FROM duckdb_databases()", "PRAGMA version", "DESCRIBE orders", "SELECT 'duckdb_tables' AS s"} {
+		if _, _, err := run(e, Request{SQL: q}, allowAll); err != nil {
+			t.Errorf("%s: %v", q, err)
+		}
 	}
 }

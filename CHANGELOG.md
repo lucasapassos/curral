@@ -3,6 +3,44 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
+## [Unreleased]
+
+### Security
+- Fixed: `DESCRIBE`/`SHOW` (also as a subquery, or `DESCRIBE SELECT ...`)
+  revealed the columns and types of tables the policy denies: DuckDB answers
+  them while binding, so the plan read no table. The inner query of each
+  DESCRIBE is now inspected like a real read; `SHOW TABLES`-style catalog
+  listings are unresolved (fail closed). `SUMMARIZE` was already covered.
+- Fixed: DuckDB error suggestions ("Did you mean ...?", "Candidate
+  bindings: ...") named tables and columns the caller cannot read, before
+  the policy ran. They are removed from responses (logs and audit keep the
+  full message), which point to `GET /v1/schema` instead.
+- Fixed: `/v1/schema` listed tables and views in a single `UNION ALL` of
+  `duckdb_tables()` and `duckdb_views()`, which crashed the process (SIGSEGV
+  in DuckDB) when run concurrently with queries on an Iceberg catalog. The
+  same statement sent to `/v1/query` crashed v0.2.2 as well (DuckDB issue),
+  so catalog listings are now refused for every role, before the policy:
+  `duckdb_tables()`, `duckdb_views()`, `duckdb_columns()` and the other
+  catalog-wide functions, `information_schema`/`pg_catalog` views,
+  `SHOW TABLES`, `PRAGMA show_tables` and `CALL duckdb_*()`. Use
+  `GET /v1/schema` instead.
+
+### Added
+- `max_rows` in `/v1/query` requests: lowers the row limit for that request
+  (never raises the server's or the role's). Also `curral query -max-rows`
+  and `max_rows=` in the Python client; a cut at the limit the caller asked
+  for is a sample there, not an error. The dry run reports the effective
+  limit.
+- `GET /v1/schema`: tables and views with their columns (type, nullability,
+  comments), filtered per caller through the same inspection, policy and
+  protections as `SELECT * FROM object`; masked columns and row-filtered
+  tables are flagged. Narrow with `?database=`, `?schema=`, `?table=`.
+  Audited as `schema` events.
+- Schema snapshot cache (`--schema-cache-ttl`, default 10m), loaded at boot,
+  refreshed in the background when stale and at once after DDL through
+  curral. Against R2 (4 tables): ~4 s cold, ~0.5 ms cached; per-caller
+  filtering runs in memory, so policy changes apply immediately.
+
 ## [v0.2.2] - 2026-10-08
 
 ### Performance

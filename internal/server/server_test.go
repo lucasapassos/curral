@@ -906,3 +906,161 @@ masks := {"sales.main.salaries": {"value": "null", "name": "last:1"}} if not "ad
 		t.Fatalf("audit: filters recorded=%v protection denial=%v", audited, denied)
 	}
 }
+
+func getSchema(t *testing.T, ts *httptest.Server, user, query string) (int, schemaResponse) {
+	t.Helper()
+	req, _ := http.NewRequest("GET", ts.URL+"/v1/schema"+query, nil)
+	if user != "" {
+		req.SetBasicAuth(user, user+"-pw")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out schemaResponse
+	json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
+func names(ts []engine.TableSchema) []string {
+	var out []string
+	for _, t := range ts {
+		out = append(out, t.Qualified())
+	}
+	return out
+}
+
+func TestSchemaAPI(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	ts, aw := newServerWithAudit(t, path)
+
+	// Each user sees what the policy lets them SELECT.
+	for user, want := range map[string][]string{
+		"admin":   {"logs.main.events", "sales.main.orders", "sales.main.salaries"},
+		"analyst": {"logs.main.events", "sales.main.orders"}, // salaries is in deny_tables
+	} {
+		status, out := getSchema(t, ts, user, "")
+		if status != 200 || !slices.Equal(names(out.Tables), want) {
+			t.Errorf("%s: %d %v", user, status, names(out.Tables))
+		}
+		if out.DefaultDatabase != "sales" || len(out.Databases) != 2 {
+			t.Errorf("%s: databases %+v", user, out)
+		}
+	}
+	_, out := getSchema(t, ts, "admin", "?database=SALES&table=orders")
+	if len(out.Tables) != 1 {
+		t.Fatalf("filter: %v", names(out.Tables))
+	}
+	if cols := out.Tables[0].Columns; len(cols) != 2 || cols[1].Name != "amount" || cols[1].Type != "DECIMAL(10,2)" || !cols[1].Nullable {
+		t.Errorf("columns: %+v", cols)
+	}
+	if status, _ := getSchema(t, ts, "", ""); status != 401 {
+		t.Errorf("no auth: %d", status)
+	}
+
+	// Masked columns and filtered tables are flagged; a view shows its base
+	// table's protections.
+	if r := do(t, ts, "admin", `{"sql":"CREATE VIEW sales.main.payroll AS SELECT name, value FROM salaries"}`); r.status != 200 {
+		t.Fatalf("view: %d %s", r.status, r.body)
+	}
+	s := lastServer
+	pf := filepath.Join(t.TempDir(), "p.rego")
+	os.WriteFile(pf, []byte(`package curral
+import rego.v1
+allow if not "sales.main.orders" in input.tables
+masks := {"sales.main.salaries": {"value": "null"}} if not "admin" in input.roles
+`), 0o600)
+	pol, err := policy.LoadQueries(context.Background(), []string{pf}, policy.Queries{Allow: "data.curral.allow", Masks: "data.curral.masks"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetPolicy(pol)
+	rf := filepath.Join(t.TempDir(), "rls.yaml")
+	os.WriteFile(rf, []byte("tables:\n  sales.main.salaries:\n    rules:\n      - roles: [analyst]\n        where: \"name = 'Ana'\"\n"), 0o600)
+	rules, err := rls.Load(rf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetRowFilters(rules)
+
+	_, out = getSchema(t, ts, "analyst", "?database=sales")
+	if got := names(out.Tables); !slices.Equal(got, []string{"sales.main.payroll", "sales.main.salaries"}) {
+		t.Fatalf("protected listing: %v", got)
+	}
+	for _, tbl := range out.Tables {
+		if !tbl.RowFiltered || tbl.Columns[0].Masked || !tbl.Columns[1].Masked {
+			t.Errorf("%s flags: %+v", tbl.Name, tbl)
+		}
+	}
+	_, out = getSchema(t, ts, "admin", "?table=salaries")
+	if len(out.Tables) != 1 || out.Tables[0].Columns[1].Masked || out.Tables[0].RowFiltered {
+		t.Errorf("admin flags: %+v", out.Tables)
+	}
+
+	aw.Close()
+	var audited bool
+	for _, ev := range readAudit(t, path) {
+		if ev.Event == "schema" && ev.User == "analyst" && ev.Status == 200 && ev.Rows == int64(len(ev.Tables)) && len(ev.Tables) > 0 {
+			audited = true
+		}
+	}
+	if !audited {
+		t.Error("schema request not audited")
+	}
+}
+
+// Metadata of tables a caller cannot read leaks neither through DESCRIBE nor
+// through DuckDB's "did you mean" suggestions.
+func TestNoMetadataLeaks(t *testing.T) {
+	ts := newServer(t)
+	for _, c := range []struct {
+		sql    string
+		status int
+	}{
+		{`{"sql":"DESCRIBE salaries"}`, 403},
+		{`{"sql":"SELECT * FROM (DESCRIBE salaries)"}`, 403},
+		{`{"sql":"SHOW salaries"}`, 403},
+		{`{"sql":"DESCRIBE SELECT value FROM salaries"}`, 403},
+		{`{"sql":"SHOW TABLES"}`, 403},
+		{`{"sql":"DESCRIBE orders"}`, 200},
+	} {
+		if r := do(t, ts, "analyst", c.sql); r.status != c.status {
+			t.Errorf("%s: %d %s", c.sql, r.status, r.body)
+		}
+	}
+	r := do(t, ts, "analyst", `{"sql":"SELECT * FROM salarie"}`)
+	if r.status != 400 || strings.Contains(r.body, "salaries") || !strings.Contains(r.body, "/v1/schema") {
+		t.Errorf("suggestion: %d %s", r.status, r.body)
+	}
+	r = do(t, ts, "analyst", `{"sql":"SELECT nam FROM salaries","dry_run":true}`)
+	if r.status != 400 || strings.Contains(r.body, `\"name\"`) {
+		t.Errorf("dry-run bindings: %d %s", r.status, r.body)
+	}
+}
+
+func TestRequestMaxRows(t *testing.T) {
+	ts := newServer(t)
+	q := func(body string) result {
+		t.Helper()
+		return do(t, ts, "analyst", body)
+	}
+	r := q(`{"sql":"SELECT id FROM orders ORDER BY id","format":"csv","max_rows":1}`)
+	if r.status != 200 || r.body != "id\n1\n" || r.header.Get("X-Curral-Max-Rows") != "1" || r.trailer.Get("X-Curral-Error") != "row limit reached" {
+		t.Errorf("max_rows 1: %d %q %v %v", r.status, r.body, r.header, r.trailer)
+	}
+	if r := q(`{"sql":"SELECT id FROM orders ORDER BY id","format":"csv","max_rows":5}`); r.body != "id\n1\n2\n" || r.trailer.Get("X-Curral-Error") != "" {
+		t.Errorf("under the limit: %q %v", r.body, r.trailer)
+	}
+	if r := q(`{"sql":"SELECT 1","max_rows":-1}`); r.status != 400 {
+		t.Errorf("negative: %d", r.status)
+	}
+	if r := q(`{"sql":"SELECT id FROM orders","max_rows":7,"dry_run":true}`); !strings.Contains(r.body, `"max_rows":7`) {
+		t.Errorf("dry run: %s", r.body)
+	}
+	// A request can only lower the server's limit, never raise it.
+	lastServer.MaxRows = 1
+	if r := q(`{"sql":"SELECT id FROM orders ORDER BY id","format":"csv","max_rows":100}`); r.body != "id\n1\n" {
+		t.Errorf("raised the server limit: %q", r.body)
+	}
+}

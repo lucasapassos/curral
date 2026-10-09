@@ -140,6 +140,11 @@ func (e *Engine) inspect(ctx context.Context, c *duckdb.Conn, typ duckdb.StmtTyp
 			insp.Tables = tables
 			insp.Functions = funcs
 			e.resolveCatalogScans(ctx, c, typ, query, database, &insp)
+			if typ == duckdb.STATEMENT_TYPE_SELECT && mayShow(query) {
+				if err := e.inspectShows(ctx, c, query, args, database, &insp); err != nil {
+					return insp, err
+				}
+			}
 		}
 	}
 

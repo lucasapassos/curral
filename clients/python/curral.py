@@ -11,6 +11,7 @@ query() (Arrow results), and pandas/polars only if you convert the table.
     table = c.query("SELECT * FROM orders WHERE amount > $1", [100])  # pyarrow.Table
     df = table.to_pandas()          # or polars.from_arrow(table)
     rows = c.rows("SELECT id FROM orders LIMIT 5")                     # list of dicts
+    sample = c.rows("SELECT * FROM orders", max_rows=100)             # at most 100 rows
     print(c.dry_run("DELETE FROM orders"))                             # decision, tables...
 """
 
@@ -65,39 +66,41 @@ class Client:
 
     # -- public API -----------------------------------------------------
 
-    def query(self, sql: str, params: Sequence[Any] = (), *, database: str | None = None):
+    def query(self, sql: str, params: Sequence[Any] = (), *, database: str | None = None, max_rows: int | None = None):
         """Run sql and return a pyarrow.Table (fastest path for large results)."""
         import pyarrow.ipc as ipc  # imported lazily: only this method needs it
 
-        with self._post(sql, params, "arrow", database) as resp:
+        with self._post(sql, params, "arrow", database, max_rows=max_rows) as resp:
             body = resp.read()
             table = ipc.open_stream(io.BytesIO(body)).read_all()
-            self._check_truncation(resp, table.num_rows)
+            self._check_truncation(resp, table.num_rows, max_rows)
             return table
 
-    def rows(self, sql: str, params: Sequence[Any] = (), *, database: str | None = None) -> list[dict]:
+    def rows(self, sql: str, params: Sequence[Any] = (), *, database: str | None = None, max_rows: int | None = None) -> list[dict]:
         """Run sql and return the rows as dicts (NDJSON; fine for small results)."""
-        return list(self.iter_rows(sql, params, database=database))
+        return list(self.iter_rows(sql, params, database=database, max_rows=max_rows))
 
-    def iter_rows(self, sql: str, params: Sequence[Any] = (), *, database: str | None = None) -> Iterator[dict]:
+    def iter_rows(self, sql: str, params: Sequence[Any] = (), *, database: str | None = None, max_rows: int | None = None) -> Iterator[dict]:
         """Stream rows as dicts without holding the whole result."""
-        with self._post(sql, params, "ndjson", database) as resp:
+        with self._post(sql, params, "ndjson", database, max_rows=max_rows) as resp:
             n = 0
             for line in resp:
                 if line.strip():
                     n += 1
                     yield json.loads(line)
-            self._check_truncation(resp, n)
+            self._check_truncation(resp, n, max_rows)
 
-    def dry_run(self, sql: str, params: Sequence[Any] = (), *, database: str | None = None) -> dict:
+    def dry_run(self, sql: str, params: Sequence[Any] = (), *, database: str | None = None, max_rows: int | None = None) -> dict:
         """Inspection and policy decision for sql, without executing it."""
-        with self._post(sql, params, "json", database, dry_run=True) as resp:
+        with self._post(sql, params, "json", database, dry_run=True, max_rows=max_rows) as resp:
             return json.load(resp)
 
     # -- internals ------------------------------------------------------
 
-    def _post(self, sql, params, fmt, database, dry_run=False):
+    def _post(self, sql, params, fmt, database, dry_run=False, max_rows=None):
         body = {"sql": sql, "params": list(params), "format": fmt, "dry_run": dry_run}
+        if max_rows:
+            body["max_rows"] = max_rows  # can only lower the server's limit
         if database or self.database:
             body["database"] = database or self.database
         req = urllib.request.Request(
@@ -117,11 +120,13 @@ class Client:
             raise CurralError(e.code, msg, e.headers.get("X-Request-Id")) from None
 
     @staticmethod
-    def _check_truncation(resp, rows: int) -> None:
+    def _check_truncation(resp, rows: int, asked: int | None = None) -> None:
         # Trailers (X-Curral-Error) are not visible to urllib; the row limit
         # is announced up front instead. A real failure mid-stream aborts the
         # connection, which surfaces as an exception while reading.
         limit = resp.headers.get("X-Curral-Max-Rows")
+        if asked and limit and int(limit) == asked:
+            return  # the caller asked for at most this many rows
         if limit and rows >= int(limit):
             warnings.warn(
                 f"result has {rows} rows, the server's row limit: it may be truncated "

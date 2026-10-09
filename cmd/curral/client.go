@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -64,6 +65,7 @@ func runQuery(args []string) error {
 	caFile := fs.String("ca", "", "PEM file with the CA that signed the server certificate")
 	insecure := fs.Bool("insecure", false, "skip TLS certificate verification (testing only)")
 	timeout := fs.Duration("timeout", 0, "client-side timeout (0 = none)")
+	maxRows := fs.Int64("max-rows", 0, "return at most this many rows (lowers the server's limit; 0 = server limit)")
 	var params paramFlag
 	fs.Var(&params, "p", "positional parameter $1, $2, ... as a JSON scalar (repeatable)")
 	if err := fs.Parse(args); err != nil {
@@ -88,7 +90,7 @@ func runQuery(args []string) error {
 
 	body, _ := json.Marshal(map[string]any{
 		"sql": sql, "params": []any(params), "format": *format,
-		"database": *database, "dry_run": *dryRun,
+		"database": *database, "dry_run": *dryRun, "max_rows": *maxRows,
 	})
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(*url, "/")+"/v1/query", bytes.NewReader(body))
 	if err != nil {
@@ -160,6 +162,11 @@ func runQuery(args []string) error {
 	}
 	// Errors after the 200 status arrive as trailers.
 	if msg := resp.Trailer.Get("X-Curral-Error"); msg != "" {
+		// Cut at the limit asked with -max-rows: a sample, not a failure.
+		if msg == "row limit reached" && *maxRows > 0 && resp.Header.Get("X-Curral-Max-Rows") == strconv.FormatInt(*maxRows, 10) {
+			fmt.Fprintf(os.Stderr, "first %s rows (-max-rows); the result has more\n", resp.Trailer.Get("X-Curral-Row-Count"))
+			return nil
+		}
 		return fmt.Errorf("result incomplete (%s rows): %s", resp.Trailer.Get("X-Curral-Row-Count"), msg)
 	}
 	if *out != "" {
