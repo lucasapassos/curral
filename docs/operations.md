@@ -79,7 +79,7 @@ The `release` workflow then:
 
 1. runs the tests;
 2. builds the binaries for both architectures;
-3. publishes the image to Docker Hub (needs the repository secret `DOCKERHUB_TOKEN`; the user name defaults to `lucasapassos` and can be overridden with the repository variable `DOCKERHUB_USERNAME`);
+3. publishes the image to Docker Hub (needs the secret `DOCKERHUB_TOKEN` in the `release` environment, which only `v*` tags can use; the user name defaults to `lucasapassos` and can be overridden with the repository variable `DOCKERHUB_USERNAME`);
 4. creates the release with the notes from that changelog section.
 
 The release tarballs (Linux, glibc 2.35+) ship with the `httpfs`, `avro` and
