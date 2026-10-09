@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"curral/internal/config"
+	"github.com/lucasapassos/curral/internal/config"
 )
 
 // Integration tests against a real Cloudflare R2 Data Catalog. They run only

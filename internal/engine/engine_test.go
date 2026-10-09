@@ -16,7 +16,7 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2"
 
-	"curral/internal/config"
+	"github.com/lucasapassos/curral/internal/config"
 )
 
 // seed creates a DuckDB file with the given statements.

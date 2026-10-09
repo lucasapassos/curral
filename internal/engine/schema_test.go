@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"curral/internal/config"
+	"github.com/lucasapassos/curral/internal/config"
 )
 
 func TestSchema(t *testing.T) {

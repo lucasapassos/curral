@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"curral/internal/config"
+	"github.com/lucasapassos/curral/internal/config"
 )
 
 // stmt is a boot statement plus a log-safe rendering of it.

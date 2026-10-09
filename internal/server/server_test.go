@@ -25,13 +25,13 @@ import (
 	"github.com/lestrrat-go/jwx/v3/jwk"
 	"github.com/lestrrat-go/jwx/v3/jwt"
 
-	"curral/internal/audit"
-	"curral/internal/auth"
-	"curral/internal/config"
-	"curral/internal/engine"
-	"curral/internal/metrics"
-	"curral/internal/policy"
-	"curral/internal/rls"
+	"github.com/lucasapassos/curral/internal/audit"
+	"github.com/lucasapassos/curral/internal/auth"
+	"github.com/lucasapassos/curral/internal/config"
+	"github.com/lucasapassos/curral/internal/engine"
+	"github.com/lucasapassos/curral/internal/metrics"
+	"github.com/lucasapassos/curral/internal/policy"
+	"github.com/lucasapassos/curral/internal/rls"
 )
 
 func newServer(t testing.TB) *httptest.Server {

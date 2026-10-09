@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"curral/internal/engine"
+	"github.com/lucasapassos/curral/internal/engine"
 )
 
 func benchQuery(b *testing.B, body string) {

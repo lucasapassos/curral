@@ -1,4 +1,4 @@
-module curral
+module github.com/lucasapassos/curral
 
 go 1.27.1
 

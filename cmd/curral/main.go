@@ -22,14 +22,14 @@ import (
 	_ "github.com/duckdb/duckdb-go/v2"
 	"golang.org/x/term"
 
-	"curral/internal/audit"
-	"curral/internal/auth"
-	"curral/internal/config"
-	"curral/internal/engine"
-	"curral/internal/metrics"
-	"curral/internal/policy"
-	"curral/internal/rls"
-	"curral/internal/server"
+	"github.com/lucasapassos/curral/internal/audit"
+	"github.com/lucasapassos/curral/internal/auth"
+	"github.com/lucasapassos/curral/internal/config"
+	"github.com/lucasapassos/curral/internal/engine"
+	"github.com/lucasapassos/curral/internal/metrics"
+	"github.com/lucasapassos/curral/internal/policy"
+	"github.com/lucasapassos/curral/internal/rls"
+	"github.com/lucasapassos/curral/internal/server"
 )
 
 const usage = `curral - REST proxy for DuckDB with auth and Rego policies

@@ -12,7 +12,7 @@ import (
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
 
-	"curral/internal/engine"
+	"github.com/lucasapassos/curral/internal/engine"
 )
 
 // query runs SQL on an in-memory DuckDB and encodes the result.

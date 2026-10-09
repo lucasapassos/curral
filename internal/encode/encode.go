@@ -22,7 +22,7 @@ import (
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
 
-	"curral/internal/engine"
+	"github.com/lucasapassos/curral/internal/engine"
 )
 
 type Format string

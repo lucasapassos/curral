@@ -12,7 +12,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 
-	"curral/internal/policy"
+	"github.com/lucasapassos/curral/internal/policy"
 )
 
 func TestArrowFormat(t *testing.T) {

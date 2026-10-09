@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"curral/internal/config"
+	"github.com/lucasapassos/curral/internal/config"
 )
 
 func TestBootStatements(t *testing.T) {
