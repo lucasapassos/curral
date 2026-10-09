@@ -1,0 +1,28 @@
+name: dockerhub
+
+# Syncs .github/DOCKERHUB.md and the repository description to the Docker Hub
+# page. Updating a repository's description needs a Docker Hub access token
+# with Read, Write & Delete scope, broader than the release token, so it lives
+# in its own "dockerhub" environment (main only) as DOCKERHUB_DESCRIPTION_TOKEN.
+on:
+  push:
+    branches: [main]
+    paths: [.github/DOCKERHUB.md, .github/workflows/dockerhub.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  description:
+    runs-on: ubuntu-latest
+    environment: dockerhub
+    steps:
+      - uses: actions/checkout@v7
+      - uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME || 'lucasapassos' }}
+          password: ${{ secrets.DOCKERHUB_DESCRIPTION_TOKEN }}
+          repository: ${{ vars.DOCKERHUB_USERNAME || 'lucasapassos' }}/curral
+          short-description: ${{ github.event.repository.description }}
+          readme-filepath: .github/DOCKERHUB.md

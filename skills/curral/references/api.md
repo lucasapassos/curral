@@ -1,35 +1,34 @@
-# API HTTP do curral
+# curral HTTP API
 
-Referência para agentes que só têm uma ferramenta HTTP. Para o fluxo de
-trabalho, veja o `SKILL.md`.
+Reference for agents that only have an HTTP tool. For the workflow, see
+`SKILL.md`.
 
-## Conteúdo
-- Autenticação
+## Contents
+- Authentication
 - `GET /v1/schema`
 - `POST /v1/query`
 - Dry run
-- Headers e trailers
-- Erros
-- Outros endpoints
+- Headers and trailers
+- Errors
+- Other endpoints
 
-## Autenticação
+## Authentication
 
-Toda chamada (exceto `/healthz`) precisa do header `Authorization`:
+Every call (except `/healthz`) needs the `Authorization` header:
 
-| Header | Credencial |
+| Header | Credential |
 |---|---|
-| `Authorization: Basic base64(usuario:senha)` | usuário e senha |
-| `Authorization: Bearer curral_...` | API key de serviço |
-| `Authorization: Bearer eyJ...` | JWT de um provedor OIDC configurado no servidor |
+| `Authorization: Basic base64(user:password)` | user name and password |
+| `Authorization: Bearer curral_...` | service API key |
+| `Authorization: Bearer eyJ...` | JWT from an OIDC provider configured on the server |
 
-Falhas repetidas de login bloqueiam o IP e o usuário por alguns minutos.
-Nesse caso a resposta é 429 com `Retry-After`, mesmo com a senha certa.
+Repeated login failures lock out the IP and the user for a few minutes.
+The response is then 429 with `Retry-After`, even with the right password.
 
 ## `GET /v1/schema`
 
-Tabelas e views que **você** pode consultar, com colunas. Query string
-opcional: `database`, `schema` e `table` (comparação sem diferenciar
-maiúsculas).
+Tables and views that **you** can query, with their columns. Optional query
+string: `database`, `schema` and `table` (case-insensitive match).
 
 ```
 GET /v1/schema?schema=analytics
@@ -44,7 +43,7 @@ GET /v1/schema?schema=analytics
   "tables": [
     {
       "database": "lake", "schema": "analytics", "name": "monthly_revenue", "kind": "table",
-      "comment": "opcional",
+      "comment": "optional",
       "row_filtered": true,
       "columns": [
         {"name": "region", "type": "VARCHAR", "nullable": true},
@@ -55,17 +54,18 @@ GET /v1/schema?schema=analytics
 }
 ```
 
-- **`databases[].schema`:** o schema usado para nomes não qualificados
-  daquele database.
-- **`kind`:** `table` ou `view`.
-- **`masked` e `row_filtered`:** só aparecem quando valem `true`.
-- **Atualização:** a listagem vem de cache. Uma tabela criada por outro
-  sistema pode levar alguns minutos para aparecer.
-- **404:** servidor antigo, sem o endpoint. Use `DESCRIBE` via `/v1/query`.
+- **`databases[].schema`:** the schema used for unqualified names in that
+  database.
+- **`kind`:** `table` or `view`.
+- **`masked` and `row_filtered`:** present only when `true`.
+- **Freshness:** the listing comes from a cache. A table created by another
+  system may take a few minutes to show up.
+- **404:** an older server without the endpoint. Use `DESCRIBE` through
+  `/v1/query`.
 
 ## `POST /v1/query`
 
-Corpo JSON. Campos desconhecidos são rejeitados com 400.
+JSON body. Unknown fields are rejected with 400.
 
 ```json
 {
@@ -78,16 +78,16 @@ Corpo JSON. Campos desconhecidos são rejeitados com 400.
 }
 ```
 
-| Campo | | |
+| Field | | |
 |---|---|---|
-| `sql` | obrigatório | um único comando |
-| `params` | opcional | valores escalares (string, número, bool, null) para `$1`, `$2`... |
-| `database` | opcional | database usado para nomes não qualificados; default `default_database` |
-| `format` | opcional | `json` (padrão), `csv`, `ndjson`, `arrow`; também via `?format=` ou `Accept` |
-| `max_rows` | opcional | no máximo N linhas nesta resposta; só reduz o limite do servidor/papel, nunca aumenta |
-| `dry_run` | opcional | `true` = inspeciona e decide sem executar; a resposta traz o `max_rows` efetivo |
+| `sql` | required | a single statement |
+| `params` | optional | scalar values (string, number, bool, null) for `$1`, `$2`... |
+| `database` | optional | database used for unqualified names; defaults to `default_database` |
+| `format` | optional | `json` (default), `csv`, `ndjson`, `arrow`; also via `?format=` or `Accept` |
+| `max_rows` | optional | at most N rows in this response; only lowers the server/role limit, never raises it |
+| `dry_run` | optional | `true` = inspect and decide without executing; the response includes the effective `max_rows` |
 
-### Respostas por formato
+### Responses by format
 
 **`json`:**
 
@@ -97,18 +97,18 @@ Corpo JSON. Campos desconhecidos são rejeitados com 400.
  "row_count":1}
 ```
 
-- **Tipos como string:** DECIMAL, HUGEINT e UUID vêm como string.
-- **Erro no meio:** se a query falhou ou foi cortada no meio, o objeto
-  termina com `"error": "..."`. Com corte pelo limite, é
+- **Types as strings:** DECIMAL, HUGEINT and UUID come as strings.
+- **Error midway:** if the query failed or was cut midway, the object ends
+  with `"error": "..."`. When cut by the limit, it is
   `"error": "row limit reached"`.
 
-**`csv`:** cabeçalho na primeira linha, depois os dados. O status de
-conclusão vem só nos trailers (abaixo).
+**`csv`:** header on the first line, then the data. The completion status
+comes only in the trailers (below).
 
-**`ndjson`:** um objeto JSON por linha.
+**`ndjson`:** one JSON object per line.
 
-**`arrow`:** stream Arrow IPC (`application/vnd.apache.arrow.stream`), para
-consumo por código.
+**`arrow`:** Arrow IPC stream (`application/vnd.apache.arrow.stream`), for
+consumption by code.
 
 ## Dry run
 
@@ -126,48 +126,48 @@ consumo por código.
  "policy_sha256":"..."}
 ```
 
-- **`decision`:** `allow` ou `deny`.
-- **`decided_by`:** quem decidiu. `policy` é a política de acesso. `engine`
-  é uma regra fixa do servidor, como ATTACH, comandos múltiplos ou SQL
-  inválido; nesse caso `reason` explica.
-- **`resolved: false`:** o servidor não conseguiu determinar tudo que o
-  comando lê. A política costuma negar esse caso.
-- **SQL inválido:** responde 400, como uma query normal.
+- **`decision`:** `allow` or `deny`.
+- **`decided_by`:** who decided. `policy` is the access policy. `engine` is
+  a fixed server rule, such as ATTACH, multiple statements or invalid SQL;
+  in that case `reason` explains.
+- **`resolved: false`:** the server could not determine everything the
+  statement reads. The policy usually denies this case.
+- **Invalid SQL:** answers 400, like a normal query.
 
-## Headers e trailers
+## Headers and trailers
 
-| Nome | Onde | |
+| Name | Where | |
 |---|---|---|
-| `X-Request-Id` | header, toda resposta | identifica o request na auditoria |
+| `X-Request-Id` | header, every response | identifies the request in the audit log |
 | `X-Curral-Statement-Type` | header | `SELECT`, `EXPLAIN`, ... |
-| `X-Curral-Max-Rows` | header | limite de linhas em vigor para este request |
-| `X-Curral-Row-Count` | trailer | linhas enviadas |
-| `X-Curral-Error` | trailer | erro depois do início do stream, incluindo `row limit reached` |
+| `X-Curral-Max-Rows` | header | row limit in force for this request |
+| `X-Curral-Row-Count` | trailer | rows sent |
+| `X-Curral-Error` | trailer | error after the stream started, including `row limit reached` |
 
-Trailers chegam **depois** do corpo. Muitos clientes HTTP não os expõem.
-Nesse caso:
-- em JSON, use o campo `error`;
-- em CSV/NDJSON, compare o número de linhas com `X-Curral-Max-Rows`.
+Trailers arrive **after** the body. Many HTTP clients do not expose them.
+In that case:
+- in JSON, use the `error` field;
+- in CSV/NDJSON, compare the number of rows with `X-Curral-Max-Rows`.
 
-Uma conexão encerrada antes do fim do corpo é um resultado incompleto.
+A connection closed before the end of the body is an incomplete result.
 
-## Erros
+## Errors
 
-Antes do stream começar, o erro vem como `{"error": "mensagem"}` com o status:
+Before the stream starts, an error comes as `{"error": "message"}` with the status:
 
-| Status | Causa |
+| Status | Cause |
 |---|---|
-| 400 | corpo inválido, SQL com erro de parser/binder/execução, múltiplos comandos, comando de transação |
-| 401 | sem credencial ou credencial inválida (`WWW-Authenticate` indica os esquemas aceitos) |
-| 403 | política negou, ou filtro/máscara não pôde ser garantido (ex.: leitura indireta por view) |
-| 429 | limite de queries simultâneas do usuário, ou bloqueio por falhas de login; respeite `Retry-After` |
-| 499 | cliente desconectou |
-| 500 | falha ao avaliar a política |
-| 503 | fila de execução cheia ou auditoria indisponível; respeite `Retry-After` |
-| 504 | timeout da query |
+| 400 | invalid body, SQL with a parser/binder/execution error, multiple statements, transaction statement |
+| 401 | missing or invalid credential (`WWW-Authenticate` lists the accepted schemes) |
+| 403 | the policy denied it, or a filter/mask could not be guaranteed (e.g. indirect read through a view) |
+| 429 | the user's concurrent query limit, or a lockout after failed logins; honor `Retry-After` |
+| 499 | client disconnected |
+| 500 | failed to evaluate the policy |
+| 503 | execution queue full or audit unavailable; honor `Retry-After` |
+| 504 | query timeout |
 
-## Outros endpoints
+## Other endpoints
 
-- `GET /v1/databases`: databases montados (nome, tipo, schema padrão,
-  somente leitura).
-- `GET /healthz`: sem autenticação; `{"status":"ok"}`.
+- `GET /v1/databases`: attached databases (name, type, default schema,
+  read-only).
+- `GET /healthz`: no authentication; `{"status":"ok"}`.
