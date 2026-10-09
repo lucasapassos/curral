@@ -119,7 +119,7 @@ Generate a strong password and its bcrypt hash:
 
 ```sh
 openssl rand -base64 24                                        # keep it in a password manager
-docker run --rm -it lucasapassos/curral:v0.4.0 hash-password   # type the password; prints the hash
+docker run --rm -it lucasapassos/curral:v0.4.1 hash-password   # type the password; prints the hash
 ```
 
 ```sh
@@ -193,7 +193,7 @@ EOF
 cat > docker-compose.yml <<'EOF'
 services:
   curral:
-    image: lucasapassos/curral:v0.4.0
+    image: lucasapassos/curral:v0.4.1
     environment:
       CURRAL_CATALOG: /etc/curral/catalog.yaml
       CURRAL_USERS: /etc/curral/users.yaml
@@ -254,7 +254,7 @@ EOF
   resolved.
 - **Subnet:** if `172.31.247.0/24` collides with a local network, change the
   subnet and Caddy's IP in both places.
-- **Version:** pin the image tag (`v0.4.0`) and upgrade on purpose, not with
+- **Version:** pin the image tag (`v0.4.1`) and upgrade on purpose, not with
   `latest`.
 
 ## 8. Start
