@@ -140,12 +140,16 @@ func TestR2Engine(t *testing.T) {
 				wantTable string // must appear in Tables
 				wantFunc  string // must appear in Functions
 				resolved  bool
+				planFunc  bool // wantFunc comes from the plan: checked only when binding succeeded
 			}{
-				{"SELECT * FROM " + table + " LIMIT 3", qualified, "", true},
-				{"SELECT count(*) FROM " + qualified, qualified, "", true},
-				{"WITH x AS (SELECT * FROM " + qualified + ") SELECT count(*) FROM (FROM x LIMIT 1) a, (FROM x LIMIT 1) b", qualified, "", true},
-				{"SELECT * FROM iceberg_scan('s3://nowhere/t') LIMIT 1", "", "iceberg_scan", true},
-				{"CREATE TEMP TABLE tmp AS SELECT * FROM " + qualified, "", "iceberg_scan", false},
+				{"SELECT * FROM " + table + " LIMIT 3", qualified, "", true, false},
+				{"SELECT count(*) FROM " + qualified, qualified, "", true, false},
+				{"WITH x AS (SELECT * FROM " + qualified + ") SELECT count(*) FROM (FROM x LIMIT 1) a, (FROM x LIMIT 1) b", qualified, "", true, false},
+				{"SELECT * FROM iceberg_scan('s3://nowhere/t') LIMIT 1", "", "iceberg_scan", true, false},
+				// With external access off the storage read fails while binding, so
+				// the inspection comes from the parse tree: still unresolved (the
+				// policy denies), but the plan's iceberg_scan is not there.
+				{"CREATE TEMP TABLE tmp AS SELECT * FROM " + qualified, "", "iceberg_scan", false, true},
 			}
 			for _, c := range cases {
 				var insp Inspection
@@ -162,7 +166,7 @@ func TestR2Engine(t *testing.T) {
 				}
 				if insp.Resolved != c.resolved ||
 					(c.wantTable != "" && !slices.Contains(insp.Tables, c.wantTable)) ||
-					(c.wantFunc != "" && !slices.Contains(insp.Functions, c.wantFunc)) {
+					(c.wantFunc != "" && (insp.planned || !c.planFunc) && !slices.Contains(insp.Functions, c.wantFunc)) {
 					t.Errorf("unexpected inspection for %s", c.sql)
 				}
 			}
@@ -253,6 +257,10 @@ func oneLineErr(err error) string {
 // log, which records credentials, so it only lives in tests.
 func TestR2CacheProbe(t *testing.T) {
 	table := r2Env(t)
+	allowed := os.Getenv("R2_ALLOWED_PATH")
+	if allowed == "" {
+		t.Skip("R2_ALLOWED_PATH not set") // external access stays off, so storage reads need it
+	}
 	configs := []struct {
 		name     string
 		settings map[string]any
@@ -272,7 +280,7 @@ func TestR2CacheProbe(t *testing.T) {
 			cat.Settings = c.settings
 			cat.Databases[0].CacheTTL = c.cacheTTL
 			cat.InitSQL = []string{"CALL enable_logging('HTTP')"}
-			e, err := Open(context.Background(), cat, Options{MaxConcurrency: 1, AllowedPaths: []string{os.Getenv("R2_ALLOWED_PATH")}}, slog.New(slog.DiscardHandler))
+			e, err := Open(context.Background(), cat, Options{MaxConcurrency: 1, AllowedPaths: []string{allowed}}, slog.New(slog.DiscardHandler))
 			if err != nil {
 				t.Fatal(err)
 			}
