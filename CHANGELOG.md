@@ -3,7 +3,7 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
-## [Unreleased]
+## [v0.4.0] - 2026-10-09
 
 ### Changed
 - Licensed under Apache 2.0; release tarballs include the `LICENSE`.
@@ -12,6 +12,8 @@ notes are taken from its section here.
 - `examples/catalog.yaml` no longer attaches `logs` as `READ_ONLY`, which
   failed on a fresh data directory; the example policy grants no writes
   there anyway.
+- `docker-compose.yml` reads the R2 credentials only as `R2_CATALOG_URI`,
+  `R2_WAREHOUSE` and `R2_TOKEN`; the older alias names are gone.
 
 ## [v0.3.3] - 2026-10-09
 
