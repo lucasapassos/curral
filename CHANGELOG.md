@@ -3,7 +3,7 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
-## [Unreleased]
+## [v0.3.0] - 2026-10-09
 
 ### Security
 - Fixed: `DESCRIBE`/`SHOW` (also as a subquery, or `DESCRIBE SELECT ...`)
