@@ -3,6 +3,18 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
+## [v0.3.2] - 2026-10-09
+
+### Security
+- Fixed: errors raised while binding, before the policy ran, mapped tables
+  the caller cannot read: an unknown column gave 400 "column not found"
+  where an existing one gave 403, and type errors named column types. Read
+  file functions leaked whether a path existed the same way. When binding
+  fails, the policy is now asked about the tables and table functions named
+  in the parse tree; if it denies, the caller gets exactly the response of a
+  valid denied statement (also in dry runs). Syntax errors, and errors on
+  objects the caller may read, are reported as before.
+
 ## [v0.3.1] - 2026-10-09
 
 ### Security

@@ -533,14 +533,14 @@ func (e *Engine) Query(ctx context.Context, req Request,
 		// instead of executing all but the last statement.
 		ds, err := c.Prepare(req.SQL)
 		if err != nil {
-			return &QueryError{err}
+			return e.failedBeforePolicy(ctx, c, req.SQL, database, &QueryError{err}, authorize)
 		}
 		st := ds.(*duckdb.Stmt)
 		defer st.Close()
 
 		typ, err := st.StatementType()
 		if err != nil {
-			return &QueryError{err}
+			return e.failedBeforePolicy(ctx, c, req.SQL, database, &QueryError{err}, authorize)
 		}
 		if alwaysDenied[typ] {
 			return fmt.Errorf("%w: %s statements are not allowed", ErrForbidden, stmtTypeName(typ))
@@ -553,7 +553,7 @@ func (e *Engine) Query(ctx context.Context, req Request,
 		insp, err := e.inspect(ctx, c, typ, req.SQL, args, database)
 		lap(&tm.Inspect)
 		if err != nil {
-			return err
+			return e.failedBeforePolicy(ctx, c, req.SQL, database, err, authorize)
 		}
 		if f, ok := listsCatalog(req.SQL, insp); ok {
 			if dynamicSQL[f] {
@@ -629,6 +629,53 @@ func (e *Engine) Query(ctx context.Context, req Request,
 		e.InvalidateSchema()
 	}
 	return nil
+}
+
+// failedBeforePolicy decides what a caller may see of an error raised while
+// binding, before the policy ran. Binder and catalog errors describe the
+// objects the statement names ("column x not found", "cannot compare
+// VARCHAR and INTEGER"), so for a table the caller cannot read they would
+// map its columns and types by trial. The policy is asked about the tables
+// and table functions named in the parse tree: if it denies, the caller
+// gets exactly the refusal a valid statement would get; otherwise the error.
+// Syntax errors depend on the text alone and pass through.
+func (e *Engine) failedBeforePolicy(ctx context.Context, c *duckdb.Conn, query, database string, err error,
+	authorize func(context.Context, Inspection) error,
+) error {
+	var qe *QueryError
+	if !errors.As(err, &qe) || strings.HasPrefix(qe.Error(), "Parser Error") {
+		return err
+	}
+	insp := Inspection{Database: database, Tables: []string{}, Targets: []string{}, Functions: []string{}}
+	// The failed statement may have aborted the transaction.
+	if restartTx(ctx, c) == nil {
+		if tables, funcs, aerr := astSources(ctx, c, query); aerr == nil {
+			insp.StatementType, insp.Resolved = "SELECT", true
+			for _, t := range tables {
+				insp.Tables = append(insp.Tables, e.qualify(t, database))
+			}
+			insp.Functions = funcs
+		} else if verb, targets, reads, ok := writeTargets(query); ok {
+			// The lexer may miss reads of a write: let the policy fail closed.
+			insp.StatementType = verb
+			for _, t := range targets {
+				insp.Targets = append(insp.Targets, e.qualify(t, database))
+			}
+			for _, t := range reads {
+				insp.Tables = append(insp.Tables, e.qualify(t, database))
+			}
+		}
+	}
+	insp.Tables, insp.Targets, insp.Functions = uniq(insp.Tables), uniq(insp.Targets), uniq(insp.Functions)
+	dbs := []string{}
+	for _, n := range append(slices.Clone(insp.Tables), insp.Targets...) {
+		dbs = append(dbs, strings.SplitN(n, ".", 2)[0])
+	}
+	insp.Databases = uniq(dbs)
+	if aerr := authorize(ctx, insp); errors.Is(aerr, ErrForbidden) {
+		return aerr
+	}
+	return err
 }
 
 // setSessionVariables exposes the caller to filters and masks. The

@@ -740,7 +740,13 @@ func (s *Server) finishDryRun(w http.ResponseWriter, ev *audit.Event, insp engin
 		Resolved: insp.Resolved,
 	}
 	status := http.StatusOK
+	var qe *engine.QueryError
 	switch {
+	case errors.As(err, &qe) && policyE == nil && (allowed || !policyCalled):
+		// A statement that failed to bind, which the policy would allow:
+		// report the error (one it denies is reported as denied, below).
+		status = http.StatusBadRequest
+		writeError(w, status, engine.PublicError(err))
 	case policyCalled && policyE == nil:
 		resp.DecidedBy = "policy"
 		resp.Decision = "deny"

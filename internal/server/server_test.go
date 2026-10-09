@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1034,7 +1035,7 @@ func TestNoMetadataLeaks(t *testing.T) {
 		t.Errorf("suggestion: %d %s", r.status, r.body)
 	}
 	r = do(t, ts, "analyst", `{"sql":"SELECT nam FROM salaries","dry_run":true}`)
-	if r.status != 400 || strings.Contains(r.body, `\"name\"`) {
+	if r.status != 200 || !strings.Contains(r.body, `"decision":"deny"`) || strings.Contains(r.body, `\"name\"`) {
 		t.Errorf("dry-run bindings: %d %s", r.status, r.body)
 	}
 }
@@ -1062,5 +1063,52 @@ func TestRequestMaxRows(t *testing.T) {
 	lastServer.MaxRows = 1
 	if r := q(`{"sql":"SELECT id FROM orders ORDER BY id","format":"csv","max_rows":100}`); r.body != "id\n1\n" {
 		t.Errorf("raised the server limit: %q", r.body)
+	}
+}
+
+// Errors raised while binding come before the policy: for a table the caller
+// cannot read they would reveal its columns and types by trial. Such a
+// statement gets exactly the refusal a valid one gets.
+func TestBinderErrorsBehindPolicy(t *testing.T) {
+	ts := newServer(t)
+	denied := do(t, ts, "analyst", `{"sql":"SELECT name FROM salaries"}`)
+	if denied.status != 403 {
+		t.Fatalf("baseline: %d %s", denied.status, denied.body)
+	}
+	for _, q := range []string{
+		`SELECT nope FROM salaries`,     // column oracle
+		`SELECT name + 1 FROM salaries`, // type oracle
+		`SELECT * FROM orders JOIN salaries USING (nope)`,
+		`SELECT * FROM read_csv('/etc/passwd')`, // file oracle: function not allowed
+		`DESCRIBE SELECT nope FROM salaries`,
+	} {
+		r := do(t, ts, "analyst", `{"sql":`+strconv.Quote(q)+`}`)
+		if r.status != denied.status || r.body != denied.body {
+			t.Errorf("%s: %d %s, want %d %s", q, r.status, r.body, denied.status, denied.body)
+		}
+	}
+	// Dry runs too: same decision as for a valid statement.
+	dv := do(t, ts, "analyst", `{"sql":"SELECT name FROM salaries","dry_run":true}`)
+	dn := do(t, ts, "analyst", `{"sql":"SELECT nope FROM salaries","dry_run":true}`)
+	if dn.status != 200 || !strings.Contains(dn.body, `"decision":"deny"`) || !strings.Contains(dv.body, `"decision":"deny"`) {
+		t.Errorf("dry run: %s / %s", dv.body, dn.body)
+	}
+	// Readable tables keep their errors, and syntax errors pass through.
+	for q, want := range map[string]string{
+		`SELECT nope FROM orders`: "nope",
+		`SELECT * FROM nosuch`:    "nosuch",
+		`SELEC 1`:                 "syntax error",
+	} {
+		r := do(t, ts, "analyst", `{"sql":`+strconv.Quote(q)+`}`)
+		if r.status != 400 || !strings.Contains(r.body, want) {
+			t.Errorf("%s: %d %s", q, r.status, r.body)
+		}
+		if r := do(t, ts, "analyst", `{"sql":`+strconv.Quote(q)+`,"dry_run":true}`); r.status != 400 {
+			t.Errorf("dry %s: %d %s", q, r.status, r.body)
+		}
+	}
+	// Admins see every error.
+	if r := do(t, ts, "admin", `{"sql":"SELECT nope FROM salaries"}`); r.status != 400 || !strings.Contains(r.body, "nope") {
+		t.Errorf("admin: %d %s", r.status, r.body)
 	}
 }
