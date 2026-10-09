@@ -3,6 +3,12 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
+## [Unreleased]
+
+### Changed
+- The Go module path is now `github.com/lucasapassos/curral`, so
+  `go install github.com/lucasapassos/curral/cmd/curral@latest` works.
+
 ## [v0.4.0] - 2026-10-09
 
 ### Changed

@@ -11,7 +11,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"curral/internal/config"
+	"github.com/lucasapassos/curral/internal/config"
 )
 
 // File is the content of the --row-filters file.

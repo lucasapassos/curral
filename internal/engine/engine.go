@@ -21,8 +21,8 @@ import (
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
 
-	"curral/internal/catalogcache"
-	"curral/internal/config"
+	"github.com/lucasapassos/curral/internal/catalogcache"
+	"github.com/lucasapassos/curral/internal/config"
 )
 
 // Options are the resource and safety knobs set from the command line.

@@ -20,13 +20,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"curral/internal/audit"
-	"curral/internal/auth"
-	"curral/internal/encode"
-	"curral/internal/engine"
-	"curral/internal/metrics"
-	"curral/internal/policy"
-	"curral/internal/rls"
+	"github.com/lucasapassos/curral/internal/audit"
+	"github.com/lucasapassos/curral/internal/auth"
+	"github.com/lucasapassos/curral/internal/encode"
+	"github.com/lucasapassos/curral/internal/engine"
+	"github.com/lucasapassos/curral/internal/metrics"
+	"github.com/lucasapassos/curral/internal/policy"
+	"github.com/lucasapassos/curral/internal/rls"
 )
 
 // SQL text modes for audit events.

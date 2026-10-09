@@ -15,7 +15,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"curral/internal/config"
+	"github.com/lucasapassos/curral/internal/config"
 )
 
 // Principal is an authenticated user or service.

@@ -93,7 +93,7 @@ outside local tests.
 |---|---|
 | **Docker** | `docker pull lucasapassos/curral` (linux/amd64 and linux/arm64, distroless, non-root, ~190 MB) |
 | **Binary** | Linux amd64/arm64 tarballs (glibc 2.35+) on the [releases page](https://github.com/lucasapassos/curral/releases), with the `httpfs`, `avro` and `iceberg` extensions bundled so it runs offline |
-| **From source** | Go 1.27+ and a C compiler: `go build -tags duckdb_arrow -o bin/curral ./cmd/curral` |
+| **From source** | Go 1.27+ and a C compiler: `go install -tags duckdb_arrow github.com/lucasapassos/curral/cmd/curral@latest` |
 
 With the release tarball, point curral at the bundled extensions:
 
