@@ -81,7 +81,7 @@ jobs:
       # Each architecture builds natively (no QEMU for the cgo/DuckDB build)
       # and is pushed by digest; the manifest job joins them under the tags.
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
