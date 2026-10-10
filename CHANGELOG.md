@@ -12,10 +12,18 @@ notes are taken from its section here.
   patch, `DELETE`, with `If-Match`) follow the policy decision
   `--policy-docs-query` (default `data.curral.docs_allow`) and are audited.
   The example policy grants them to the new `poet` role.
-- The Python client reads and writes semantic documents (`docs()`, `doc()`,
-  `create_doc()`, `update_doc()`, `patch_doc()`, `delete_doc()`), and the
-  agent skill reads them before writing SQL; `scripts/curral.sh` gains
-  `docs`, `doc` and `doc-create`/`doc-update`/`doc-patch`/`doc-delete`.
+- `POST /v1/docs/search` returns the semantic documents that best fit a
+  question: `table`/`schema` filters, then BM25 over the documents (title
+  weighted most; accents, identifiers and plurals folded). With `--jev-key`,
+  TypeSafe's Jev model judges the best `--search-shortlist` candidates and
+  only those at or above `--jev-threshold` (0.7) are returned, ranked by
+  it; when none is, those at or above `--jev-floor` (0.2) come back as weak
+  matches.
+- The Python client reads, searches and writes semantic documents
+  (`docs()`, `doc()`, `search_docs()`, `create_doc()`, `update_doc()`,
+  `patch_doc()`, `delete_doc()`), and the agent skill searches them before
+  writing SQL; `scripts/curral.sh` gains `docs`, `doc`, `search` and
+  `doc-create`/`doc-update`/`doc-patch`/`doc-delete`.
 
 ### Fixed
 - `scripts/curral.sh schema` split filter values on spaces, so a value such

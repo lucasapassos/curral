@@ -1,0 +1,29 @@
+{
+  "docs": {
+    "revenue": {"header": {"title": "Monthly revenue", "description": "Gross revenue per month", "used_for": ["finance reports"]}, "context": {"schemas": ["sales.main"], "tables": ["sales.main.orders"], "body": "Revenue is sum(orders.amount) grouped by date_trunc('month', created_at). Cancelled orders (status = 'cancelled') must be excluded.", "sqls": [{"sql": "SELECT date_trunc('month', created_at) m, sum(amount) FROM sales.main.orders WHERE status <> 'cancelled' GROUP BY 1", "description": "revenue per month"}]}},
+    "churn": {"header": {"title": "Customer churn", "description": "Who stopped buying"}, "context": {"schemas": ["sales.main"], "tables": ["sales.main.customers", "sales.main.orders"], "body": "A customer churns after 90 days without an order. Use max(orders.created_at) per customer_id."}},
+    "returns": {"header": {"title": "Returns", "description": "Returned items and reasons"}, "context": {"schemas": ["sales.main"], "tables": ["sales.main.returns"], "body": "One row per returned item. reason_code maps to: 1 damaged, 2 wrong size, 3 changed mind."}},
+    "shipping": {"header": {"title": "Shipping times"}, "context": {"schemas": ["sales.main"], "tables": ["sales.main.shipments"], "body": "delivered_at - shipped_at is the delivery time. Ignore rows where delivered_at is null."}},
+    "catalog": {"header": {"title": "Product catalog"}, "context": {"schemas": ["sales.main"], "tables": ["sales.main.products"], "body": "products.category is the top-level category; sku is unique."}}
+  },
+  "cases": [
+    {"q": "qual foi o faturamento mensal?", "match": ["revenue"]},
+    {"q": "quais clientes pararam de comprar?", "match": ["churn"]},
+    {"q": "quantas devoluções por motivo no último mês?", "match": ["returns"]},
+    {"q": "quanto tempo leva a entrega?", "match": ["shipping"]},
+    {"q": "qual categoria de produto mais vende?", "match": ["catalog"], "may": ["revenue"]},
+    {"q": "quanto vendemos em pedidos cancelados?", "match": ["revenue"], "may": ["churn"]},
+    {"q": "qual o sku mais devolvido?", "match": ["returns"], "may": ["catalog"]},
+    {"q": "clientes que devolveram itens danificados", "match": ["returns"], "may": ["churn"]},
+    {"q": "headcount por departamento", "match": []},
+    {"q": "quantos tickets de suporte estão abertos?", "match": []},
+    {"q": "qual o custo de frete por pedido?", "match": [], "may": ["shipping"]},
+    {"q": "taxa de conversão do site", "match": []},
+    {"q": "ticket médio por pedido", "match": ["revenue"]},
+    {"q": "quais produtos nunca foram vendidos?", "match": ["catalog"], "may": ["revenue", "churn"]},
+    {"q": "motivo mais comum de troca", "match": ["returns"]},
+    {"q": "pedidos entregues com atraso", "match": ["shipping"], "may": ["revenue"]},
+    {"q": "estoque disponível por sku", "match": [], "may": ["catalog"]},
+    {"q": "salário médio dos vendedores", "match": []}
+  ]
+}

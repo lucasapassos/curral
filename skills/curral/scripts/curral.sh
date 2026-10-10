@@ -5,6 +5,7 @@
 #   curral.sh query  [-f json|csv|ndjson] [-d database] [-o file] [-m max_rows] [-p value]... "SQL"
 #   curral.sh dry-run [-d database] [-p value]... "SQL"
 #   curral.sh docs [table=X] [schema=Y] [q=TEXT] [fields=header]
+#   curral.sh search [table=X] [schema=Y] [limit=N] [fields=header] "QUESTION"
 #   curral.sh doc ID
 #   curral.sh doc-create FILE|-
 #   curral.sh doc-update [-e etag] ID FILE|-     (replaces the content)
@@ -180,6 +181,23 @@ docs)
 		shift
 	done
 	OUT=- request -G "$@" "$url/v1/docs"
+	;;
+search)
+	[ $# -ge 1 ] || die "usage: search [table=X] [schema=Y] [limit=N] [fields=header] \"QUESTION\""
+	body=""
+	while [ $# -gt 1 ]; do
+		case $1 in
+		table=* | schema=* | fields=*)
+			body="$body,\"${1%%=*}\":$(printf '%s' "${1#*=}" | json_string)" ;;
+		limit=*)
+			case ${1#limit=} in *[!0-9]* | "") die "limit= needs an integer" ;; esac
+			body="$body,\"limit\":${1#limit=}" ;;
+		*) die "invalid option: $1 (use table=, schema=, limit=, fields=header; the question goes last)" ;;
+		esac
+		shift
+	done
+	printf '{"q":%s%s}' "$(printf '%s' "$1" | json_string)" "$body" >"$tmp/req"
+	OUT=- request -H 'Content-Type: application/json' --data-binary "@$tmp/req" "$url/v1/docs/search"
 	;;
 doc)
 	[ $# -eq 1 ] || die "usage: doc ID"

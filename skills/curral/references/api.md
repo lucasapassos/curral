@@ -156,6 +156,7 @@ writes are allowed by the policy (403 otherwise).
 |---|---|
 | `GET /v1/docs` | `{"docs": [...]}`, most recently updated first |
 | `GET /v1/docs/{id}` | the document; `ETag` header |
+| `POST /v1/docs/search` | `{"ranker", "results": [{"score", "judged", "doc"}]}`, best first |
 | `POST /v1/docs` | 201, the document with `id`; `Location` and `ETag` headers |
 | `PUT /v1/docs/{id}` | 200, replaces `header`/`context` content |
 | `PATCH /v1/docs/{id}` | 200, JSON merge patch (RFC 7396): only the fields to change, `null` removes one |
@@ -165,6 +166,14 @@ writes are allowed by the policy (403 otherwise).
   `orders` finds `sales.main.orders`), `q=` (text in title, description or
   `used_for`), all case-insensitive. `fields=header` leaves out `body` and
   `sqls`.
+- **Search:** body `{"q": "question", "table"?, "schema"?, "limit"?: 5
+  (max 50), "fields"?: "full"|"header"}`. `"ranker": "jev"`: each result
+  was judged by a model and `score` is the probability it helps (only
+  those above the server's threshold are returned; if none is,
+  `"below_threshold": true` and the best are returned anyway, unless they
+  are clearly unrelated, so `results` may be empty; `"judged": false`
+  marks one the model could not rate). `"ranker": "bm25"`: word
+  match only, `score` just orders. 400 without `q`.
 - **Writes:** `header.title` (up to 200 characters) and `context.body` are
   required, each `sqls[]` item needs `sql`. `id`, `author`, `created_at`,
   `updated_at` and `updated_by` are set by the server; values sent for them

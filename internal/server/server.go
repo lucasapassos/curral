@@ -27,6 +27,7 @@ import (
 	"github.com/lucasapassos/curral/internal/engine"
 	"github.com/lucasapassos/curral/internal/metrics"
 	"github.com/lucasapassos/curral/internal/policy"
+	"github.com/lucasapassos/curral/internal/rerank"
 	"github.com/lucasapassos/curral/internal/rls"
 )
 
@@ -63,6 +64,12 @@ type Server struct {
 	Version               string
 
 	Docs *docs.Store // semantic documents; nil disables /v1/docs
+	// Judge, when set, decides which documents /v1/docs/search returns and
+	// ranks them; nil ranks by BM25 alone.
+	Judge           rerank.Judge
+	SearchThreshold float64 // minimum Judge probability to match: 0.7
+	SearchFloor     float64 // minimum to return when none matches (0 = any)
+	SearchShortlist int     // best BM25 candidates handed to Judge: 20
 
 	// Swapped atomically on reload; in-flight requests keep the version
 	// they started with.

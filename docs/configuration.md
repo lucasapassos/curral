@@ -35,6 +35,11 @@ list: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--policy-masks-query` | (off) | optional rule with column masks, e.g. `data.curral.masks` |
 | `--docs-dir` | (off) | directory of semantic documents served at `/v1/docs`; reloaded on `SIGHUP` |
 | `--policy-docs-query` | `data.curral.docs_allow` | decision allowing writes to `/v1/docs`; undefined means deny |
+| `--jev-key` | (off) | TypeSafe API key: `/v1/docs/search` asks Jev which documents fit the question; prefer `CURRAL_JEV_KEY`. Sends the candidate documents to TypeSafe |
+| `--jev-threshold` | 0.7 | minimum Jev probability for a search match |
+| `--jev-floor` | 0.2 | when nothing reaches the threshold, documents at or above this still come back as weak matches (`below_threshold`); 0 returns the best whatever their probability |
+| `--jev-timeout` | 5s | how long a search waits for Jev; unrated documents keep their BM25 place |
+| `--search-shortlist` | 20 | best BM25 candidates a search hands to Jev |
 | `--row-filters` | (off) | RLS file: which rows each user sees, per table; reloaded on `SIGHUP` |
 | `--max-concurrency` | 8 | queries executing at the same time |
 | `--queue-timeout` | 5s | wait for a free slot; after that the response is 503 |

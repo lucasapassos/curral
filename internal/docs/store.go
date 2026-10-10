@@ -28,8 +28,9 @@ var idRE = regexp.MustCompile(`^[a-z0-9]{8,64}$`)
 func ValidID(id string) bool { return idRE.MatchString(id) }
 
 type entry struct {
-	doc  Doc
-	etag string
+	doc   Doc
+	etag  string
+	terms terms // for Search
 }
 
 // Store keeps every document in memory and one file per document,
@@ -89,7 +90,7 @@ func (s *Store) Reload() error {
 			return fmt.Errorf("docs: %s: %w", path, err)
 		}
 		d.ID = id
-		ids[id] = entry{d, etag(b)}
+		ids[id] = entry{d, etag(b), docTerms(d)}
 	}
 	s.ids = ids
 	return nil
@@ -261,7 +262,7 @@ func (s *Store) write(d Doc) (Doc, string, error) {
 		dir.Close()
 	}
 	tag := etag(b)
-	s.ids[d.ID] = entry{d, tag}
+	s.ids[d.ID] = entry{d, tag, docTerms(d)}
 	return d, tag, nil
 }
 

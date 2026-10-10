@@ -16,6 +16,7 @@ query() (Arrow results), and pandas/polars only if you convert the table.
 
     # Semantic documents (/v1/docs, servers started with --docs-dir)
     notes = c.docs(table="orders")                                     # list of dicts
+    hits = c.search_docs("monthly revenue per customer")["results"]    # best first
     d = c.create_doc({"header": {"title": "Revenue"}, "context": {"body": "..."}})
     d = c.patch_doc(d["id"], {"header": {"used_for": ["finance"]}}, if_match=d.etag)
     c.delete_doc(d["id"])
@@ -120,6 +121,15 @@ class Client:
         path = "/v1/docs" + ("?" + urllib.parse.urlencode(query) if query else "")
         with self._request("GET", path) as resp:
             return json.load(resp)["docs"]
+
+    def search_docs(self, q: str, *, table: str | None = None, schema: str | None = None, limit: int | None = None, headers_only: bool = False) -> dict:
+        """The documents that best fit the question q, best first:
+        {"ranker", "results": [{"score", "judged", "doc"}], "below_threshold"?}."""
+        body = {k: v for k, v in {"q": q, "table": table, "schema": schema, "limit": limit}.items() if v}
+        if headers_only:
+            body["fields"] = "header"
+        with self._request("POST", "/v1/docs/search", body) as resp:
+            return json.load(resp)
 
     def doc(self, doc_id: str) -> Doc:
         """One document, with its etag."""
