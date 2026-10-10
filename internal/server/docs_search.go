@@ -10,6 +10,7 @@ import (
 
 	"github.com/lucasapassos/curral/internal/auth"
 	"github.com/lucasapassos/curral/internal/docs"
+	"github.com/lucasapassos/curral/internal/rerank"
 )
 
 // Search answers "which documents help with this question?" in up to three
@@ -20,7 +21,6 @@ import (
 const (
 	defaultSearchLimit     = 5
 	maxSearchLimit         = 50
-	defaultSearchThreshold = 0.7
 	defaultSearchShortlist = 20
 )
 
@@ -43,7 +43,8 @@ type searchHit struct {
 type searchResponse struct {
 	Ranker string `json:"ranker"`
 	// BelowThreshold: no document reached the threshold, so the best judged
-	// ones are returned anyway; treat them as weak matches.
+	// ones at or above the floor are returned anyway; treat them as weak
+	// matches.
 	BelowThreshold bool        `json:"below_threshold,omitempty"`
 	Results        []searchHit `json:"results"`
 }
@@ -104,7 +105,7 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, _ *auth.Prin
 		shortlist = defaultSearchShortlist
 	}
 	if threshold <= 0 {
-		threshold = defaultSearchThreshold
+		threshold = rerank.DefaultThreshold
 	}
 	hits := s.Docs.Search(in.Q, f, max(shortlist, in.Limit))
 	ds := make([]docs.Doc, len(hits))
@@ -128,7 +129,7 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, _ *auth.Prin
 			}
 		case j.P >= threshold:
 			matched = append(matched, searchHit{j.P, true, view(h.Doc)})
-		default:
+		case j.P >= s.SearchFloor:
 			weak = append(weak, searchHit{j.P, true, view(h.Doc)})
 		}
 	}

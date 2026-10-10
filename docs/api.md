@@ -169,8 +169,10 @@ curl -u analyst:analyst-pw -d '{"q":"monthly revenue per customer","limit":3}' l
   model, which judges whether the document is needed to write the SQL. Only
   documents at or above `--jev-threshold` (0.7) are returned, ranked by that
   probability (`score`, with `"judged": true`). If none reaches it, the best
-  judged ones come back with `"below_threshold": true`; treat them as weak
-  matches. A document Jev could not rate in time keeps its BM25 place after
+  judged ones at or above `--jev-floor` (0.2) come back with
+  `"below_threshold": true`; treat them as weak matches. Below the floor
+  they are left out, so a question no document fits gets an empty list. A
+  document Jev could not rate in time keeps its BM25 place after
   the judged ones, with `"judged": false`.
 - **Without Jev:** `"ranker": "bm25"` and `score` is the BM25 score, useful only
   for ordering.

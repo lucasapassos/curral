@@ -141,6 +141,20 @@ func TestDocsSearchJudged(t *testing.T) {
 		t.Fatalf("churn: %+v", got)
 	}
 
+	// With a floor, weak matches below it are left out.
+	floored, _ := newDocsServer(t, dir, filepath.Join(t.TempDir(), "audit.jsonl"), func(s *Server) {
+		s.Judge, s.SearchFloor = judge, 0.2
+	})
+	got = search(t, docReq(t, floored, "POST", "analyst", "/v1/docs/search", `{"q":"churn","table":"customers"}`))
+	if got.BelowThreshold || len(got.Results) != 0 {
+		t.Fatalf("floor: %+v", got)
+	}
+	judge.p["Customer churn"] = 0.3
+	got = search(t, docReq(t, floored, "POST", "analyst", "/v1/docs/search", `{"q":"churn","table":"customers"}`))
+	if !got.BelowThreshold || !slices.Equal(got.titles(), []string{"Customer churn"}) {
+		t.Fatalf("above the floor: %+v", got)
+	}
+
 	// A document the judge cannot rate keeps its BM25 place after matches.
 	delete(judge.p, "Monthly revenue")
 	got = search(t, docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"monthly revenue orders","limit":3}`))

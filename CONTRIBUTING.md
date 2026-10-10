@@ -24,6 +24,11 @@ go test -race -tags duckdb_arrow ./...
 The `duckdb_arrow` tag enables Arrow IPC output; CI also runs the server and
 engine tests without it. The Cloudflare R2 integration tests skip themselves
 unless the `R2_*` variables are set (see `examples/r2.env.example`).
+`TestJevEval` checks the question `/v1/docs/search` asks of TypeSafe's Jev
+against the labeled cases in `internal/rerank/testdata/eval.json`, through
+the real API; it skips itself unless `CURRAL_JEV_KEY` is set. Run it after
+changing that question or the default threshold:
+`go test ./internal/rerank -run JevEval -v`.
 
 Fuzzers for the statement inspection (run them when touching
 `internal/engine`):

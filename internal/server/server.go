@@ -68,6 +68,7 @@ type Server struct {
 	// ranks them; nil ranks by BM25 alone.
 	Judge           rerank.Judge
 	SearchThreshold float64 // minimum Judge probability to match: 0.7
+	SearchFloor     float64 // minimum to return when none matches (0 = any)
 	SearchShortlist int     // best BM25 candidates handed to Judge: 20
 
 	// Swapped atomically on reload; in-flight requests keep the version

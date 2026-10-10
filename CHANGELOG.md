@@ -16,7 +16,9 @@ notes are taken from its section here.
   question: `table`/`schema` filters, then BM25 over the documents (title
   weighted most; accents, identifiers and plurals folded). With `--jev-key`,
   TypeSafe's Jev model judges the best `--search-shortlist` candidates and
-  only those at or above `--jev-threshold` are returned, ranked by it.
+  only those at or above `--jev-threshold` (0.7) are returned, ranked by
+  it; when none is, those at or above `--jev-floor` (0.2) come back as weak
+  matches.
 - The Python client reads, searches and writes semantic documents
   (`docs()`, `doc()`, `search_docs()`, `create_doc()`, `update_doc()`,
   `patch_doc()`, `delete_doc()`), and the agent skill searches them before

@@ -21,6 +21,15 @@ import (
 // DefaultURL is TypeSafe's System One endpoint.
 const DefaultURL = "https://api.typesafe.ai/v1/systemone"
 
+// Defaults for using judgments, checked against testdata/eval.json (see
+// eval_test.go): a document matches at DefaultThreshold or above; when none
+// does, those at DefaultFloor or above are still worth showing as weak
+// matches.
+const (
+	DefaultThreshold = 0.7
+	DefaultFloor     = 0.2
+)
+
 // Judgment is the probability that a document helps answer the question.
 // Err is set when the document could not be judged; P is then 0.
 type Judgment struct {

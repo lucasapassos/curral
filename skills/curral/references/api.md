@@ -170,8 +170,9 @@ writes are allowed by the policy (403 otherwise).
   (max 50), "fields"?: "full"|"header"}`. `"ranker": "jev"`: each result
   was judged by a model and `score` is the probability it helps (only
   those above the server's threshold are returned; if none is,
-  `"below_threshold": true` and the best are returned anyway; `"judged":
-  false` marks one the model could not rate). `"ranker": "bm25"`: word
+  `"below_threshold": true` and the best are returned anyway, unless they
+  are clearly unrelated, so `results` may be empty; `"judged": false`
+  marks one the model could not rate). `"ranker": "bm25"`: word
   match only, `score` just orders. 400 without `q`.
 - **Writes:** `header.title` (up to 200 characters) and `context.body` are
   required, each `sqls[]` item needs `sql`. `id`, `author`, `created_at`,
