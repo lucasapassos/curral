@@ -83,6 +83,47 @@ another running a simple query:
 | no quota | waited 5 s and got **503** | 8 ran, 4 got 503 |
 | `--max-concurrency-per-user 2` | **200 in 2 ms** | 2 ran, 10 got 429 |
 
+## Semantic documents
+
+With `--docs-dir`, every authenticated user can read `/v1/docs`; writes go
+through a separate decision, `--policy-docs-query` (default
+`data.curral.docs_allow`). It is undefined, and so denies every write, until
+the policy defines it. The example grants it to `admin` and `poet`:
+
+```rego
+docs_allow if "admin" in input.roles
+
+docs_allow if "poet" in input.roles
+```
+
+Input:
+
+| Field | |
+|---|---|
+| `action` | `create`, `update` (`PUT` and `PATCH`) or `delete` |
+| `user`, `roles` | the caller |
+| `doc_id` | the document id (generated on create) |
+| `author` | who created the document; absent on create |
+| `doc` | `{title, author, tables, schemas}` as the document will be saved; absent on delete |
+| `current` | the same fields as the document is now; absent on create |
+
+So rules can, for example, let only the author delete
+(`input.author == input.user`) or limit a role to documents about some
+tables. A rule like that must check **both** `doc` and `current`: checking
+only `doc` would let an update take over a document about other tables by
+changing its `tables`.
+
+```rego
+docs_allow if {
+	"sales_poet" in input.roles
+	not other_tables
+}
+
+other_tables if { some t in input.doc.tables; not startswith(t, "sales.") }
+
+other_tables if { some t in input.current.tables; not startswith(t, "sales.") }
+```
+
 ## Data protection: row filters (RLS) and column masking
 
 Beyond allowing or denying tables, curral can restrict **which rows** a user

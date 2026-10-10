@@ -50,3 +50,29 @@ def test_truncation_warning():
         t = analyst().query("SELECT * FROM orders")
     assert t.num_rows == 10000
     assert any(issubclass(x.category, TruncatedResultWarning) for x in w)
+
+
+def test_docs():
+    poet = Client(URL, user="poet", password="poet-pw")
+    d = poet.create_doc({
+        "header": {"title": "Order amounts", "used_for": ["finance"]},
+        "context": {"tables": ["sales.main.orders"], "body": "amount is the gross value."},
+    })
+    assert d["header"]["author"] == "poet" and d.etag
+    try:
+        assert any(x["id"] == d["id"] for x in analyst().docs(table="orders", headers_only=True))
+        with pytest.raises(CurralError) as e:
+            analyst().patch_doc(d["id"], {"header": {"title": "x"}})
+        assert e.value.status == 403
+        with pytest.raises(CurralError) as e:
+            poet.patch_doc(d["id"], {"header": {"title": "x"}}, if_match='"stale"')
+        assert e.value.status == 412
+        p = poet.patch_doc(d["id"], {"header": {"used_for": None}}, if_match=d.etag)
+        assert "used_for" not in p["header"] and p.etag != d.etag
+        u = poet.update_doc(d["id"], {**poet.doc(d["id"]), "context": {"body": "new"}})
+        assert u["context"] == {"body": "new"}
+    finally:
+        poet.delete_doc(d["id"])
+    with pytest.raises(CurralError) as e:
+        poet.doc(d["id"])
+    assert e.value.status == 404

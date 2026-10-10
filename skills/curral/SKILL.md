@@ -1,6 +1,6 @@
 ---
 name: curral
-description: Query data through a curral server (a REST API that runs DuckDB SQL over DuckDB databases and Iceberg catalogs, such as the Cloudflare R2 Data Catalog, with authentication and per-user permissions). Use this skill whenever you read data through curral, for example when CURRAL_URL/CURRAL_TOKEN are set in the environment, when the user mentions curral, the "lake" or tables it serves, or asks for numbers, reports, exports or the structure of the tables that live there, even without naming curral. Covers schema discovery (/v1/schema), writing the SQL, validating with dry_run, row limits and interpreting 400/401/403/429/503/504 errors.
+description: Query data through a curral server (a REST API that runs DuckDB SQL over DuckDB databases and Iceberg catalogs, such as the Cloudflare R2 Data Catalog, with authentication and per-user permissions). Use this skill whenever you read data through curral, for example when CURRAL_URL/CURRAL_TOKEN are set in the environment, when the user mentions curral, the "lake" or tables it serves, or asks for numbers, reports, exports or the structure of the tables that live there, even without naming curral. Covers schema discovery (/v1/schema), semantic documents with notes and sample SQL (/v1/docs), writing the SQL, validating with dry_run, row limits and interpreting 400/401/403/429/503/504 errors.
 ---
 
 # Querying data through curral
@@ -43,6 +43,8 @@ scripts/curral.sh query -f csv -o out.csv "SELECT ..."
 scripts/curral.sh query -m 20 "SELECT * FROM monthly_revenue"   # sample: at most 20 rows
 scripts/curral.sh query -p 2025-01-01 "SELECT ... WHERE ref_date >= \$1::DATE"
 scripts/curral.sh dry-run "SELECT ..."           # decides without executing
+scripts/curral.sh docs table=monthly_revenue     # semantic documents; filters: table= schema= q= fields=header
+scripts/curral.sh doc ID                         # one document (its ETag on stderr)
 ```
 
 Pass options before the SQL, and the SQL as a single argument. The exit
@@ -88,6 +90,24 @@ listing, use
 `SELECT table_catalog, table_schema, table_name FROM information_schema.tables`.
 In Iceberg catalogs, `information_schema.columns` shows a fake
 `__ UNKNOWN` column for tables not loaded yet. Use `DESCRIBE`.
+
+### 1b. Read the semantic documents for those tables
+
+If the server keeps semantic documents (`GET /v1/docs` answers 200; 404
+means the feature is off), read the ones about the tables you will query
+before writing SQL: `GET /v1/docs?table=monthly_revenue` (or `?schema=`, or
+`?q=` with words from the question). Start with `?fields=header` to see
+titles and `used_for`, then fetch the relevant ones whole with
+`GET /v1/docs/{id}`.
+
+Each document has `header` (title, description, `used_for`: the questions
+it helps answer) and `context` (`tables`, `schemas`, a free-text `body`
+and `sqls`: sample queries with a description). They are written by people
+who know the data: the meaning of columns, units, caveats, the right joins
+and filters. Prefer what they say over guesses from column names, and start
+from their `sqls` when one fits the question (adapting it, and still going
+through `dry_run` when unsure). If a document contradicts `/v1/schema`, the
+schema wins: the document may be outdated; mention it to the user.
 
 ### 2. Write the SQL (DuckDB dialect)
 
@@ -172,6 +192,33 @@ An error once the stream is under way drops the connection or comes in the
 
 Every response carries `X-Request-Id`. Include it when reporting an
 unexpected error, because it ties the case to the server's audit log.
+
+## Writing semantic documents
+
+Only when the user asks, and only if the policy lets their account write
+(writes by others get 403; the example policy grants the `poet` role). To
+record what you learned about a table, a document looks like:
+
+```json
+{"header": {"title": "Monthly revenue", "description": "...", "used_for": ["finance reports"]},
+ "context": {"tables": ["lake.analytics.monthly_revenue"], "body": "what the columns mean, caveats...",
+             "sqls": [{"sql": "SELECT ...", "description": "revenue per customer"}]}}
+```
+
+`title` and `body` are required; the server fills `id`, `author` and the
+timestamps. With the script, the JSON comes from a file or stdin (`-`):
+
+```sh
+scripts/curral.sh doc-create doc.json
+scripts/curral.sh doc-patch -e '"<etag>"' ID patch.json    # merge patch: only the fields to change; null removes
+scripts/curral.sh doc-update -e '"<etag>"' ID doc.json     # replaces the whole content
+scripts/curral.sh doc-delete -e '"<etag>"' ID
+```
+
+Pass the ETag from your last read with `-e` (`If-Match`): a 412 means
+someone changed the document in the meantime, so read it again and redo
+your change on top. Only put in sample SQL that you ran successfully, and
+never real personal data or values you saw masked.
 
 ## Respect the protections
 

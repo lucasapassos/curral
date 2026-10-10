@@ -9,6 +9,8 @@ The endpoints curral exposes, their request and response formats, and the bundle
 | `POST /v1/query` | yes | run a statement (or a dry run) |
 | `GET /v1/schema` | yes | tables, views and columns the caller may query |
 | `GET /v1/databases` | yes | attached databases |
+| `GET /v1/docs`, `GET /v1/docs/{id}` | yes | semantic documents (with `--docs-dir`) |
+| `POST /v1/docs`, `PUT`/`PATCH`/`DELETE /v1/docs/{id}` | yes | write semantic documents, as the policy allows |
 | `GET /healthz` | no | liveness |
 
 The Prometheus `/metrics` endpoint lives on a separate port; see
@@ -83,6 +85,60 @@ of every object and filters it per user in memory on each call:
   catalog show up within `--schema-cache-ttl`.
 - **Policy and RLS:** changes apply immediately, without waiting for the
   cache, because the filtering runs on every call.
+
+## Semantic documents: `/v1/docs`
+
+With `--docs-dir`, curral keeps **semantic documents**: notes on what schemas
+and tables mean and which SQL answers which question, for AI agents (and
+people) to read before writing queries. Each one is a JSON file,
+`<docs-dir>/<id>.json`.
+
+```json
+{"id": "019a2f1c3a4b9f2e18c4d7a6b05",
+ "header": {"author": "poet", "created_at": "2026-10-10T12:00:00Z",
+            "updated_at": "2026-10-10T12:30:00Z", "updated_by": "admin",
+            "title": "Monthly revenue",
+            "description": "Gross revenue per customer and month",
+            "used_for": ["finance reports", "churn analysis"]},
+ "context": {"schemas": ["lake.analytics"],
+             "tables": ["lake.analytics.monthly_revenue"],
+             "body": "Free text, as long as needed: meaning of columns, caveats, joins...",
+             "sqls": [{"sql": "SELECT customer, sum(revenue) FROM lake.analytics.monthly_revenue GROUP BY 1",
+                       "description": "revenue per customer"}]}}
+```
+
+- **Required:** `header.title` (up to 200 characters) and `context.body`; each
+  `sqls[]` item needs `sql`. Everything else is optional. `tables` and
+  `schemas` are free text, not checked against the catalog.
+- **Server-set:** `id`, `author` (who created it), `created_at`, `updated_at`
+  and `updated_by` (who changed it last). Values sent for them are ignored, so
+  a document from a `GET` can be sent back as is. Unknown fields are a 400.
+- **Reading:** every authenticated user. `GET /v1/docs` lists full documents,
+  most recently updated first; `?table=`, `?schema=` (exact name or its last
+  parts, so `orders` finds `sales.main.orders`) and `?q=` (text in title,
+  description or `used_for`) narrow it, all case-insensitive.
+  `?fields=header` leaves out `body` and `sqls`.
+- **Writing:** `POST /v1/docs` creates (201, `Location` and `ETag`), `PUT
+  /v1/docs/{id}` replaces the content, `PATCH /v1/docs/{id}` applies a [JSON
+  merge patch](https://www.rfc-editor.org/rfc/rfc7396) (`null` removes a
+  field) and `DELETE /v1/docs/{id}` removes it (204). Who may write is decided
+  by the policy; see [Authorization](authorization.md#semantic-documents).
+- **Concurrent edits:** `GET` returns an `ETag`; send it back in `If-Match` on
+  `PUT`, `PATCH` or `DELETE` and the write fails with 412 if someone else
+  changed the document in between.
+- **Size:** request bodies are capped by `--max-body`.
+- **Audit:** writes produce `doc_create`, `doc_update` and `doc_delete` events
+  with the document id in `doc`; like queries, they are refused (503) while
+  the audit log is unavailable.
+- **Files:** written atomically and pretty-printed, so they can be versioned or
+  edited by hand; `SIGHUP` reloads the directory.
+
+```sh
+curl -u poet:poet-pw -H 'Content-Type: application/json' -d @doc.json localhost:8080/v1/docs
+curl -u analyst:analyst-pw 'localhost:8080/v1/docs?table=orders&fields=header'
+curl -u poet:poet-pw -X PATCH -H 'If-Match: "<etag>"' \
+  -d '{"header":{"used_for":["finance reports"]}}' localhost:8080/v1/docs/<id>
+```
 
 ## Dry run
 

@@ -8,6 +8,7 @@ Reference for agents that only have an HTTP tool. For the workflow, see
 - `GET /v1/schema`
 - `POST /v1/query`
 - Dry run
+- Semantic documents: `/v1/docs`
 - Headers and trailers
 - Errors
 - Other endpoints
@@ -133,6 +134,45 @@ consumption by code.
 - **`resolved: false`:** the server could not determine everything the
   statement reads. The policy usually denies this case.
 - **Invalid SQL:** answers 400, like a normal query.
+
+## Semantic documents: `/v1/docs`
+
+Notes written by people who know the data, about what schemas and tables
+mean and which SQL answers which question. Present only on servers started
+with `--docs-dir` (otherwise 404). Every authenticated user reads them;
+writes are allowed by the policy (403 otherwise).
+
+```json
+{"id": "019a2f1c3a4b9f2e18c4d7a6b05",
+ "header": {"author": "poet", "created_at": "2026-10-10T12:00:00Z", "updated_at": "2026-10-10T12:30:00Z",
+            "updated_by": "admin", "title": "Monthly revenue", "description": "...",
+            "used_for": ["finance reports"]},
+ "context": {"schemas": ["lake.analytics"], "tables": ["lake.analytics.monthly_revenue"],
+             "body": "free text",
+             "sqls": [{"sql": "SELECT ...", "description": "..."}]}}
+```
+
+| Request | Response |
+|---|---|
+| `GET /v1/docs` | `{"docs": [...]}`, most recently updated first |
+| `GET /v1/docs/{id}` | the document; `ETag` header |
+| `POST /v1/docs` | 201, the document with `id`; `Location` and `ETag` headers |
+| `PUT /v1/docs/{id}` | 200, replaces `header`/`context` content |
+| `PATCH /v1/docs/{id}` | 200, JSON merge patch (RFC 7396): only the fields to change, `null` removes one |
+| `DELETE /v1/docs/{id}` | 204 |
+
+- **List filters:** `table=` and `schema=` (exact name or its last parts:
+  `orders` finds `sales.main.orders`), `q=` (text in title, description or
+  `used_for`), all case-insensitive. `fields=header` leaves out `body` and
+  `sqls`.
+- **Writes:** `header.title` (up to 200 characters) and `context.body` are
+  required, each `sqls[]` item needs `sql`. `id`, `author`, `created_at`,
+  `updated_at` and `updated_by` are set by the server; values sent for them
+  are ignored. Unknown fields are a 400.
+- **`If-Match`:** send the `ETag` you read on `PUT`, `PATCH` and `DELETE`;
+  412 means the document changed since.
+- **Errors:** 400 invalid document, 403 not allowed to write, 404 no such
+  document, 412 stale `If-Match`, 413 body too large, 503 audit unavailable.
 
 ## Headers and trailers
 

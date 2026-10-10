@@ -22,6 +22,7 @@ import (
 
 	"github.com/lucasapassos/curral/internal/audit"
 	"github.com/lucasapassos/curral/internal/auth"
+	"github.com/lucasapassos/curral/internal/docs"
 	"github.com/lucasapassos/curral/internal/encode"
 	"github.com/lucasapassos/curral/internal/engine"
 	"github.com/lucasapassos/curral/internal/metrics"
@@ -60,6 +61,8 @@ type Server struct {
 	Audit                 *audit.Writer // nil disables auditing
 	AuditSQL              string        // redacted (default), full or hash
 	Version               string
+
+	Docs *docs.Store // semantic documents; nil disables /v1/docs
 
 	// Swapped atomically on reload; in-flight requests keep the version
 	// they started with.
@@ -157,6 +160,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/databases", s.authed(s.databases))
 	mux.HandleFunc("GET /v1/schema", s.authed(s.schema))
 	mux.HandleFunc("GET /healthz", s.health)
+	if s.Docs != nil {
+		s.docRoutes(mux)
+	}
 	return withRequestID(mux)
 }
 

@@ -187,3 +187,22 @@ masks := {"lake.s.pii": {"cpf": "last:2", "nome": "redact", "dn": "null", "email
 		}
 	}
 }
+
+func TestDocsAllow(t *testing.T) {
+	ctx := context.Background()
+	files := []string{"../../examples/policy.rego", "../../examples/roles.json"}
+	p, err := LoadQueries(ctx, files, Queries{Allow: "data.curral.allow", Docs: "data.curral.docs_allow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for roles, want := range map[string]bool{"poet": true, "admin": true, "analyst": false, "": false} {
+		in := map[string]any{"action": "create", "user": "u", "roles": []string{roles}}
+		if got, err := p.AllowDocs(ctx, in); err != nil || got != want {
+			t.Errorf("%q: got %v, %v; want %v", roles, got, err, want)
+		}
+	}
+	// Without a docs query, every write is denied.
+	if got, _ := load(t).AllowDocs(ctx, map[string]any{"roles": []string{"admin"}}); got {
+		t.Error("docs write allowed without a docs query")
+	}
+}

@@ -3,6 +3,26 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
+## [Unreleased]
+
+### Added
+- Semantic documents: with `--docs-dir`, `/v1/docs` stores JSON notes on
+  schemas, tables and example SQL (one file each) for AI agents to read.
+  Any authenticated user reads them; writes (`POST`, `PUT`, `PATCH` merge
+  patch, `DELETE`, with `If-Match`) follow the policy decision
+  `--policy-docs-query` (default `data.curral.docs_allow`) and are audited.
+  The example policy grants them to the new `poet` role.
+- The Python client reads and writes semantic documents (`docs()`, `doc()`,
+  `create_doc()`, `update_doc()`, `patch_doc()`, `delete_doc()`), and the
+  agent skill reads them before writing SQL; `scripts/curral.sh` gains
+  `docs`, `doc` and `doc-create`/`doc-update`/`doc-patch`/`doc-delete`.
+
+### Fixed
+- `scripts/curral.sh schema` split filter values on spaces, so a value such
+  as `table=x -x http://host` became curl options (e.g. sending the
+  credentials through a proxy). Filters are now always passed as single
+  URL-encoded values.
+
 ## [v0.4.1] - 2026-10-09
 
 ### Changed

@@ -25,6 +25,7 @@ import (
 	"github.com/lucasapassos/curral/internal/audit"
 	"github.com/lucasapassos/curral/internal/auth"
 	"github.com/lucasapassos/curral/internal/config"
+	"github.com/lucasapassos/curral/internal/docs"
 	"github.com/lucasapassos/curral/internal/engine"
 	"github.com/lucasapassos/curral/internal/metrics"
 	"github.com/lucasapassos/curral/internal/policy"
@@ -105,6 +106,8 @@ type serveFlags struct {
 	policyQuery    string
 	limitsQuery    string
 	masksQuery     string
+	docsQuery      string
+	docsDir        string
 	rowFilters     string
 	maxConcurrency int
 	perUserConc    int64
@@ -152,6 +155,8 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.Var(&f.policies, "policy", "Rego policy file, or JSON/YAML data file exposed as data.* (repeatable, required)")
 	fs.StringVar(&f.policyQuery, "policy-query", "data.curral.allow", "Rego decision that must evaluate to true")
 	fs.StringVar(&f.masksQuery, "policy-masks-query", "", "optional Rego rule with column masks per table, e.g. data.curral.masks")
+	fs.StringVar(&f.docsDir, "docs-dir", "", "directory of semantic documents served at /v1/docs, one JSON file each; empty disables. Reloaded on SIGHUP")
+	fs.StringVar(&f.docsQuery, "policy-docs-query", "data.curral.docs_allow", "Rego decision allowing writes to /v1/docs (undefined = deny); used with --docs-dir")
 	fs.StringVar(&f.rowFilters, "row-filters", "", "row-level security file (per table, which rows matching users see); reloaded on SIGHUP")
 	fs.StringVar(&f.limitsQuery, "policy-limits-query", "", "optional Rego rule with per-request limits {timeout, max_rows}, e.g. data.curral.limits")
 	fs.IntVar(&f.maxConcurrency, "max-concurrency", 8, "queries executing at the same time")
@@ -288,9 +293,11 @@ func runServe(args []string, checkOnly bool) error {
 		return err
 	}
 	loadPolicy := func(ctx context.Context) (*policy.Policy, error) {
-		return policy.LoadQueries(ctx, f.policies, policy.Queries{
-			Allow: f.policyQuery, Limits: f.limitsQuery, Masks: f.masksQuery,
-		})
+		q := policy.Queries{Allow: f.policyQuery, Limits: f.limitsQuery, Masks: f.masksQuery}
+		if f.docsDir != "" {
+			q.Docs = f.docsQuery
+		}
+		return policy.LoadQueries(ctx, f.policies, q)
 	}
 	pol, err := loadPolicy(ctx)
 	if err != nil {
@@ -400,6 +407,12 @@ func runServe(args []string, checkOnly bool) error {
 		AuditSQL: f.auditSQL,
 		Version:  version,
 	}
+	if f.docsDir != "" {
+		if srv.Docs, err = docs.Open(f.docsDir); err != nil {
+			return err
+		}
+		log.Info("semantic documents enabled", "dir", f.docsDir, "docs", srv.Docs.Len(), "policy_query", f.docsQuery)
+	}
 	srv.SetAuth(auth.New(users, f.authCacheTTL))
 	srv.SetPolicy(pol)
 	srv.SetRowFilters(rowRules)
@@ -417,7 +430,8 @@ func runServe(args []string, checkOnly bool) error {
 		}
 	}
 
-	// SIGHUP: reopen the audit log (logrotate) and reload users and policy.
+	// SIGHUP: reopen the audit log (logrotate) and reload users, policy and
+	// semantic documents.
 	// A broken file keeps the previous version in effect. The catalog is
 	// locked into DuckDB at boot and needs a restart.
 	hup := make(chan os.Signal, 1)
@@ -451,6 +465,13 @@ func runServe(args []string, checkOnly bool) error {
 			}
 			srv.SetRowFilters(newRules)
 			srv.Reload(auth.New(users, f.authCacheTTL), newPol, nil)
+			if srv.Docs != nil {
+				if err := srv.Docs.Reload(); err != nil {
+					log.Error("semantic documents reload failed; keeping the current ones", "err", err)
+				} else {
+					log.Info("semantic documents reloaded", "docs", srv.Docs.Len())
+				}
+			}
 		}
 	}()
 
