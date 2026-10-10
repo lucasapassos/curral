@@ -22,6 +22,7 @@ type Policy struct {
 	query  rego.PreparedEvalQuery
 	limits *rego.PreparedEvalQuery // optional per-request limits
 	masks  *rego.PreparedEvalQuery // optional column masks
+	docs   *rego.PreparedEvalQuery // optional semantic document writes
 	// SHA256 identifies the policy and data files loaded, so audit records
 	// show which version of the rules made each decision.
 	SHA256 string
@@ -43,6 +44,7 @@ type Queries struct {
 	Allow  string // required decision, e.g. data.curral.allow
 	Limits string // optional, e.g. data.curral.limits
 	Masks  string // optional, e.g. data.curral.masks
+	Docs   string // optional, e.g. data.curral.docs_allow
 }
 
 // LoadQueries compiles the policy files once for every configured query.
@@ -76,6 +78,13 @@ func LoadQueries(ctx context.Context, files []string, q Queries) (*Policy, error
 			return nil, fmt.Errorf("policy masks: %w", err)
 		}
 		p.masks = &mq
+	}
+	if q.Docs != "" {
+		dq, err := prepare(q.Docs)
+		if err != nil {
+			return nil, fmt.Errorf("policy docs: %w", err)
+		}
+		p.docs = &dq
 	}
 	if p.SHA256, err = hashFiles(files); err != nil {
 		return nil, fmt.Errorf("policy: %w", err)
@@ -262,12 +271,25 @@ func hashFiles(paths []string) (string, error) {
 
 // Allow evaluates the decision. Anything but a single literal true is a deny.
 func (p *Policy) Allow(ctx context.Context, input map[string]any) (bool, error) {
+	return allowed(ctx, p.query, input)
+}
+
+// AllowDocs decides whether a semantic document may be created, updated or
+// deleted. Without a docs query every write is denied.
+func (p *Policy) AllowDocs(ctx context.Context, input map[string]any) (bool, error) {
+	if p.docs == nil {
+		return false, nil
+	}
+	return allowed(ctx, *p.docs, input)
+}
+
+func allowed(ctx context.Context, q rego.PreparedEvalQuery, input map[string]any) (bool, error) {
 	// Converting to an AST value up front skips OPA's JSON round-trip.
 	v, err := ast.InterfaceToValue(input)
 	if err != nil {
 		return false, err
 	}
-	rs, err := p.query.Eval(ctx, rego.EvalParsedInput(v))
+	rs, err := q.Eval(ctx, rego.EvalParsedInput(v))
 	if err != nil {
 		return false, err
 	}

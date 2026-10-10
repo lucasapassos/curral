@@ -4,6 +4,12 @@
 #   curral.sh schema [database=X] [schema=Y] [table=Z]
 #   curral.sh query  [-f json|csv|ndjson] [-d database] [-o file] [-m max_rows] [-p value]... "SQL"
 #   curral.sh dry-run [-d database] [-p value]... "SQL"
+#   curral.sh docs [table=X] [schema=Y] [q=TEXT] [fields=header]
+#   curral.sh doc ID
+#   curral.sh doc-create FILE|-
+#   curral.sh doc-update [-e etag] ID FILE|-     (replaces the content)
+#   curral.sh doc-patch  [-e etag] ID FILE|-     (JSON merge patch)
+#   curral.sh doc-delete [-e etag] ID
 #
 # Environment: CURRAL_URL and CURRAL_TOKEN (Bearer) or CURRAL_USER + CURRAL_PASSWORD.
 # -p: each value becomes $1, $2...; numbers, true, false and null are sent as
@@ -14,6 +20,8 @@
 #     not an error.
 # Exit code: 0 ok; 1 HTTP/network error; 2 usage; 3 result truncated by the
 # server's limit (the body is incomplete); 4 error in the middle of the stream.
+# doc, doc-create, doc-update and doc-patch print the document's ETag on
+# stderr; pass it with -e so the write fails (412) if someone changed it since.
 set -eu
 
 die() { echo "curral: $*" >&2; exit 2; }
@@ -58,6 +66,12 @@ json_param() {
 	esac
 }
 
+check_id() {
+	case $1 in
+	"" | *[!a-z0-9]*) die "invalid document id: $1" ;;
+	esac
+}
+
 # request: runs curl and handles status, headers and trailers.
 request() {
 	out=${OUT:--}
@@ -96,6 +110,8 @@ request() {
 		exit 4
 	fi
 	[ -n "$rows" ] && [ "$out" != - ] && echo "curral: $rows rows in $out" >&2
+	tag=$(hdr ETag)
+	[ -n "$tag" ] && echo "curral: ETag: $tag" >&2
 	return 0
 }
 
@@ -139,8 +155,48 @@ query | dry-run)
 	} >"$tmp/req"
 	OUT=$OUT request -H 'Content-Type: application/json' --data-binary "@$tmp/req" "$url/v1/query"
 	;;
+docs)
+	for kv in "$@"; do
+		case $kv in
+		table=* | schema=* | q=* | fields=*) ;;
+		*) die "invalid filter: $kv (use table=, schema=, q=, fields=header)" ;;
+		esac
+	done
+	OUT=- request -G "$url/v1/docs" $(for kv in "$@"; do printf -- '--data-urlencode %s ' "$kv"; done)
+	;;
+doc)
+	[ $# -eq 1 ] || die "usage: doc ID"
+	check_id "$1"
+	OUT=- request "$url/v1/docs/$1"
+	;;
+doc-create)
+	[ $# -eq 1 ] || die "usage: doc-create FILE|-"
+	OUT=- request -H 'Content-Type: application/json' --data-binary "@$1" "$url/v1/docs"
+	;;
+doc-update | doc-patch | doc-delete)
+	etag=""
+	while getopts e: opt; do
+		case $opt in
+		e) etag=$OPTARG ;;
+		*) die "invalid option" ;;
+		esac
+	done
+	shift $((OPTIND - 1))
+	check_id "${1:-}"
+	if [ "$cmd" = doc-delete ]; then
+		[ $# -eq 1 ] || die "usage: doc-delete [-e etag] ID"
+		set -- -X DELETE "$url/v1/docs/$1"
+	else
+		[ $# -eq 2 ] || die "usage: $cmd [-e etag] ID FILE|-"
+		method=PUT ctype=application/json
+		[ "$cmd" = doc-patch ] && method=PATCH ctype=application/merge-patch+json
+		set -- -X "$method" -H "Content-Type: $ctype" --data-binary "@$2" "$url/v1/docs/$1"
+	fi
+	[ -n "$etag" ] && set -- -H "If-Match: $etag" "$@"
+	OUT=- request "$@"
+	;;
 *)
-	sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' >&2
+	sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' >&2
 	exit 2
 	;;
 esac

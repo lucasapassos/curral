@@ -23,7 +23,7 @@ import (
 // Event is one audit record. Fields are stable: consumers parse them.
 type Event struct {
 	TS                time.Time           `json:"ts"`
-	Event             string              `json:"event"` // query, auth_failure
+	Event             string              `json:"event"` // query, schema, auth_failure, doc_create, doc_update, doc_delete, ...
 	RequestID         string              `json:"request_id"`
 	User              string              `json:"user"`
 	AuthMethod        string              `json:"auth_method,omitempty"` // basic, api_key, jwt
@@ -35,6 +35,7 @@ type Event struct {
 	SQL               string              `json:"sql,omitempty"`
 	SQLSHA256         string              `json:"sql_sha256,omitempty"`
 	ParamsCount       int                 `json:"params_count"`
+	Doc               string              `json:"doc,omitempty"` // semantic document id (doc_* events)
 	Tables            []string            `json:"tables,omitempty"`
 	Targets           []string            `json:"targets,omitempty"`
 	Functions         []string            `json:"functions,omitempty"`

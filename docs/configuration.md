@@ -33,6 +33,8 @@ list: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--policy-query` | `data.curral.allow` | decision that must be `true` |
 | `--policy-limits-query` | (off) | optional rule with per-request limits, e.g. `data.curral.limits` |
 | `--policy-masks-query` | (off) | optional rule with column masks, e.g. `data.curral.masks` |
+| `--docs-dir` | (off) | directory of semantic documents served at `/v1/docs`; reloaded on `SIGHUP` |
+| `--policy-docs-query` | `data.curral.docs_allow` | decision allowing writes to `/v1/docs`; undefined means deny |
 | `--row-filters` | (off) | RLS file: which rows each user sees, per table; reloaded on `SIGHUP` |
 | `--max-concurrency` | 8 | queries executing at the same time |
 | `--queue-timeout` | 5s | wait for a free slot; after that the response is 503 |
@@ -151,7 +153,8 @@ and the **policy** (`.rego` and data) and reopens the audit log.
 - **Tracking:** each attempt produces a `config_reload` audit event, with the new `policy_sha256` or the error, and counts in `curral_config_reloads_total`. `curral_policy_info` shows the hash in effect.
 - **Catalog:** it is mounted and locked at startup, so changes to it require a restart.
 
-The `--row-filters` file and the TLS certificate also reload on `SIGHUP`.
+The `--row-filters` file, the `--docs-dir` documents and the TLS certificate
+also reload on `SIGHUP`.
 
 ## Docker
 
