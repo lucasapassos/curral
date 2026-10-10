@@ -63,6 +63,10 @@ func (s *Store) Dir() string { return s.dir }
 // Reload re-reads the directory, picking up files edited by hand. On error
 // the documents already loaded stay in effect.
 func (s *Store) Reload() error {
+	// Keep the disk snapshot and index swap serialized with API writes.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	files, err := filepath.Glob(filepath.Join(s.dir, "*.json"))
 	if err != nil {
 		return fmt.Errorf("docs: %w", err)
@@ -87,9 +91,7 @@ func (s *Store) Reload() error {
 		d.ID = id
 		ids[id] = entry{d, etag(b)}
 	}
-	s.mu.Lock()
 	s.ids = ids
-	s.mu.Unlock()
 	return nil
 }
 
@@ -240,7 +242,7 @@ func (s *Store) write(d Doc) (Doc, string, error) {
 		return Doc{}, "", fmt.Errorf("docs: %w", err)
 	}
 	defer os.Remove(tmp.Name()) // no-op after the rename
-	if err := tmp.Chmod(0o640); err == nil {
+	if err = tmp.Chmod(0o640); err == nil {
 		if _, err = tmp.Write(b); err == nil {
 			err = tmp.Sync()
 		}
