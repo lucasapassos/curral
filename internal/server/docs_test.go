@@ -21,8 +21,9 @@ import (
 )
 
 // newDocsServer starts a server with only /v1/docs (no engine needed), the
-// example users and policy, and an audit log at auditPath.
-func newDocsServer(t *testing.T, dir, auditPath string) (*httptest.Server, *audit.Writer) {
+// example users and policy, and an audit log at auditPath. setup, if given,
+// adjusts the server before it starts.
+func newDocsServer(t *testing.T, dir, auditPath string, setup ...func(*Server)) (*httptest.Server, *audit.Writer) {
 	t.Helper()
 	users, err := config.LoadUsers("../../examples/users.yaml")
 	if err != nil {
@@ -46,6 +47,9 @@ func newDocsServer(t *testing.T, dir, auditPath string) (*httptest.Server, *audi
 	s := &Server{Log: log, MaxBody: 1 << 10, Version: "test", Docs: store, Audit: aw}
 	s.SetAuth(auth.New(users, time.Minute))
 	s.SetPolicy(pol)
+	for _, f := range setup {
+		f(s)
+	}
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 	return ts, aw

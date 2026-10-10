@@ -22,6 +22,7 @@ var (
 func (s *Server) docRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/docs", s.authed(s.listDocs))
 	mux.HandleFunc("GET /v1/docs/{id}", s.authed(s.getDoc))
+	mux.HandleFunc("POST /v1/docs/search", s.authed(s.searchDocs))
 	mux.HandleFunc("POST /v1/docs", s.authed(s.docWriter("create")))
 	mux.HandleFunc("PUT /v1/docs/{id}", s.authed(s.docWriter("update")))
 	mux.HandleFunc("PATCH /v1/docs/{id}", s.authed(s.docWriter("update")))
@@ -38,6 +39,12 @@ type docSummary struct {
 	} `json:"context"`
 }
 
+func summary(d docs.Doc) docSummary {
+	out := docSummary{ID: d.ID, Header: d.Header}
+	out.Context.Schemas, out.Context.Tables = d.Context.Schemas, d.Context.Tables
+	return out
+}
+
 // listDocs lists documents, most recently updated first. ?table=, ?schema=
 // and ?q= narrow the list; ?fields=header leaves out bodies and SQL.
 func (s *Server) listDocs(w http.ResponseWriter, r *http.Request, _ *auth.Principal) {
@@ -49,8 +56,7 @@ func (s *Server) listDocs(w http.ResponseWriter, r *http.Request, _ *auth.Princi
 	case "header":
 		out := make([]docSummary, len(list))
 		for i, d := range list {
-			out[i].ID, out[i].Header = d.ID, d.Header
-			out[i].Context.Schemas, out[i].Context.Tables = d.Context.Schemas, d.Context.Tables
+			out[i] = summary(d)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"docs": out})
 	default:

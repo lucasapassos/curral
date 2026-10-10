@@ -29,6 +29,7 @@ import (
 	"github.com/lucasapassos/curral/internal/engine"
 	"github.com/lucasapassos/curral/internal/metrics"
 	"github.com/lucasapassos/curral/internal/policy"
+	"github.com/lucasapassos/curral/internal/rerank"
 	"github.com/lucasapassos/curral/internal/rls"
 	"github.com/lucasapassos/curral/internal/server"
 )
@@ -108,6 +109,10 @@ type serveFlags struct {
 	masksQuery     string
 	docsQuery      string
 	docsDir        string
+	jevKey         string
+	jevThreshold   float64
+	jevTimeout     time.Duration
+	shortlist      int
 	rowFilters     string
 	maxConcurrency int
 	perUserConc    int64
@@ -157,6 +162,10 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.StringVar(&f.masksQuery, "policy-masks-query", "", "optional Rego rule with column masks per table, e.g. data.curral.masks")
 	fs.StringVar(&f.docsDir, "docs-dir", "", "directory of semantic documents served at /v1/docs, one JSON file each; empty disables. Reloaded on SIGHUP")
 	fs.StringVar(&f.docsQuery, "policy-docs-query", "data.curral.docs_allow", "Rego decision allowing writes to /v1/docs (undefined = deny); used with --docs-dir")
+	fs.StringVar(&f.jevKey, "jev-key", "", "TypeSafe API key: /v1/docs/search asks Jev which documents fit the question (sends their content to TypeSafe); empty ranks by BM25 alone. Prefer CURRAL_JEV_KEY")
+	fs.Float64Var(&f.jevThreshold, "jev-threshold", 0.7, "minimum Jev probability (0-1) for a document to match a search")
+	fs.DurationVar(&f.jevTimeout, "jev-timeout", 5*time.Second, "time a search waits for Jev; documents not judged by then keep their BM25 place")
+	fs.IntVar(&f.shortlist, "search-shortlist", 20, "best BM25 candidates a search hands to Jev")
 	fs.StringVar(&f.rowFilters, "row-filters", "", "row-level security file (per table, which rows matching users see); reloaded on SIGHUP")
 	fs.StringVar(&f.limitsQuery, "policy-limits-query", "", "optional Rego rule with per-request limits {timeout, max_rows}, e.g. data.curral.limits")
 	fs.IntVar(&f.maxConcurrency, "max-concurrency", 8, "queries executing at the same time")
@@ -216,6 +225,12 @@ func parseFlags(args []string) (*serveFlags, error) {
 	}
 	if (f.tlsCert == "") != (f.tlsKey == "") {
 		return nil, fmt.Errorf("--tls-cert and --tls-key go together")
+	}
+	if f.jevThreshold <= 0 || f.jevThreshold > 1 {
+		return nil, fmt.Errorf("--jev-threshold must be above 0 and at most 1")
+	}
+	if f.shortlist < 1 {
+		return nil, fmt.Errorf("--search-shortlist must be at least 1")
 	}
 	switch f.auditSQL {
 	case server.AuditSQLRedacted, server.AuditSQLFull, server.AuditSQLHash:
@@ -412,6 +427,11 @@ func runServe(args []string, checkOnly bool) error {
 			return err
 		}
 		log.Info("semantic documents enabled", "dir", f.docsDir, "docs", srv.Docs.Len(), "policy_query", f.docsQuery)
+		srv.SearchThreshold, srv.SearchShortlist = f.jevThreshold, f.shortlist
+		if f.jevKey != "" {
+			srv.Judge = &rerank.Jev{Key: f.jevKey, Timeout: f.jevTimeout}
+			log.Info("document search ranked by Jev", "threshold", f.jevThreshold, "shortlist", f.shortlist)
+		}
 	}
 	srv.SetAuth(auth.New(users, f.authCacheTTL))
 	srv.SetPolicy(pol)

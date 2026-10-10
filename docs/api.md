@@ -118,6 +118,8 @@ people) to read before writing queries. Each one is a JSON file,
   parts, so `orders` finds `sales.main.orders`) and `?q=` (text in title,
   description or `used_for`) narrow it, all case-insensitive.
   `?fields=header` leaves out `body` and `sqls`.
+- **Searching:** `POST /v1/docs/search` returns the documents that best fit a
+  question; see [below](#searching-documents).
 - **Writing:** `POST /v1/docs` creates (201, `Location` and `ETag`), `PUT
   /v1/docs/{id}` replaces the content, `PATCH /v1/docs/{id}` applies a [JSON
   merge patch](https://www.rfc-editor.org/rfc/rfc7396) (`null` removes a
@@ -139,6 +141,39 @@ curl -u analyst:analyst-pw 'localhost:8080/v1/docs?table=orders&fields=header'
 curl -u poet:poet-pw -X PATCH -H 'If-Match: "<etag>"' \
   -d '{"header":{"used_for":["finance reports"]}}' localhost:8080/v1/docs/<id>
 ```
+
+### Searching documents
+
+`POST /v1/docs/search` takes a question in plain words and returns the
+documents most likely to help answer it, best first. Any authenticated user
+may search.
+
+```sh
+curl -u analyst:analyst-pw -d '{"q":"monthly revenue per customer","limit":3}' localhost:8080/v1/docs/search
+```
+```json
+{"ranker": "jev",
+ "results": [{"score": 0.93, "judged": true, "doc": {"id": "...", "header": {...}, "context": {...}}}]}
+```
+
+- **Request:** `q` (required), optional `table` and `schema` filters (as in
+  the listing), `limit` (default 5, at most 50) and `fields` (`full`, the
+  default, or `header`).
+- **Ranking:** words are matched without case or accents, identifiers split
+  on `_` and `.`, and a plural `s` is ignored. Matches in the title count
+  most, then `used_for`, `tables`/`schemas`, the description, and the body and
+  SQL ([BM25](https://en.wikipedia.org/wiki/Okapi_BM25)). Documents with
+  no word of the question are left out.
+- **With Jev** (`--jev-key`): the best BM25 candidates (`--search-shortlist`,
+  at least `limit`) are each sent to [TypeSafe](https://typesafe.ai)'s Jev
+  model, which judges whether the document is needed to write the SQL. Only
+  documents at or above `--jev-threshold` (0.7) are returned, ranked by that
+  probability (`score`, with `"judged": true`). If none reaches it, the best
+  judged ones come back with `"below_threshold": true`; treat them as weak
+  matches. A document Jev could not rate in time keeps its BM25 place after
+  the judged ones, with `"judged": false`.
+- **Without Jev:** `"ranker": "bm25"` and `score` is the BM25 score, useful only
+  for ordering.
 
 ## Dry run
 

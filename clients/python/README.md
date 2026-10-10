@@ -21,6 +21,7 @@ Semantic documents (`/v1/docs`, on servers started with `--docs-dir`):
 
 ```python
 notes = c.docs(table="orders", q="revenue")          # list of dicts; headers_only=True skips bodies
+hits = c.search_docs("monthly revenue per customer")["results"]   # best first: score, judged, doc
 d = c.create_doc({"header": {"title": "Revenue"}, "context": {"body": "...", "tables": ["sales.main.orders"]}})
 d = c.patch_doc(d["id"], {"header": {"used_for": ["finance"]}}, if_match=d.etag)   # merge patch
 d = c.update_doc(d["id"], {**c.doc(d["id"]), "context": {"body": "rewritten"}})    # full replace

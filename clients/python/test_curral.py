@@ -61,6 +61,8 @@ def test_docs():
     assert d["header"]["author"] == "poet" and d.etag
     try:
         assert any(x["id"] == d["id"] for x in analyst().docs(table="orders", headers_only=True))
+        found = analyst().search_docs("gross order amount", table="orders", limit=1)
+        assert found["results"][0]["doc"]["id"] == d["id"]
         with pytest.raises(CurralError) as e:
             analyst().patch_doc(d["id"], {"header": {"title": "x"}})
         assert e.value.status == 403
