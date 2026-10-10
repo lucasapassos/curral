@@ -198,3 +198,76 @@ func TestDocsDisabled(t *testing.T) {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
 }
+
+// A policy scoped to some tables must see the document before and after an
+// update; otherwise changing tables would take over any document.
+func TestDocsPolicySeesBothVersions(t *testing.T) {
+	tmp := t.TempDir()
+	rego := `package curral
+import rego.v1
+docs_allow if "admin" in input.roles
+docs_allow if {
+	"sales_poet" in input.roles
+	not other_tables
+}
+other_tables if { some t in input.doc.tables; not startswith(t, "sales.") }
+other_tables if { some t in input.current.tables; not startswith(t, "sales.") }
+`
+	users, err := config.LoadUsers("../../examples/users.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range users.Users {
+		if users.Users[i].Name == "poet" {
+			users.Users[i].Roles = []string{"sales_poet"}
+		}
+	}
+	policyPath := filepath.Join(tmp, "docs.rego")
+	os.WriteFile(policyPath, []byte(rego), 0o600)
+	pol, err := policy.LoadQueries(context.Background(), []string{policyPath},
+		policy.Queries{Allow: "data.curral.docs_allow", Docs: "data.curral.docs_allow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := docs.Open(filepath.Join(tmp, "docs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{Log: slog.New(slog.DiscardHandler), MaxBody: 1 << 20, Docs: store}
+	s.SetAuth(auth.New(users, time.Minute))
+	s.SetPolicy(pol)
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	doc := func(table string) string {
+		return `{"header":{"title":"t"},"context":{"tables":["` + table + `"],"body":"b"}}`
+	}
+	id := func(r result) string {
+		var d docs.Doc
+		json.Unmarshal([]byte(r.body), &d)
+		return d.ID
+	}
+	if r := docReq(t, ts, "POST", "poet", "/v1/docs", doc("crm.main.customers")); r.status != 403 {
+		t.Fatalf("create outside scope: %d", r.status)
+	}
+	own := docReq(t, ts, "POST", "poet", "/v1/docs", doc("sales.main.orders"))
+	if own.status != 201 {
+		t.Fatalf("create in scope: %d %s", own.status, own.body)
+	}
+	other := docReq(t, ts, "POST", "admin", "/v1/docs", doc("crm.main.customers"))
+	for _, c := range []struct{ method, body string }{
+		{"PATCH", `{"context":{"tables":["sales.main.orders"]}}`},
+		{"PUT", doc("sales.main.orders")},
+		{"DELETE", ""},
+	} {
+		if r := docReq(t, ts, c.method, "poet", "/v1/docs/"+id(other), c.body); r.status != 403 {
+			t.Errorf("%s of a document outside scope: %d %s", c.method, r.status, r.body)
+		}
+	}
+	if r := docReq(t, ts, "PATCH", "poet", "/v1/docs/"+id(own), `{"context":{"tables":["crm.main.customers"]}}`); r.status != 403 {
+		t.Errorf("moving a document out of scope: %d", r.status)
+	}
+	if r := docReq(t, ts, "DELETE", "poet", "/v1/docs/"+id(own), ""); r.status != 204 {
+		t.Errorf("delete in scope: %d %s", r.status, r.body)
+	}
+}

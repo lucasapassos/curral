@@ -127,17 +127,16 @@ func (s *Server) docWriter(action string) handler {
 		}
 
 		pol := s.Policy()
+		// The policy sees both versions: a rule scoped to some tables must
+		// check what the document is about now (current) as well as what it
+		// will be about (doc), or an update could take over any document.
 		check := func(old, next *docs.Doc) error {
-			input := map[string]any{
-				"action": action, "user": p.Name, "roles": p.Roles,
-				"doc_id": "", "author": "", "title": "", "tables": []string{}, "schemas": []string{},
-			}
+			input := map[string]any{"action": action, "user": p.Name, "roles": p.Roles}
 			if old != nil {
-				input["doc_id"], input["author"] = old.ID, old.Header.Author
+				input["doc_id"], input["author"], input["current"] = old.ID, old.Header.Author, docPolicyView(old)
 			}
-			if d := firstDoc(next, old); d != nil {
-				input["doc_id"], input["title"] = d.ID, d.Header.Title
-				input["tables"], input["schemas"] = nonNil(d.Context.Tables), nonNil(d.Context.Schemas)
+			if next != nil {
+				input["doc_id"], input["doc"] = next.ID, docPolicyView(next)
 			}
 			ok, err := pol.AllowDocs(r.Context(), input)
 			if err != nil {
@@ -205,10 +204,10 @@ func (s *Server) docWriter(action string) handler {
 	}
 }
 
-// firstDoc returns the first non-nil document.
-func firstDoc(a, b *docs.Doc) *docs.Doc {
-	if a != nil {
-		return a
+// docPolicyView is the part of a document the docs policy sees.
+func docPolicyView(d *docs.Doc) map[string]any {
+	return map[string]any{
+		"title": d.Header.Title, "author": d.Header.Author,
+		"tables": nonNil(d.Context.Tables), "schemas": nonNil(d.Context.Schemas),
 	}
-	return b
 }

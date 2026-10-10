@@ -66,6 +66,10 @@ json_param() {
 	esac
 }
 
+nl='
+'
+cr=$(printf '\r')
+
 check_id() {
 	case $1 in
 	"" | *[!a-z0-9]*) die "invalid document id: $1" ;;
@@ -127,8 +131,14 @@ schema)
 		*) die "invalid filter: $kv (use database=, schema=, table=)" ;;
 		esac
 	done
-	# -G + --data-urlencode builds the query string.
-	OUT=- request -G "$url/v1/schema" $(for kv in "$@"; do printf -- '--data-urlencode %s ' "$kv"; done)
+	# Each filter becomes "--data-urlencode k=v" as separate quoted words: a
+	# value with spaces must never turn into curl options (-x would leak the
+	# credentials to a proxy).
+	for kv in "$@"; do
+		set -- "$@" --data-urlencode "$kv"
+		shift
+	done
+	OUT=- request -G "$@" "$url/v1/schema"
 	;;
 query | dry-run)
 	format=json database="" OUT=- params="" maxrows=""
@@ -162,7 +172,14 @@ docs)
 		*) die "invalid filter: $kv (use table=, schema=, q=, fields=header)" ;;
 		esac
 	done
-	OUT=- request -G "$url/v1/docs" $(for kv in "$@"; do printf -- '--data-urlencode %s ' "$kv"; done)
+	# Each filter becomes "--data-urlencode k=v" as separate quoted words: a
+	# value with spaces must never turn into curl options (-x would leak the
+	# credentials to a proxy).
+	for kv in "$@"; do
+		set -- "$@" --data-urlencode "$kv"
+		shift
+	done
+	OUT=- request -G "$@" "$url/v1/docs"
 	;;
 doc)
 	[ $# -eq 1 ] || die "usage: doc ID"
@@ -177,7 +194,7 @@ doc-update | doc-patch | doc-delete)
 	etag=""
 	while getopts e: opt; do
 		case $opt in
-		e) etag=$OPTARG ;;
+		e) case $OPTARG in *"$nl"* | *"$cr"*) die "-e: invalid ETag" ;; esac; etag=$OPTARG ;;
 		*) die "invalid option" ;;
 		esac
 	done

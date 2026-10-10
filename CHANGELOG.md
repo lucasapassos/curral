@@ -17,6 +17,12 @@ notes are taken from its section here.
   agent skill reads them before writing SQL; `scripts/curral.sh` gains
   `docs`, `doc` and `doc-create`/`doc-update`/`doc-patch`/`doc-delete`.
 
+### Fixed
+- `scripts/curral.sh schema` split filter values on spaces, so a value such
+  as `table=x -x http://host` became curl options (e.g. sending the
+  credentials through a proxy). Filters are now always passed as single
+  URL-encoded values.
+
 ## [v0.4.1] - 2026-10-09
 
 ### Changed
