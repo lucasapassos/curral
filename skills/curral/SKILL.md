@@ -99,10 +99,14 @@ If the server keeps semantic documents (`GET /v1/docs` answers 200; 404
 means the feature is off), search them with the user's question before
 writing SQL: `POST /v1/docs/search` with `{"q": "<the question>"}` (add
 `"table"` or `"schema"` when you already know them). Results come best
-first, whole. With `"ranker": "jev"` every result was judged relevant;
-`"below_threshold": true` means none was, so read them with suspicion. With
-`"ranker": "bm25"` the ranking is by shared words only: check that each
-one is really about your question. To browse instead, `GET
+first, whole. With `"ranker": "jev"`, check each result's `judged` flag:
+`true` means Jev evaluated it; `false` means evaluation failed or timed out
+and the result uses BM25. `"below_threshold": true` means no evaluated
+document reached the relevance threshold, so treat evaluated results as
+weak matches. For every `"judged": false` result, including all results
+with `"ranker": "bm25"`, the score reflects shared words only: check that
+the document is really about your question before using it to write SQL.
+To browse instead, `GET
 /v1/docs?table=monthly_revenue&fields=header`, then `GET /v1/docs/{id}`.
 
 Each document has `header` (title, description, `used_for`: the questions
