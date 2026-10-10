@@ -3,7 +3,7 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
-## [Unreleased]
+## [v0.5.0] - 2026-10-10
 
 ### Added
 - Semantic documents: with `--docs-dir`, `/v1/docs` stores JSON notes on
