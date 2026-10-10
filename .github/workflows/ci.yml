@@ -68,7 +68,8 @@ jobs:
           go build -tags duckdb_arrow -o bin/curral ./cmd/curral
           ./bin/curral serve --catalog examples/catalog.yaml --users examples/users.yaml \
             --policy examples/policy.rego --policy examples/roles.json \
-            --policy-limits-query data.curral.limits --auth-ip-max-failures 0 > curral.log 2>&1 &
+            --policy-limits-query data.curral.limits --auth-ip-max-failures 0 \
+            --docs-dir data/docs > curral.log 2>&1 &
           for i in $(seq 30); do ./bin/curral healthcheck && exit 0; sleep 1; done
           cat curral.log; exit 1
 
