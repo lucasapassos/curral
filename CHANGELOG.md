@@ -3,7 +3,7 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
-## [Unreleased]
+## [v0.6.0] - 2026-10-12
 
 ### Added
 - Arrow Flight SQL on a second port with `--flight-listen` (off by default),
