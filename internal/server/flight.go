@@ -886,9 +886,11 @@ var decimalType = regexp.MustCompile(`^(?:DECIMAL|NUMERIC)\((\d+),\s*(\d+)\)$`)
 func arrowType(duck string) arrow.DataType {
 	t := strings.ToUpper(strings.TrimSpace(duck))
 	if m := decimalType.FindStringSubmatch(t); m != nil {
-		p, _ := strconv.Atoi(m[1])
-		s, _ := strconv.Atoi(m[2])
-		return &arrow.Decimal128Type{Precision: int32(p), Scale: int32(s)}
+		p, perr := strconv.ParseInt(m[1], 10, 32)
+		s, serr := strconv.ParseInt(m[2], 10, 32)
+		if perr == nil && serr == nil {
+			return &arrow.Decimal128Type{Precision: int32(p), Scale: int32(s)}
+		}
 	}
 	switch t {
 	case "BOOLEAN":
