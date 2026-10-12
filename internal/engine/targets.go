@@ -323,6 +323,69 @@ func writeTargets(q string) (verb string, targets, reads [][]string, ok bool) {
 	return verb, t, r, ok
 }
 
+// Statement verbs answered with a count (or nothing) rather than rows.
+var countVerbs = map[string]bool{
+	"INSERT": true, "UPDATE": true, "DELETE": true, "MERGE": true, "TRUNCATE": true,
+	"CREATE": true, "DROP": true, "ALTER": true, "COMMENT": true, "COPY": true,
+	"SET": true, "RESET": true, "USE": true, "VACUUM": true, "CHECKPOINT": true, "FORCE": true,
+	"ANALYZE": true, "INSTALL": true, "LOAD": true, "ATTACH": true, "DETACH": true,
+	"BEGIN": true, "START": true, "COMMIT": true, "END": true, "ROLLBACK": true, "ABORT": true,
+	"EXPORT": true, "IMPORT": true, "PREPARE": true, "DEALLOCATE": true,
+}
+
+// ReturnsRows reports whether a statement's rows are its answer (SELECT,
+// VALUES, SHOW, DESCRIBE, EXPLAIN, PRAGMA, CALL, a write with RETURNING...)
+// rather than an update count (DML, DDL, SET...). It only guides how a
+// client reads the result (Flight SQL's is_update), never what may run;
+// when unsure it says true, which at worst shows a count as a one-row result.
+func ReturnsRows(q string) bool {
+	toks, _ := tokenize(q) // a partial token list still starts with the verb
+	i := 0
+	for i < len(toks) && toks[i].kind == tokPunct && toks[i].text == "(" {
+		i++
+	}
+	if i < len(toks) && toks[i].kind == tokWord && toks[i].up == "WITH" {
+		// WITH name [(columns)] AS [[NOT] MATERIALIZED] (body) [, ...] verb:
+		// the verb is the first token after a closing parenthesis at depth 0
+		// that is neither AS (after a column list) nor a comma.
+		depth, verb := 0, -1
+		for j := i + 1; j < len(toks) && verb < 0; j++ {
+			t := toks[j]
+			switch {
+			case t.kind == tokPunct && t.text == "(":
+				depth++
+			case t.kind == tokPunct && t.text == ")":
+				depth--
+				if depth == 0 && j+1 < len(toks) {
+					next := toks[j+1]
+					if !(next.kind == tokWord && next.up == "AS") && !(next.kind == tokPunct && next.text == ",") {
+						verb = j + 1
+					}
+				}
+			}
+		}
+		if verb < 0 {
+			return true
+		}
+		i = verb
+	}
+	if i >= len(toks) || toks[i].kind != tokWord || !countVerbs[toks[i].up] {
+		return true
+	}
+	depth := 0
+	for _, t := range toks[i:] {
+		switch {
+		case t.kind == tokPunct && t.text == "(":
+			depth++
+		case t.kind == tokPunct && t.text == ")":
+			depth--
+		case depth == 0 && t.kind == tokWord && t.up == "RETURNING":
+			return true
+		}
+	}
+	return false
+}
+
 func parseTarget(c *cursor) (targets, reads [][]string, ok bool) {
 	one := func() ([][]string, [][]string, bool) {
 		n, ok := c.name()

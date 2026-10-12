@@ -8,7 +8,6 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"maps"
 	"regexp"
@@ -19,6 +18,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/apache/arrow-go/v18/arrow/array"
 	duckdb "github.com/duckdb/duckdb-go/v2"
 
 	"github.com/lucasapassos/curral/internal/catalogcache"
@@ -48,10 +48,6 @@ var (
 	// ErrMaxRows is returned after a result was cut at its row limit.
 	ErrMaxRows = errors.New("row limit reached")
 )
-
-// ArrowWriter writes a statement's result to w as an Arrow IPC stream,
-// stopping (with ErrMaxRows) after maxRows rows when maxRows > 0.
-type ArrowWriter func(w io.Writer, maxRows int64) (rows int64, err error)
 
 // QueryError is a problem with the submitted SQL (parse/bind/runtime).
 type QueryError struct{ Err error }
@@ -326,9 +322,14 @@ type Request struct {
 	// per-role limit from the policy). The engine's QueryTimeout still caps
 	// the whole request.
 	ExecTimeout *time.Duration
-	// EmitArrow, when set, replaces emit: the result goes out as an Arrow
-	// IPC stream written by the ArrowWriter it is handed.
-	EmitArrow func(ArrowWriter) error
+	// EmitArrow, when set, replaces emit: the result is handed over as Arrow
+	// record batches, converted by DuckDB a whole vector at a time.
+	EmitArrow func(array.RecordReader) error
+	// Describe, when set, stops a statement the policy allowed right before
+	// it would run: it receives the result columns and parameter types
+	// instead, and nothing executes. Missing parameters are inspected as
+	// NULL.
+	Describe func(Description) error
 	// Protect, read once authorize returns, maps qualified tables to the
 	// row filter and column masks they must be read with. Only SELECT can
 	// read protected tables; the statement is rewritten to apply them.
@@ -337,6 +338,13 @@ type Request struct {
 	// variables curral_user and curral_roles (getvariable(...)).
 	User  string
 	Roles []string
+}
+
+// Description is what a statement takes and returns, read without running
+// it.
+type Description struct {
+	Columns []Column // result columns, with DuckDB type names
+	Params  []string // DuckDB type names of $1, $2, ... ("" when unknown)
 }
 
 // Timing breaks a request's time down by stage.
@@ -549,7 +557,12 @@ func (e *Engine) Query(ctx context.Context, req Request,
 		if typ == duckdb.STATEMENT_TYPE_TRANSACTION {
 			return &QueryError{errors.New("transaction statements are not supported: each request runs in its own transaction")}
 		}
-
+		if req.Describe != nil {
+			for len(args) < st.NumInput() {
+				args = append(args, driver.NamedValue{Ordinal: len(args) + 1})
+			}
+		}
+		params := st
 		insp, err := e.inspect(ctx, c, typ, req.SQL, args, database)
 		lap(&tm.Inspect)
 		if err != nil {
@@ -589,14 +602,24 @@ func (e *Engine) Query(ctx context.Context, req Request,
 			st, execSQL = rs.(*duckdb.Stmt), rewritten
 			lap(&tm.Authorize)
 		}
+		if req.Describe != nil {
+			d, err := describeStmt(st, params)
+			if err != nil {
+				return err
+			}
+			return req.Describe(d)
+		}
 
 		if req.ExecTimeout != nil && *req.ExecTimeout > 0 {
 			execCtx, cancelExec = context.WithTimeout(ctx, *req.ExecTimeout)
 		}
 		if req.EmitArrow != nil {
-			return req.EmitArrow(func(w io.Writer, maxRows int64) (int64, error) {
-				return writeArrow(execCtx, c, execSQL, args, w, maxRows)
-			})
+			rr, err := queryArrow(execCtx, c, execSQL, args)
+			if err != nil {
+				return err
+			}
+			defer rr.Release()
+			return req.EmitArrow(rr)
 		}
 		dr, err := st.QueryContext(execCtx, args)
 		if err != nil {
@@ -615,8 +638,8 @@ func (e *Engine) Query(ctx context.Context, req Request,
 		}
 		return emit(cols, dr)
 	})
-	if err != nil {
-		return err
+	if err != nil || req.Describe != nil {
+		return err // a description leaves nothing to commit
 	}
 	if err := execCtx.Err(); err != nil {
 		return err // timed out while streaming: roll back
