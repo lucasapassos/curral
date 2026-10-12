@@ -46,7 +46,9 @@ curral is the missing layer in between:
   with `SIGHUP`.
 - **Friendly to tools and AI agents.** `GET /v1/schema` lists only what the
   caller may query, `dry_run` explains a policy decision without executing
-  anything, and Arrow output streams straight into pandas, polars or DuckDB.
+  anything, Arrow output streams straight into pandas, polars or DuckDB, and
+  an optional Flight SQL port lets DBeaver, DataGrip and ADBC clients
+  connect under the same rules.
 
 ## Quickstart
 
@@ -128,6 +130,12 @@ c = Client("http://localhost:8080", user="analyst", password="analyst-pw")
 df = c.query("SELECT * FROM orders").to_pandas()   # Arrow under the hood
 ```
 
+**Database IDEs.** With `--flight-listen :31337`, DBeaver and DataGrip
+connect through the Arrow Flight SQL JDBC driver
+(`jdbc:arrow-flight-sql://localhost:31337?useEncryption=false`), browse only
+what the user may query and run SQL under the same policy; see
+[API](docs/api.md#flight-sql-dbeaver-datagrip-jdbc-adbc).
+
 **AI agents.** [`skills/curral`](skills/curral) is an agent skill that
 teaches an assistant to discover the schema, validate with `dry_run` and
 query within its permissions.
@@ -186,7 +194,7 @@ and automatic HTTPS.
 | | |
 |---|---|
 | [Configuration](docs/configuration.md) | flags, environment variables, catalog file, R2/Iceberg, Docker, reload |
-| [API](docs/api.md) | `/v1/query`, `/v1/schema`, formats, errors, dry-run, CLI |
+| [API](docs/api.md) | `/v1/query`, `/v1/schema`, formats, errors, dry-run, CLI, Flight SQL for IDEs |
 | [Authentication](docs/authentication.md) | users, API keys, OIDC (Keycloak, Auth0, Entra, Google), TLS, brute-force protection |
 | [Authorization](docs/authorization.md) | policy input, per-role limits, fairness, row-level security and masking |
 | [Security](docs/security.md) | built-in guarantees, audit log, how inspection is verified, known limitations |

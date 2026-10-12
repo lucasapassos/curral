@@ -37,6 +37,7 @@ produce events.
 ```
 
 - **`decision`** is `allow`, `deny` or `error`. **`decided_by`** says who decided: `policy`, `engine` (ATTACH, multi-statement, invalid SQL), `auth`, `queue`, `audit` or `request` (also `protection` and `concurrency`, see [Authorization](authorization.md)).
+- **Flight SQL** calls produce the same events. Preparing a statement, which inspects and authorizes it without running it, adds a `prepare` event.
 - **`policy_sha256`** is the hash of the policy files, to prove which version of the rules decided.
 - **`request_id`** is also returned in the `X-Request-Id` header and appears in the operational log.
 - **SQL:** by default literals become `?`, because they may contain personal data. If the SQL uses constructs the tokenizer cannot read safely, only `sql_sha256` is kept. `params` values are never logged, only their count. Passwords never appear. Change this with `--audit-sql` (`redacted`, `full`, `hash`).

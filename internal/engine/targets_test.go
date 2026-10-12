@@ -6,6 +6,39 @@ import (
 	"testing"
 )
 
+func TestReturnsRows(t *testing.T) {
+	cases := map[string]bool{
+		"SELECT 1":                                           true,
+		"  (SELECT 1) UNION (SELECT 2)":                      true,
+		"FROM orders":                                        true,
+		"SELECT CASE WHEN a THEN 1 END FROM t":               true, // END inside a query
+		"WITH x AS (SELECT 1) SELECT * FROM x":               true,
+		"WITH x(a) AS (SELECT 1) SELECT * FROM x":            true, // column list, then AS
+		"WITH x AS MATERIALIZED (SELECT 1) FROM x":           true,
+		"SHOW TABLES":                                        true,
+		"DESCRIBE orders":                                    true,
+		"EXPLAIN DELETE FROM orders":                         true,
+		"PRAGMA version":                                     true,
+		"CALL pragma_version()":                              true,
+		"INSERT INTO t VALUES (1) RETURNING id":              true,
+		"DELETE FROM t RETURNING *":                          true,
+		"INSERT INTO t VALUES (1)":                           false,
+		"-- note\nUPDATE t SET a = 1":                        false,
+		"delete from t where id in (select id from u)":       false,
+		"WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x": false,
+		"CREATE TABLE t AS SELECT 1":                         false,
+		"COPY t TO 'x.csv'":                                  false,
+		"SET threads = 4":                                    false,
+		"BEGIN":                                              false,
+		"":                                                   true,
+	}
+	for q, want := range cases {
+		if got := ReturnsRows(q); got != want {
+			t.Errorf("ReturnsRows(%q) = %v, want %v", q, got, want)
+		}
+	}
+}
+
 func TestTokenizeFailsClosed(t *testing.T) {
 	unsafe := []string{
 		"SELECT $$ x $$",

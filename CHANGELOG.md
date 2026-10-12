@@ -3,6 +3,19 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
+## [Unreleased]
+
+### Added
+- Arrow Flight SQL on a second port with `--flight-listen` (off by default),
+  so DBeaver, DataGrip (Arrow Flight SQL JDBC driver) and ADBC clients
+  connect to curral. Calls go through the same authentication, lockouts,
+  policy, row filters, masks, limits, audit log and metrics as the HTTP API,
+  over the same TLS certificate. A password login gets a 12-hour session
+  token; database trees list only what the user may query; preparing a
+  statement authorizes it (`prepare` audit event) and returns its parameter
+  and result types; the `database` header or JDBC's `setCatalog` picks the
+  database for unqualified names.
+
 ## [v0.5.0] - 2026-10-10
 
 ### Added

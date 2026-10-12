@@ -1,10 +1,11 @@
-// Package server exposes the REST API.
+// Package server exposes the REST API and, optionally, Flight SQL.
 package server
 
 import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/ipc"
 
 	"github.com/lucasapassos/curral/internal/audit"
 	"github.com/lucasapassos/curral/internal/auth"
@@ -200,46 +205,57 @@ type handler func(http.ResponseWriter, *http.Request, *auth.Principal)
 
 func (s *Server) authed(h handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ip := s.clientIP(r)
-		claimed := ""
-		if u, _, ok := r.BasicAuth(); ok {
-			claimed = u
-		}
-		// Blocked callers are turned away before any credential check.
-		if left, scope, blocked := s.blocked(ip, claimed); blocked {
-			w.Header().Set("Retry-After", strconv.Itoa(int(left.Seconds())+1))
-			writeError(w, http.StatusTooManyRequests, "too many failed authentication attempts; try again later")
-			s.Metrics.AuthBlocked(scope)
-			if s.Audit != nil {
-				ev := s.newEvent(r, "auth_blocked", nil)
-				ev.User, ev.Error = claimed, scope+" locked out"
-				ev.Decision, ev.DecidedBy, ev.Status = "deny", "auth", http.StatusTooManyRequests
-				s.Audit.Record(ev)
-			}
-			return
-		}
-
-		p, method, user, reason := s.authenticate(r)
-		if p == nil {
+		p, blockedFor, blocked := s.login(s.httpCaller(r), r.Header.Get("Authorization"), nil)
+		switch {
+		case blocked:
+			w.Header().Set("Retry-After", strconv.Itoa(int(blockedFor.Seconds())+1))
+			writeError(w, http.StatusTooManyRequests, errLockedOut)
+		case p == nil:
 			w.Header().Set("WWW-Authenticate", `Basic realm="curral", charset="UTF-8"`)
 			if s.OIDC != nil {
 				w.Header().Add("WWW-Authenticate", `Bearer realm="curral"`)
 			}
 			writeError(w, http.StatusUnauthorized, "invalid credentials")
-			s.Log.Info("auth failed", "method", method, "user", user, "reason", reason,
-				"client", ip, "request_id", requestID(r))
-			s.Metrics.AuthFailure(method)
-			s.recordFailure(ip, user)
-			if s.Audit != nil {
-				ev := s.newEvent(r, "auth_failure", nil)
-				ev.User, ev.AuthMethod, ev.Error = user, method, reason
-				ev.Decision, ev.DecidedBy, ev.Status = "deny", "auth", http.StatusUnauthorized
-				s.Audit.Record(ev)
-			}
-			return
+		default:
+			h(w, r, p)
 		}
-		h(w, r, p)
 	}
+}
+
+const errLockedOut = "too many failed authentication attempts; try again later"
+
+// login authenticates the Authorization header of a request from c. A nil
+// principal turns the caller away: locked out after repeated failures
+// (blocked, for blockedFor) or with wrong credentials. Locked-out callers
+// are refused before any credential check. Failures are logged, counted
+// towards lockouts and audited. sessions, when set, also accepts its bearer
+// tokens.
+func (s *Server) login(c caller, header string, sessions *auth.Sessions) (p *auth.Principal, blockedFor time.Duration, blocked bool) {
+	claimed, _, _ := parseBasic(header)
+	if left, scope, ok := s.blocked(c.addr, claimed); ok {
+		s.Metrics.AuthBlocked(scope)
+		if s.Audit != nil {
+			ev := s.event(c, "auth_blocked", nil)
+			ev.User, ev.Error = claimed, scope+" locked out"
+			ev.Decision, ev.DecidedBy, ev.Status = "deny", "auth", http.StatusTooManyRequests
+			s.Audit.Record(ev)
+		}
+		return nil, left, true
+	}
+	p, method, user, reason := s.authenticate(header, sessions)
+	if p == nil {
+		s.Log.Info("auth failed", "method", method, "user", user, "reason", reason,
+			"client", c.addr, "request_id", c.requestID)
+		s.Metrics.AuthFailure(method)
+		s.recordFailure(c.addr, user)
+		if s.Audit != nil {
+			ev := s.event(c, "auth_failure", nil)
+			ev.User, ev.AuthMethod, ev.Error = user, method, reason
+			ev.Decision, ev.DecidedBy, ev.Status = "deny", "auth", http.StatusUnauthorized
+			s.Audit.Record(ev)
+		}
+	}
+	return p, 0, false
 }
 
 func (s *Server) blocked(ip, user string) (time.Duration, string, bool) {
@@ -269,15 +285,21 @@ func (s *Server) recordFailure(ip, user string) {
 // right-most address in X-Forwarded-For that is not itself a trusted proxy.
 // Addresses a client writes into the header are never trusted.
 func (s *Server) clientIP(r *http.Request) string {
-	peer, err := netip.ParseAddrPort(r.RemoteAddr)
+	return s.clientAddr(r.RemoteAddr, r.Header.Values("X-Forwarded-For"))
+}
+
+// clientAddr resolves the client address from the peer's host:port and the
+// X-Forwarded-For values received, as clientIP does.
+func (s *Server) clientAddr(remote string, forwardedFor []string) string {
+	peer, err := netip.ParseAddrPort(remote)
 	if err != nil {
-		return r.RemoteAddr
+		return remote
 	}
 	addr := peer.Addr().Unmap()
 	if !s.trusted(addr) {
 		return addr.String()
 	}
-	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	hops := strings.Split(strings.Join(forwardedFor, ","), ",")
 	for i := len(hops) - 1; i >= 0; i-- {
 		hop, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
 		if err != nil {
@@ -300,19 +322,19 @@ func (s *Server) trusted(a netip.Addr) bool {
 	return false
 }
 
-// authenticate picks the method from the Authorization header: Basic for
-// local users, "Bearer curral_..." for API keys, any other Bearer for OIDC
+// authenticate picks the method from an Authorization header: Basic for
+// local users, "Bearer curral_..." for API keys, a bearer token of sessions
+// (when given) for a Basic login made earlier, any other Bearer for OIDC
 // JWTs. On failure it returns the attempted method, the claimed user (if
 // any) and a reason for the logs; the client only ever sees 401.
-func (s *Server) authenticate(r *http.Request) (p *auth.Principal, method, user, reason string) {
-	h := r.Header.Get("Authorization")
+func (s *Server) authenticate(h string, sessions *auth.Sessions) (p *auth.Principal, method, user, reason string) {
 	scheme, cred, _ := strings.Cut(h, " ")
 	cred = strings.TrimSpace(cred)
 	switch {
 	case h == "":
 		return nil, "none", "", "no credentials"
 	case strings.EqualFold(scheme, "Basic"):
-		user, pass, ok := r.BasicAuth()
+		user, pass, ok := parseBasic(h)
 		if !ok {
 			return nil, auth.MethodBasic, "", "malformed basic credentials"
 		}
@@ -320,6 +342,11 @@ func (s *Server) authenticate(r *http.Request) (p *auth.Principal, method, user,
 			return nil, auth.MethodBasic, user, "wrong user or password"
 		}
 		return p, auth.MethodBasic, user, ""
+	case strings.EqualFold(scheme, "Bearer") && sessions != nil && strings.HasPrefix(cred, auth.SessionPrefix):
+		if p = sessions.Check(s.authn.Load(), cred); p == nil {
+			return nil, auth.MethodBasic, "", "invalid or expired session token"
+		}
+		return p, auth.MethodBasic, p.Name, ""
 	case strings.EqualFold(scheme, "Bearer") && strings.HasPrefix(cred, auth.APIKeyPrefix):
 		if p = s.authn.Load().AuthenticateAPIKey(cred); p == nil {
 			return nil, auth.MethodAPIKey, "", "unknown or expired api key"
@@ -340,13 +367,45 @@ func (s *Server) authenticate(r *http.Request) (p *auth.Principal, method, user,
 	return nil, "unknown", "", "unsupported authorization scheme"
 }
 
+// parseBasic reads "Basic base64(user:password)", with or without base64
+// padding (gRPC clients often leave it out).
+func parseBasic(h string) (user, pass string, ok bool) {
+	scheme, cred, found := strings.Cut(h, " ")
+	if !found || !strings.EqualFold(scheme, "Basic") {
+		return "", "", false
+	}
+	cred = strings.TrimSpace(cred)
+	b, err := base64.StdEncoding.DecodeString(cred)
+	if err != nil {
+		if b, err = base64.RawStdEncoding.DecodeString(cred); err != nil {
+			return "", "", false
+		}
+	}
+	return strings.Cut(string(b), ":")
+}
+
+// caller is where a request came from, for logs, lockouts and audit.
+type caller struct {
+	requestID    string
+	addr         string // client address, resolved through trusted proxies
+	forwardedFor string // X-Forwarded-For as received
+}
+
+func (s *Server) httpCaller(r *http.Request) caller {
+	return caller{requestID: requestID(r), addr: s.clientIP(r), forwardedFor: r.Header.Get("X-Forwarded-For")}
+}
+
 func (s *Server) newEvent(r *http.Request, kind string, p *auth.Principal) *audit.Event {
+	return s.event(s.httpCaller(r), kind, p)
+}
+
+func (s *Server) event(c caller, kind string, p *auth.Principal) *audit.Event {
 	ev := &audit.Event{
 		TS:           time.Now().UTC(),
 		Event:        kind,
-		RequestID:    requestID(r),
-		RemoteAddr:   s.clientIP(r),
-		ForwardedFor: r.Header.Get("X-Forwarded-For"),
+		RequestID:    c.requestID,
+		RemoteAddr:   c.addr,
+		ForwardedFor: c.forwardedFor,
 		Version:      s.Version,
 	}
 	if pol := s.Policy(); pol != nil {
@@ -481,38 +540,156 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		return
 	}
 
+	var (
+		bytes   = countingWriter{w: w}
+		started bool
+	)
+	startStream := func(insp engine.Inspection, maxRows int64) {
+		started = true
+		h := w.Header()
+		h.Set("Content-Type", format.ContentType())
+		h.Set("X-Curral-Statement-Type", insp.StatementType)
+		h.Set("Trailer", "X-Curral-Error, X-Curral-Row-Count")
+		if maxRows > 0 {
+			// Clients that cannot read trailers can still tell that a
+			// result with exactly this many rows may have been cut.
+			h.Set("X-Curral-Max-Rows", strconv.FormatInt(maxRows, 10))
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+	trailers := func(rows int64, err error) {
+		w.Header().Set("X-Curral-Row-Count", fmt.Sprint(rows))
+		if err != nil {
+			w.Header().Set("X-Curral-Error", oneLine(err.Error()))
+		}
+	}
+	sink := resultSink{
+		rows: func(insp engine.Inspection, maxRows int64, cols []engine.Column, rs engine.Rows) (int64, int64, error) {
+			startStream(insp, maxRows)
+			rc := http.NewResponseController(w)
+			n, err := encode.Write(&bytes, format, cols, rs, encode.Options{
+				MaxRows: maxRows,
+				Flush:   func() { _ = rc.Flush() },
+			})
+			trailers(n, err)
+			return n, bytes.n, err
+		},
+		started: func() bool { return started },
+	}
+	if format == encode.Arrow {
+		sink.records = func(insp engine.Inspection, maxRows int64, rr array.RecordReader) (int64, int64, error) {
+			// Headers go out with the first byte, so a query that fails
+			// before producing data still gets a proper error status.
+			out := &startOnWrite{w: &bytes, start: func() { startStream(insp, maxRows) }}
+			n, err := writeIPC(out, rr, maxRows)
+			if started {
+				trailers(n, err)
+			}
+			return n, bytes.n, err
+		}
+	}
+
+	run := s.runQuery(r.Context(), p, ev, queryCall{
+		sql: req.SQL, params: params, database: req.Database, maxRows: req.MaxRows,
+		dryRun: req.DryRun, format: string(format), sink: sink,
+	})
+	if req.DryRun {
+		s.finishDryRun(w, ev, run)
+		return
+	}
+	if run.err != nil && !started {
+		if run.status == http.StatusServiceUnavailable || run.status == http.StatusTooManyRequests {
+			w.Header().Set("Retry-After", "1")
+		}
+		writeError(w, run.status, run.publicError())
+	}
+	// A real failure after the 200 went out: abort the connection so every
+	// HTTP client sees an incomplete body, not a short result that looks
+	// complete (many clients cannot read the X-Curral-Error trailer). The
+	// row limit is not a failure; it ends cleanly.
+	if started && run.err != nil && !errors.Is(run.err, engine.ErrMaxRows) {
+		panic(http.ErrAbortHandler)
+	}
+}
+
+// resultSink delivers an authorized statement's result to the client. Once
+// the policy allowed the statement, the run calls records (Arrow, when set)
+// or rows with the effective row limit; they report the rows and bytes
+// sent. started tells afterwards whether any of the result reached the
+// client: past that point an error can no longer change the response.
+type resultSink struct {
+	rows    func(insp engine.Inspection, maxRows int64, cols []engine.Column, rs engine.Rows) (rows, bytes int64, err error)
+	records func(insp engine.Inspection, maxRows int64, rr array.RecordReader) (rows, bytes int64, err error)
+	started func() bool
+}
+
+// queryCall is one statement to run for an authenticated caller.
+type queryCall struct {
+	sql      string
+	params   []any
+	database string
+	maxRows  int64  // the request's own row limit (0 = none); it only lowers the others
+	dryRun   bool   // inspect and decide, never execute
+	format   string // for the log line
+	// describe, when set, stops the statement right before it would run
+	// and receives its description (engine.Request.Describe). Descriptions
+	// are logged and audited but kept out of the query metrics.
+	describe func(engine.Description) error
+	sink     resultSink
+}
+
+// queryRun is how a statement ended, for the transport to answer with.
+type queryRun struct {
+	err     error
+	status  int // HTTP status, also in the audit event and metrics (unset for dry runs)
+	insp    engine.Inspection
+	limits  policy.Limits
+	maxRows int64 // effective row limit
+	protect map[string]engine.Protection
+	// The policy ran (policyCalled) and allowed the statement, or failed
+	// (policyE).
+	allowed, policyCalled bool
+	policyE               error
+}
+
+// publicError is what the client may see of the run's error.
+func (r *queryRun) publicError() string {
+	if r.policyE != nil {
+		return "policy evaluation failed"
+	}
+	return engine.PublicError(r.err)
+}
+
+// runQuery inspects, authorizes and executes one statement for p, sending
+// the result through q.sink, and records it: log, metrics and the audit
+// event ev (dry runs are left to finishDryRun). Nothing executes without
+// the policy's approval and, with an audit log, room to record it.
+func (s *Server) runQuery(ctx context.Context, p *auth.Principal, ev *audit.Event, q queryCall) queryRun {
+	start := time.Now()
 	// One policy version for the whole request, recorded in its audit event.
 	pol := s.Policy()
 	ev.PolicySHA256 = pol.SHA256
 
 	var (
-		insp             engine.Inspection
-		rows             int64
-		bytes            countingWriter
-		started          bool
-		policyCalled     bool
-		allowed          bool
-		policyE          error
+		run              queryRun
+		rows, bytes      int64
 		auditE           error
 		reservation      *audit.Reservation
-		limits           policy.Limits
-		protect          map[string]engine.Protection
 		throttled        bool
 		protectionDenied bool
 		heldGroup        string
 		execTimeout      time.Duration
 		timing           engine.Timing
 	)
-	bytes.w = w
 	// The strictest of the server's, the role's and the request's limits.
-	rowLimit := func() int64 { return minLimit(minLimit(s.MaxRows, limits.MaxRows), req.MaxRows) }
+	rowLimit := func() int64 { return minLimit(minLimit(s.MaxRows, run.limits.MaxRows), q.maxRows) }
 	authorize := func(ctx context.Context, i engine.Inspection) error {
-		insp = i
-		policyCalled = true
+		run.insp = i
+		run.policyCalled = true
 		input := map[string]any{
 			"user":           p.Name,
 			"roles":          p.Roles,
-			"sql":            req.SQL,
+			"sql":            q.sql,
 			"statement_type": i.StatementType,
 			"database":       i.Database,
 			"tables":         i.Tables,
@@ -527,12 +704,12 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		if err == nil && ok {
 			// Limits are part of the decision: if they cannot be
 			// computed, the request is not allowed.
-			limits, err = pol.Limits(ctx, input)
-			execTimeout = limits.Timeout
+			run.limits, err = pol.Limits(ctx, input)
+			execTimeout = run.limits.Timeout
 			if err == nil {
 				// Row filters and masks, like limits, are part of the
 				// decision: failing to compute them refuses the request.
-				protect, err = s.protections(ctx, pol, input, i, p)
+				run.protect, err = s.protections(ctx, pol, input, i, p)
 				if errors.Is(err, engine.ErrForbidden) {
 					protectionDenied = true
 					return err
@@ -540,23 +717,23 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 			}
 		}
 		if err != nil {
-			policyE = err
+			run.policyE = err
 			return err
 		}
-		if req.DryRun {
-			allowed = ok
+		if q.dryRun {
+			run.allowed = ok
 			return errDryRun
 		}
 		if !ok {
 			return engine.ErrForbidden
 		}
-		allowed = true
+		run.allowed = true
 		// Fair share: a caller over its concurrency is refused right away.
-		if max := limits.MaxConcurrency; max > 0 || s.MaxConcurrencyPerUser > 0 {
+		if max := run.limits.MaxConcurrency; max > 0 || s.MaxConcurrencyPerUser > 0 {
 			if max == 0 {
 				max = s.MaxConcurrencyPerUser
 			}
-			group := limits.ConcurrencyGroup
+			group := run.limits.ConcurrencyGroup
 			if group == "" {
 				group = "user:" + p.Name
 			}
@@ -581,96 +758,45 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		}
 	}()
 	emit := func(cols []engine.Column, rs engine.Rows) error {
-		started = true
-		h := w.Header()
-		h.Set("Content-Type", format.ContentType())
-		h.Set("X-Curral-Statement-Type", insp.StatementType)
-		h.Set("Trailer", "X-Curral-Error, X-Curral-Row-Count")
-		if max := rowLimit(); max > 0 {
-			// Clients that cannot read trailers can still tell that a
-			// result with exactly this many rows may have been cut.
-			h.Set("X-Curral-Max-Rows", strconv.FormatInt(max, 10))
-		}
-		w.WriteHeader(http.StatusOK)
-		rc := http.NewResponseController(w)
-		n, err := encode.Write(&bytes, format, cols, rs, encode.Options{
-			MaxRows: rowLimit(),
-			Flush:   func() { _ = rc.Flush() },
-		})
-		rows = n
-		h.Set("X-Curral-Row-Count", fmt.Sprint(n))
-		if err != nil {
-			h.Set("X-Curral-Error", oneLine(err.Error()))
-		}
+		var err error
+		rows, bytes, err = q.sink.rows(run.insp, rowLimit(), cols, rs)
 		return err
 	}
-
-	startStream := func(contentType string) {
-		started = true
-		h := w.Header()
-		h.Set("Content-Type", contentType)
-		h.Set("X-Curral-Statement-Type", insp.StatementType)
-		h.Set("Trailer", "X-Curral-Error, X-Curral-Row-Count")
-		if max := rowLimit(); max > 0 {
-			// Clients that cannot read trailers can still tell that a
-			// result with exactly this many rows may have been cut.
-			h.Set("X-Curral-Max-Rows", strconv.FormatInt(max, 10))
-		}
-		w.WriteHeader(http.StatusOK)
-	}
-	var emitArrow func(engine.ArrowWriter) error
-	if format == encode.Arrow {
-		emitArrow = func(write engine.ArrowWriter) error {
-			// Headers go out with the first byte, so a query that fails
-			// before producing data still gets a proper error status.
-			out := &startOnWrite{w: &bytes, start: func() { startStream(format.ContentType()) }}
-			n, err := write(out, rowLimit())
-			rows = n
-			if started {
-				w.Header().Set("X-Curral-Row-Count", fmt.Sprint(n))
-				if err != nil {
-					w.Header().Set("X-Curral-Error", oneLine(err.Error()))
-				}
-			}
+	var emitArrow func(array.RecordReader) error
+	if q.sink.records != nil {
+		emitArrow = func(rr array.RecordReader) error {
+			var err error
+			rows, bytes, err = q.sink.records(run.insp, rowLimit(), rr)
 			return err
 		}
 	}
 
-	err = s.Engine.Query(r.Context(), engine.Request{
-		EmitArrow: emitArrow,
-		SQL:       req.SQL, Params: params, Database: req.Database, Timing: &timing, ExecTimeout: &execTimeout,
-		Protect: &protect, User: p.Name, Roles: p.Roles,
+	err := s.Engine.Query(ctx, engine.Request{
+		EmitArrow: emitArrow, Describe: q.describe,
+		SQL: q.sql, Params: q.params, Database: q.database, Timing: &timing, ExecTimeout: &execTimeout,
+		Protect: &run.protect, User: p.Name, Roles: p.Roles,
 	}, authorize, emit)
-
-	if req.DryRun {
-		s.finishDryRun(w, ev, insp, limits, rowLimit(), protect, err, allowed, policyCalled, policyE)
-		return
+	run.err, run.maxRows = err, rowLimit()
+	if q.dryRun {
+		return run
 	}
 
-	status := http.StatusOK
-	if err != nil && !started {
-		status = statusOf(err, policyE)
-		msg := engine.PublicError(err)
-		if policyE != nil {
-			msg = "policy evaluation failed"
-		}
-		if status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests {
-			w.Header().Set("Retry-After", "1")
-		}
-		writeError(w, status, msg)
+	run.status = http.StatusOK
+	if err != nil && !q.sink.started() {
+		run.status = statusOf(err, run.policyE)
 	}
 
 	attrs := []any{
-		"request_id", ev.RequestID, "user", p.Name, "status", status, "type", insp.StatementType,
-		"databases", insp.Databases, "rows", rows, "format", format,
+		"request_id", ev.RequestID, "user", p.Name, "status", run.status, "type", run.insp.StatementType,
+		"databases", run.insp.Databases, "rows", rows, "format", q.format,
 		"duration", time.Since(start),
 	}
 	if err != nil {
 		attrs = append(attrs, "err", err)
 	}
-	s.Log.Info("query", attrs...)
+	s.Log.Info(ev.Event, attrs...)
 
-	decision, decidedBy := decisionOf(err, allowed, policyCalled, policyE, auditE)
+	decision, decidedBy := decisionOf(err, run.allowed, run.policyCalled, run.policyE, auditE)
 	if throttled {
 		decision, decidedBy = "error", "concurrency"
 		s.Metrics.Throttled()
@@ -680,35 +806,29 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 	}
 	policyResult := ""
 	switch {
-	case allowed:
+	case run.allowed:
 		policyResult = "allow"
-	case policyCalled && policyE == nil:
+	case run.policyCalled && run.policyE == nil:
 		policyResult = "deny"
 	}
 	total := time.Since(start)
-	s.Metrics.ObserveQuery(metrics.Query{
-		Status: strconv.Itoa(status), Decision: decision, DecidedBy: decidedBy,
-		StatementType: insp.StatementType, Roles: p.Roles, PolicyResult: policyResult,
-		Rows: rows, Bytes: bytes.n,
-		Stages: map[string]time.Duration{
-			metrics.StageQueue: timing.Queue, metrics.StageInspect: timing.Inspect,
-			metrics.StageAuthorize: timing.Authorize, metrics.StageExecute: timing.Execute,
-			metrics.StageTotal: total,
-		},
-	})
-
-	// A real failure after the 200 went out: abort the connection so every
-	// HTTP client sees an incomplete body, not a short result that looks
-	// complete (many clients cannot read the X-Curral-Error trailer). The
-	// row limit is not a failure; it ends cleanly.
-	if started && err != nil && !errors.Is(err, engine.ErrMaxRows) {
-		defer panic(http.ErrAbortHandler)
+	if q.describe == nil {
+		s.Metrics.ObserveQuery(metrics.Query{
+			Status: strconv.Itoa(run.status), Decision: decision, DecidedBy: decidedBy,
+			StatementType: run.insp.StatementType, Roles: p.Roles, PolicyResult: policyResult,
+			Rows: rows, Bytes: bytes,
+			Stages: map[string]time.Duration{
+				metrics.StageQueue: timing.Queue, metrics.StageInspect: timing.Inspect,
+				metrics.StageAuthorize: timing.Authorize, metrics.StageExecute: timing.Execute,
+				metrics.StageTotal: total,
+			},
+		})
 	}
 
 	if s.Audit == nil {
-		return
+		return run
 	}
-	if insp.StatementType != "" {
+	if insp := run.insp; insp.StatementType != "" {
 		ev.StatementType = insp.StatementType
 		ev.Database = insp.Database
 		ev.Tables, ev.Targets, ev.Functions = insp.Tables, insp.Targets, insp.Functions
@@ -716,10 +836,10 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		ev.Resolved = &resolved
 		ev.HiddenRemoteScans = insp.HiddenRemoteScans
 	}
-	ev.Status, ev.Rows, ev.Bytes = status, rows, bytes.n
-	ev.Limits = limitsJSON(limits)
-	ev.RowFilters, ev.MaskedColumns = protectionSummary(protect)
-	if len(protect) > 0 && err == nil {
+	ev.Status, ev.Rows, ev.Bytes = run.status, rows, bytes
+	ev.Limits = limitsJSON(run.limits)
+	ev.RowFilters, ev.MaskedColumns = protectionSummary(run.protect)
+	if len(run.protect) > 0 && err == nil && q.describe == nil {
 		s.Metrics.Rewritten()
 	}
 	if err != nil {
@@ -738,13 +858,47 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 	} else {
 		s.Audit.Record(ev)
 	}
+	return run
+}
+
+// writeIPC writes rr to w as an Arrow IPC stream, cut at maxRows rows (> 0).
+func writeIPC(w io.Writer, rr array.RecordReader, maxRows int64) (int64, error) {
+	iw := ipc.NewWriter(w, ipc.WithSchema(rr.Schema()))
+	n, err := eachRecord(rr, maxRows, iw.Write)
+	if cerr := iw.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
+	return n, err
+}
+
+// eachRecord hands rr's record batches to fn. With maxRows > 0 the result
+// is cut there, and ErrMaxRows reports the cut when more rows existed.
+func eachRecord(rr array.RecordReader, maxRows int64, fn func(arrow.RecordBatch) error) (int64, error) {
+	var n int64
+	for rr.Next() {
+		rec := rr.RecordBatch()
+		rows := rec.NumRows()
+		if maxRows > 0 && n+rows > maxRows {
+			cut := rec.NewSlice(0, maxRows-n)
+			err := fn(cut)
+			cut.Release()
+			if err != nil {
+				return n, err
+			}
+			return maxRows, engine.ErrMaxRows
+		}
+		if err := fn(rec); err != nil {
+			return n, err
+		}
+		n += rows
+	}
+	return n, rr.Err()
 }
 
 // finishDryRun answers a dry run with the inspection and the decision. SQL
 // errors and policy failures are reported as for a real query.
-func (s *Server) finishDryRun(w http.ResponseWriter, ev *audit.Event, insp engine.Inspection,
-	limits policy.Limits, maxRows int64, protect map[string]engine.Protection, err error, allowed, policyCalled bool, policyE error,
-) {
+func (s *Server) finishDryRun(w http.ResponseWriter, ev *audit.Event, run queryRun) {
+	insp, err := run.insp, run.err
 	resp := dryRunResponse{
 		DryRun: true, PolicySHA256: ev.PolicySHA256,
 		StatementType: insp.StatementType, Database: insp.Database,
@@ -755,31 +909,27 @@ func (s *Server) finishDryRun(w http.ResponseWriter, ev *audit.Event, insp engin
 	status := http.StatusOK
 	var qe *engine.QueryError
 	switch {
-	case errors.As(err, &qe) && policyE == nil && (allowed || !policyCalled):
+	case errors.As(err, &qe) && run.policyE == nil && (run.allowed || !run.policyCalled):
 		// A statement that failed to bind, which the policy would allow:
 		// report the error (one it denies is reported as denied, below).
 		status = http.StatusBadRequest
 		writeError(w, status, engine.PublicError(err))
-	case policyCalled && policyE == nil:
+	case run.policyCalled && run.policyE == nil:
 		resp.DecidedBy = "policy"
 		resp.Decision = "deny"
-		if allowed {
+		if run.allowed {
 			resp.Decision = "allow"
-			resp.Limits = limitsJSON(limits)
-			resp.MaxRows = maxRows
+			resp.Limits = limitsJSON(run.limits)
+			resp.MaxRows = run.maxRows
 			ev.Limits = resp.Limits
-			resp.RowFilters, resp.MaskedColumns = protectionSummary(protect)
+			resp.RowFilters, resp.MaskedColumns = protectionSummary(run.protect)
 			ev.RowFilters, ev.MaskedColumns = resp.RowFilters, resp.MaskedColumns
 		}
 	case errors.Is(err, engine.ErrForbidden):
 		resp.Decision, resp.DecidedBy, resp.Reason = "deny", "engine", err.Error()
 	default:
-		status = statusOf(err, policyE)
-		msg := engine.PublicError(err)
-		if policyE != nil {
-			msg = "policy evaluation failed"
-		}
-		writeError(w, status, msg)
+		status = statusOf(err, run.policyE)
+		writeError(w, status, run.publicError())
 	}
 	if status == http.StatusOK {
 		writeJSON(w, status, resp)
@@ -954,35 +1104,49 @@ type schemaResponse struct {
 }
 
 // schema lists tables and views with their columns, keeping only those the
-// caller could read with "SELECT * FROM object": each one goes through the
-// same inspection, policy and protections as a query. Masked columns and
-// row-filtered tables are flagged. ?database=, ?schema= and ?table= narrow
-// the listing.
+// caller could read; see listSchema. ?database=, ?schema= and ?table=
+// narrow the listing.
 func (s *Server) schema(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
-	start := time.Now()
-	ev := s.newEvent(r, "schema", p)
 	q := r.URL.Query()
 	f := engine.SchemaFilter{Database: q.Get("database"), Schema: q.Get("schema"), Table: q.Get("table")}
-	ev.Database = f.Database
-	pol := s.Policy()
-	ev.PolicySHA256 = pol.SHA256
-
-	fail := func(status int, msg, decidedBy string) {
+	tables, status, msg := s.listSchema(r.Context(), p, s.newEvent(r, "schema", p), f, nil)
+	if status != http.StatusOK {
 		if status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests {
 			w.Header().Set("Retry-After", "1")
 		}
 		writeError(w, status, msg)
+		return
+	}
+	writeJSON(w, http.StatusOK, schemaResponse{
+		DefaultDatabase: s.Engine.Default(), Databases: s.Engine.Databases(), Tables: tables,
+	})
+}
+
+// listSchema lists the tables and views matching f (and match, when set)
+// that p could read with "SELECT * FROM object": each one goes through the
+// same inspection, policy and protections as a query. Masked columns and
+// row-filtered tables are flagged. The listing is logged and audited as ev.
+// A status other than 200 comes with the message the client may see.
+func (s *Server) listSchema(ctx context.Context, p *auth.Principal, ev *audit.Event, f engine.SchemaFilter,
+	match func(engine.TableSchema) bool,
+) (tables []engine.TableSchema, status int, msg string) {
+	start := time.Now()
+	ev.Database = f.Database
+	pol := s.Policy()
+	ev.PolicySHA256 = pol.SHA256
+
+	fail := func(status int, msg, decidedBy string) ([]engine.TableSchema, int, string) {
 		if s.Audit != nil {
 			ev.Decision, ev.DecidedBy, ev.Status, ev.Error = "error", decidedBy, status, msg
 			s.Audit.Record(ev)
 		}
+		return nil, status, msg
 	}
 	if max := s.MaxConcurrencyPerUser; max > 0 {
 		group := "user:" + p.Name
 		if !s.groups.tryAcquire(group, max) {
 			s.Metrics.Throttled()
-			fail(http.StatusTooManyRequests, fmt.Sprintf("%v (limit %d for %s)", errConcurrency, max, group), "concurrency")
-			return
+			return fail(http.StatusTooManyRequests, fmt.Sprintf("%v (limit %d for %s)", errConcurrency, max, group), "concurrency")
 		}
 		defer s.groups.release(group)
 	}
@@ -992,14 +1156,16 @@ func (s *Server) schema(w http.ResponseWriter, r *http.Request, p *auth.Principa
 		var err error
 		if reservation, err = s.Audit.Reserve(time.Second); err != nil {
 			s.Log.Error("schema refused: audit unavailable", "request_id", ev.RequestID, "err", err)
-			fail(http.StatusServiceUnavailable, errAudit.Error(), "audit")
-			return
+			return fail(http.StatusServiceUnavailable, errAudit.Error(), "audit")
 		}
 	}
 
 	prot := map[string]map[string]engine.Protection{}
 	var policyE error
-	tables, err := s.Engine.Schema(r.Context(), f, func(ctx context.Context, t engine.TableSchema, i engine.Inspection) (bool, error) {
+	tables, err := s.Engine.Schema(ctx, f, func(ctx context.Context, t engine.TableSchema, i engine.Inspection) (bool, error) {
+		if match != nil && !match(t) {
+			return false, nil
+		}
 		input := map[string]any{
 			"user":                p.Name,
 			"roles":               p.Roles,
@@ -1033,17 +1199,13 @@ func (s *Server) schema(w http.ResponseWriter, r *http.Request, p *auth.Principa
 		if policyE != nil {
 			msg = "policy evaluation failed"
 		}
-		if status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests {
-			w.Header().Set("Retry-After", "1")
-		}
-		writeError(w, status, msg)
 		s.Log.Info("schema", "request_id", ev.RequestID, "user", p.Name, "status", status, "err", err)
 		if s.Audit != nil {
 			ev.Decision, ev.DecidedBy = decisionOf(err, false, false, policyE, nil)
 			ev.Status, ev.Error = status, oneLine(err.Error())
 			reservation.Write(ev)
 		}
-		return
+		return nil, status, msg
 	}
 
 	listed := make([]string, len(tables))
@@ -1065,9 +1227,6 @@ func (s *Server) schema(w http.ResponseWriter, r *http.Request, p *auth.Principa
 			t.Columns[j].Masked = masked[strings.ToLower(t.Columns[j].Name)]
 		}
 	}
-	writeJSON(w, http.StatusOK, schemaResponse{
-		DefaultDatabase: s.Engine.Default(), Databases: s.Engine.Databases(), Tables: tables,
-	})
 	s.Log.Info("schema", "request_id", ev.RequestID, "user", p.Name, "status", http.StatusOK,
 		"tables", len(tables), "duration", time.Since(start))
 	if s.Audit != nil {
@@ -1076,6 +1235,7 @@ func (s *Server) schema(w http.ResponseWriter, r *http.Request, p *auth.Principa
 		ev.TimingMS = map[string]float64{"total": ms(time.Since(start))}
 		reservation.Write(ev)
 	}
+	return tables, http.StatusOK, ""
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {

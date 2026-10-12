@@ -5,11 +5,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -21,6 +23,7 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2"
 	"golang.org/x/term"
+	"google.golang.org/grpc"
 
 	"github.com/lucasapassos/curral/internal/audit"
 	"github.com/lucasapassos/curral/internal/auth"
@@ -134,6 +137,7 @@ type serveFlags struct {
 	auditSQL       string
 	auditQueue     int
 	metricsListen  string
+	flightListen   string
 	oidcIssuer     string
 	oidcAudience   string
 	oidcUserClaim  string
@@ -189,6 +193,7 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.StringVar(&f.auditSQL, "audit-sql", server.AuditSQLRedacted, "SQL text in audit events: redacted (literals become ?), full or hash")
 	fs.IntVar(&f.auditQueue, "audit-queue", 4096, "audit events buffered in memory")
 	fs.StringVar(&f.metricsListen, "metrics-listen", "", "serve Prometheus /metrics on this separate address (e.g. 127.0.0.1:9090); empty disables")
+	fs.StringVar(&f.flightListen, "flight-listen", "", "serve Arrow Flight SQL (JDBC/ADBC clients such as DBeaver and DataGrip) on this address, e.g. :31337, with the same users, policy, TLS and audit as HTTP; empty disables")
 	fs.StringVar(&f.oidcIssuer, "oidc-issuer", "", "accept bearer JWTs from this OIDC issuer (discovery + JWKS); empty disables")
 	fs.StringVar(&f.oidcAudience, "oidc-audience", "", "required audience (aud) of JWTs")
 	fs.StringVar(&f.oidcUserClaim, "oidc-user-claim", "sub", "JWT claim used as the user name (e.g. email, preferred_username)")
@@ -518,12 +523,32 @@ func runServe(args []string, checkOnly bool) error {
 		}
 	}()
 
+	errc := make(chan error, 2)
+	var flightSrv *grpc.Server
+	if f.flightListen != "" {
+		var tlsConf *tls.Config
+		if certs != nil {
+			tlsConf = certs.TLSConfig()
+		}
+		if flightSrv, err = srv.Flight(tlsConf); err != nil {
+			return err
+		}
+		lis, err := net.Listen("tcp", f.flightListen)
+		if err != nil {
+			return fmt.Errorf("--flight-listen: %w", err)
+		}
+		go func() { errc <- flightSrv.Serve(lis) }()
+		if certs == nil {
+			log.Warn("serving plaintext Flight SQL: credentials travel unencrypted (--tls-cert/--tls-key)")
+		}
+		log.Info("flight sql listening", "addr", f.flightListen, "tls", certs != nil)
+	}
+
 	httpSrv := &http.Server{
 		Addr:              f.listen,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	errc := make(chan error, 1)
 	if certs != nil {
 		httpSrv.TLSConfig = certs.TLSConfig()
 		go func() { errc <- httpSrv.ListenAndServeTLS("", "") }()
@@ -536,22 +561,49 @@ func runServe(args []string, checkOnly bool) error {
 
 	select {
 	case err = <-errc:
+		if flightSrv != nil {
+			flightSrv.Stop()
+		}
 	case <-ctx.Done():
 		log.Info("shutting down")
 		shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		flightDone := stopGRPC(shutCtx, flightSrv)
 		err = httpSrv.Shutdown(shutCtx)
+		<-flightDone
 	}
 	if metricsSrv != nil {
 		metricsSrv.Close()
 	}
-	// After HTTP shutdown no handler can still write events.
+	// After HTTP and Flight shutdown no handler can still write events.
 	if aw != nil {
 		if cerr := aw.Close(); cerr != nil {
 			log.Error("audit log close", "err", cerr)
 		}
 	}
 	return err
+}
+
+// stopGRPC lets g's running calls finish, cutting them when ctx ends; the
+// channel is closed once g has stopped. A nil g is already stopped.
+func stopGRPC(ctx context.Context, g *grpc.Server) <-chan struct{} {
+	done := make(chan struct{})
+	if g == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		stopped := make(chan struct{})
+		go func() { g.GracefulStop(); close(stopped) }()
+		select {
+		case <-stopped:
+		case <-ctx.Done():
+			g.Stop()
+			<-stopped
+		}
+	}()
+	return done
 }
 
 // Set at build time: -ldflags "-X main.version=... -X main.commit=..."

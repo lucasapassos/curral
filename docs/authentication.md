@@ -22,6 +22,7 @@ Three methods, chosen by the `Authorization` header:
   - **Validation:** signature, `iss`, `aud`, `exp` and `nbf`. Unsigned tokens (`alg: none`) or tokens signed by another key are rejected.
   - **Roles:** the claim may be a list or a space-separated string (e.g. `scope`).
 - **Tracking:** the audit log records `auth_method` (`basic`, `api_key`, `jwt`). `curral_auth_failures_total{method}` splits failures by method, and the operational log carries the reason. The client always just gets 401.
+- **Flight SQL:** the same three methods, in the gRPC `authorization` header. A password login (the Flight handshake) returns a session token for the calls that follow, valid for 12 hours and recorded as `basic`; a restart, a password change or the user's removal voids it. Session tokens are refused over HTTP. See [API](api.md#flight-sql-dbeaver-datagrip-jdbc-adbc).
 
 ```sh
 curral serve ... --oidc-issuer https://sso.example.com/realms/main --oidc-audience curral \
@@ -77,10 +78,12 @@ warns about it at startup. There are two options:
 
 - **Native TLS:** `--tls-cert`/`--tls-key`. `SIGHUP` reloads the certificate
   without dropping connections, and an invalid file keeps the current
-  certificate.
+  certificate. It also covers the Flight SQL port (`--flight-listen`).
 - **Proxy with automatic certificates:** `docker compose --profile tls up`
   starts Caddy in front, with Let's Encrypt for `CURRAL_DOMAIN` or a local CA
   for `localhost`, plus HSTS. See [deploy/README.md](../deploy/README.md).
+  It covers HTTP only: a Flight SQL port needs native TLS or a gRPC-capable
+  proxy.
 
 ### Brute force
 

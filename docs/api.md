@@ -14,7 +14,9 @@ The endpoints curral exposes, their request and response formats, and the bundle
 | `GET /healthz` | no | liveness |
 
 The Prometheus `/metrics` endpoint lives on a separate port; see
-[Operations](operations.md).
+[Operations](operations.md). With `--flight-listen`, the same data is also
+served over [Arrow Flight SQL](#flight-sql-dbeaver-datagrip-jdbc-adbc), for
+database IDEs and JDBC/ADBC clients.
 
 ## `POST /v1/query`
 
@@ -213,5 +215,104 @@ result arrives incomplete.
 ## Python client
 
 A single-file client lives in [`clients/python`](../clients/python/README.md).
+
+## Flight SQL (DBeaver, DataGrip, JDBC, ADBC)
+
+`--flight-listen` (or `CURRAL_FLIGHT_LISTEN`) serves
+[Arrow Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html) over
+gRPC on a second port, for clients that speak a database protocol rather
+than HTTP: DBeaver and DataGrip through the Arrow Flight SQL JDBC driver,
+ADBC (Python, Go, R), and BI tools with a Flight SQL driver. Without the
+flag nothing listens; it needs a build with `-tags duckdb_arrow`, as are
+the release binaries and the Docker image.
+
+```sh
+curral serve ... --flight-listen :31337
+```
+
+Every call goes through the same pipeline as `/v1/query`: users, API keys
+and JWTs, lockouts, the policy, row filters and masks, limits, the audit
+log and the metrics. The TLS certificate (`--tls-cert`) also covers the
+Flight port.
+
+- **Logging in:** with user and password, the client's handshake gets a
+  session token for its later calls (12 h, signed with a key that lives in
+  memory: a restart, a password change or the user's removal ends it). API
+  keys and JWTs go as a bearer token on every call (JDBC: `token=`).
+- **Listing:** catalogs are the attached databases. Schemas, tables and
+  columns come from the same listing as `GET /v1/schema`: only what the
+  user could query, audited as `schema` events. Primary and foreign keys and
+  type information come back empty.
+- **Database for unqualified names:** a `database` header (JDBC: a
+  `database=` URL property; ADBC: the `adbc.flight.sql.rpc.call_header.database`
+  option) or the `catalog` session option, which JDBC's `setCatalog` (picking
+  a database in the IDE) sends. Otherwise the catalog's `default`.
+- **Prepared statements:** preparing inspects and authorizes the statement
+  without running it (a `prepare` audit event, kept out of the query
+  metrics), so a refused statement fails right away, and returns its
+  parameter and result types. Running it is authorized again (a `query`
+  event). Each statement read through a prepared statement, as JDBC does for
+  all of them, is thus inspected twice; with lake catalogs, set `cache_ttl`.
+  `DECIMAL` parameters are sent as text.
+- **No transactions:** each statement runs in its own transaction, as over
+  HTTP; clients see autocommit.
+- **Row limit:** a cut result ends cleanly with the trailer
+  `x-curral-error: row limit reached`.
+
+### JDBC: DBeaver and DataGrip
+
+Download `flight-sql-jdbc-driver-<version>.jar` from
+[Maven Central](https://repo1.maven.org/maven2/org/apache/arrow/flight-sql-jdbc-driver/)
+and add it as a custom driver:
+
+- **Class:** `org.apache.arrow.driver.jdbc.ArrowFlightJdbcDriver`
+- **URL:** `jdbc:arrow-flight-sql://curral.example.com:31337`, with
+  `?useEncryption=false` when the port has no TLS. Add `&database=logs` to
+  pick the database for unqualified names.
+- **Credentials:** the curral user and password, or `token=curral_...` as a
+  driver property for an API key.
+- **Java options:** `--add-opens=java.base/java.nio=ALL-UNNAMED`, plus
+  `--sun-misc-unsafe-memory-access=allow` on Java 24 and later (only there:
+  older JVMs refuse to start with it). Without them the driver fails to
+  start with `ExceptionInInitializerError`.
+
+**DataGrip:** *Database Explorer → ⚙ Drivers → +*. Under *Driver Files*, add
+the jar with *+ → Custom JARs…* (the file, not its folder); then pick the
+class above from the *Class* list. A class left at `java.sql.Driver` fails
+with `java.sql.Driver.<init>()`. In the data source, put the URL and the
+credentials, and the Java options in *Advanced → VM options*: DataGrip runs
+each driver in its own JVM, and its bundled runtime is Java 25, so both
+options are needed.
+
+**DBeaver:** *Database → Driver Manager → New*: add the jar under
+*Libraries*, the class under *Class Name* and
+`jdbc:arrow-flight-sql://{host}:{port}` as *URL Template*; set
+`useEncryption=false` in the connection's *Driver properties* when the port
+has no TLS. The Java options go after `-vmargs` in `dbeaver.ini`.
+
+**Why the Java options:** the driver keeps results in off-heap Arrow
+buffers, allocated through the netty it bundles. That needs the address
+fields of `java.nio` buffers, closed to other modules since Java 16
+(`--add-opens`), and `sun.misc.Unsafe` memory access, which Java 24
+restricts (`--sun-misc-unsafe-memory-access=allow`). Any Flight SQL server
+needs them with this driver; curral does not.
+
+The IDE's SQL dialect is generic: write DuckDB SQL. Catalog views
+(`information_schema`, `duckdb_tables()`...) stay blocked; the IDE's
+database tree uses the Flight SQL listing instead.
+
+### ADBC (Python)
+
+```python
+import adbc_driver_flightsql.dbapi as flightsql
+
+conn = flightsql.connect("grpc://localhost:31337",
+                         db_kwargs={"username": "analyst", "password": "analyst-pw"})
+cur = conn.cursor()
+cur.execute("SELECT * FROM orders WHERE id = ?", (3,))
+table = cur.fetch_arrow_table()
+```
+
+Use `grpc+tls://` when the port has TLS.
 
 See also: [Configuration](configuration.md) · [Authentication](authentication.md) · [Authorization](authorization.md) · [Security](security.md) · [Operations](operations.md)

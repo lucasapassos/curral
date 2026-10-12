@@ -5,23 +5,22 @@ package engine
 import (
 	"context"
 	"database/sql/driver"
-	"io"
 
-	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
-// ArrowAvailable reports whether this build can return Arrow IPC streams
-// (built with -tags duckdb_arrow).
+// ArrowAvailable reports whether this build can return Arrow results
+// (built with -tags duckdb_arrow): Arrow IPC over HTTP and Flight SQL.
 const ArrowAvailable = true
 
-// writeArrow runs the statement on c and streams the result as an Arrow IPC
-// stream. DuckDB converts whole vectors to Arrow natively, skipping the
+// queryArrow runs the statement on c and returns its result as Arrow record
+// batches. DuckDB converts whole vectors to Arrow natively, skipping the
 // per-value conversion of the row path.
-func writeArrow(ctx context.Context, c *duckdb.Conn, query string, args []driver.NamedValue, w io.Writer, maxRows int64) (int64, error) {
+func queryArrow(ctx context.Context, c *duckdb.Conn, query string, args []driver.NamedValue) (array.RecordReader, error) {
 	a, err := duckdb.NewArrowFromConn(c)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	vals := make([]any, len(args))
 	for i, nv := range args {
@@ -29,37 +28,7 @@ func writeArrow(ctx context.Context, c *duckdb.Conn, query string, args []driver
 	}
 	rr, err := a.QueryContext(ctx, query, vals...)
 	if err != nil {
-		return 0, &QueryError{err}
+		return nil, &QueryError{err}
 	}
-	defer rr.Release()
-
-	iw := ipc.NewWriter(w, ipc.WithSchema(rr.Schema()))
-	var n int64
-	var rerr error
-	for rr.Next() {
-		rec := rr.RecordBatch()
-		rows := rec.NumRows()
-		if maxRows > 0 && n+rows > maxRows {
-			cut := rec.NewSlice(0, maxRows-n)
-			err := iw.Write(cut)
-			cut.Release()
-			if err != nil {
-				return n, err
-			}
-			n = maxRows
-			rerr = ErrMaxRows
-			break
-		}
-		if err := iw.Write(rec); err != nil {
-			return n, err
-		}
-		n += rows
-	}
-	if rerr == nil {
-		rerr = rr.Err()
-	}
-	if err := iw.Close(); err != nil && rerr == nil {
-		rerr = err
-	}
-	return n, rerr
+	return rr, nil
 }
