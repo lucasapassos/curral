@@ -3,6 +3,26 @@
 Versions follow [Semantic Versioning](https://semver.org). Each release's
 notes are taken from its section here.
 
+## [Unreleased]
+
+### Added
+- The agent skill keeps curral credentials out of the conversation:
+  `scripts/curral.sh login`, run by the user in a terminal, asks for the
+  URL and the password (not echoed) and saves them to
+  `~/.config/curral/credentials` (mode 600, or `$CURRAL_CONFIG`), which the
+  script reads when the environment has no credentials. `curral.sh status`
+  checks the connection without showing the secret and exits 5 when none
+  is configured; the skill starts with it and asks the user to run `login`
+  instead of asking for the password in the chat.
+- `skills/curral/scripts/curral.ps1`: the skill's client for PowerShell on
+  Windows (5.1 or later, with the `curl.exe` that ships with Windows), with
+  the same commands, output and exit codes as `curral.sh`. Its `login`
+  stores the secret in `%APPDATA%\curral\credentials` encrypted with DPAPI.
+
+### Fixed
+- `scripts/curral.sh` broke Basic auth when the user or password contained
+  `"`.
+
 ## [v0.6.0] - 2026-10-12
 
 ### Added
