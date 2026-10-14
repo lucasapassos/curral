@@ -1,6 +1,6 @@
 ---
 name: curral
-description: Query data through a curral server (a REST API that runs DuckDB SQL over DuckDB databases and Iceberg catalogs, such as the Cloudflare R2 Data Catalog, with authentication and per-user permissions). Use this skill whenever you read data through curral, for example when CURRAL_URL/CURRAL_TOKEN are set in the environment, when the user mentions curral, the "lake" or tables it serves, or asks for numbers, reports, exports or the structure of the tables that live there, even without naming curral. Covers schema discovery (/v1/schema), semantic documents with notes and sample SQL (/v1/docs), writing the SQL, validating with dry_run, row limits and interpreting 400/401/403/429/503/504 errors.
+description: Query data through a curral server (a REST API that runs DuckDB SQL over DuckDB databases and Iceberg catalogs, such as the Cloudflare R2 Data Catalog, with authentication and per-user permissions). Use this skill whenever you read data through curral, for example when CURRAL_URL/CURRAL_TOKEN are set in the environment or ~/.config/curral/credentials exists, when the user mentions curral, the "lake" or tables it serves, or asks for numbers, reports, exports or the structure of the tables that live there, even without naming curral. Covers checking the connection and asking the user to set it up without exposing the password, schema discovery (/v1/schema), semantic documents with notes and sample SQL (/v1/docs), writing the SQL, validating with dry_run, row limits and interpreting 400/401/403/429/503/504 errors.
 ---
 
 # Querying data through curral
@@ -20,22 +20,59 @@ what they prevented.
 
 ## Connection
 
-Credentials live in the environment, never in the response text or in files:
+**Secrets never go through you.** Do not ask for a password or token in the
+chat, and never write one in a command (`export CURRAL_PASSWORD=...`,
+`curl -u ...`), a file you create or your answer: every command you run is
+shown on screen and kept in the conversation log. The script reads the
+connection itself:
 
-| Variable | Use |
+| Source | Content |
 |---|---|
-| `CURRAL_URL` | e.g. `https://curral.example.com` |
-| `CURRAL_TOKEN` | API key (`curral_...`) or JWT, sent as `Authorization: Bearer ...` |
-| `CURRAL_USER` + `CURRAL_PASSWORD` | Basic auth, used when there is no token |
+| environment | `CURRAL_URL`; `CURRAL_TOKEN` (API key `curral_...` or JWT, sent as Bearer) or `CURRAL_USER` + `CURRAL_PASSWORD` (Basic) |
+| `~/.config/curral/credentials` (or `$CURRAL_CONFIG`) | the same variables as `KEY=value` lines, written by `curral.sh login` (mode 600) |
+| `%APPDATA%\curral\credentials` (or `$env:CURRAL_CONFIG`), Windows | written by `curral.ps1 login`; the secret is encrypted with DPAPI, readable only by that Windows user |
 
-If the user gives a URL and credentials in the conversation, use them, but do
-not repeat them in your answer. In commands, prefer environment variables to
-writing the password on the command line.
+Credentials in the environment take precedence over the file.
+
+**Which script:** `scripts/curral.sh` where there is `sh` (Linux, macOS,
+Git Bash, WSL). In PowerShell on Windows, use `scripts\curral.ps1` with the
+same commands, output and exit codes, run as:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\curral.ps1 query -m 20 'SELECT * FROM monthly_revenue WHERE region = ''South'''
+```
+
+There, quote the SQL with single quotes (doubling the quotes inside), so
+PowerShell does not expand `$1`. The `curral.sh` examples below apply to
+both.
+
+**Start every session with** `scripts/curral.sh status`. It prints the URL
+and the user (never the secret) on stderr and the databases on stdout.
+- **Exit 0:** connected; go on.
+- **Exit 5 (no connection configured) or 1 with HTTP 401:** stop and ask the
+  user to configure it. Give them the absolute path that the script
+  printed and ask them to run it **in their own terminal**, outside the
+  chat:
+
+  ```sh
+  /path/to/skills/curral/scripts/curral.sh login
+  ```
+
+  On Windows, the script prints the `powershell ... curral.ps1 login`
+  line instead. It asks for the URL, the user (empty for an API key) and
+  the password without echoing it, saves the file readable only by the
+  user and checks the connection. Wait for the user to confirm, then run
+  `status` again. Do not run `login` yourself: it needs a terminal and
+  fails without one.
+- **If the user pastes a password or token in the chat anyway:** do not use
+  it and do not repeat it. Tell them it is now in the conversation log, that
+  they should change it, and ask them to run `login` with the new one.
 
 **With a shell:** use `scripts/curral.sh`, which builds the JSON with correct
 escaping, authenticates and warns on stderr when the result is truncated:
 
 ```sh
+scripts/curral.sh status                         # connection check; first command of the session
 scripts/curral.sh schema                         # everything you can read
 scripts/curral.sh schema table=monthly_revenue     # filters: database= schema= table=
 scripts/curral.sh query "SELECT count(*) AS n FROM monthly_revenue"
@@ -59,9 +96,13 @@ codes are:
 | 2 | incorrect usage |
 | 3 | **result truncated** by the row limit (the body is incomplete) |
 | 4 | error in the middle of the result |
+| 5 | no connection configured; ask the user to run `login` (see above) |
 
 **Without a shell:** with only an HTTP tool, see `references/api.md`, which
-describes requests, responses, headers and errors.
+describes requests, responses, headers and errors. You cannot read the
+credentials file there, so the secret would have to come through the chat
+and sit in the `Authorization` header of every call: tell the user, and
+suggest an API key with narrow permissions or an agent with a shell.
 
 ## Workflow
 
@@ -192,7 +233,7 @@ An error once the stream is under way drops the connection or comes in the
 | Status | Meaning | What to do |
 |---|---|---|
 | 400 | invalid SQL (parser/binder) or malformed request; DuckDB's message comes in `error`, without name suggestions ("did you mean") | fix the SQL; check names in `/v1/schema` |
-| 401 | missing or wrong credential | do not guess; ask the user for the credential |
+| 401 | missing or wrong credential | do not guess and do not ask for the secret in the chat; ask the user to run `curral.sh login` again in their terminal |
 | 403 | the policy denied it (table without access, statement not allowed, indirect read of a protected table) | do not work around it; use `dry_run` to understand and explain the restriction to the user |
 | 429 | too many of your queries at once, or a lockout after failed logins (`Retry-After`) | run queries one after another; wait `Retry-After` seconds |
 | 499 | the client disconnected | — |
