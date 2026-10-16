@@ -60,7 +60,7 @@ jobs:
           cp README.md CHANGELOG.md LICENSE dist/$name/
           cp -r examples dist/$name/
           tar -C dist -czf dist/$name.tar.gz $name
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.arch }}
           path: dist/*.tar.gz
@@ -103,7 +103,7 @@ jobs:
           touch "digests/${DIGEST#sha256:}"
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: digest-${{ matrix.arch }}
           path: digests/*
