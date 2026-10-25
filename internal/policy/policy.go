@@ -16,6 +16,8 @@ import (
 
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/rego"
+
+	"github.com/lucasapassos/curral/internal/config"
 )
 
 type Policy struct {
@@ -249,6 +251,9 @@ func maskSQL(col string, m any) (string, error) {
 		if !ok || strings.TrimSpace(s) == "" || len(v) != 1 {
 			return "", fmt.Errorf(`custom masks are {"sql": "<expression>"}`)
 		}
+		if !config.StandaloneExpr(s) {
+			return "", fmt.Errorf("custom mask must be a single SQL expression")
+		}
 		return s, nil
 	}
 	return "", fmt.Errorf("unsupported mask %T", m)
@@ -329,7 +334,7 @@ func (p *Policy) RowFilters(ctx context.Context, input map[string]any) (map[stri
 	out := map[string]string{}
 	for table, value := range tables {
 		predicate, ok := value.(string)
-		if len(strings.Split(table, ".")) != 3 || !ok || strings.TrimSpace(predicate) == "" {
+		if len(strings.Split(table, ".")) != 3 || !ok || strings.TrimSpace(predicate) == "" || !config.StandaloneExpr(predicate) {
 			return nil, fmt.Errorf("invalid row filter for %q", table)
 		}
 		out[table] = predicate

@@ -17,6 +17,11 @@ notes are taken from its section here.
 - Policy row predicates (`--policy-row-filters-query`, default
   `data.curral.row_filters`), ANDed with the `--row-filters` file, and the
   `curral_identity` session variable for filters and masks.
+
+### Changed
+- Row filters (file and policy) and `{"sql": ...}` masks must each be a
+  single SQL expression; a filter that could escape its parentheses, or
+  holds `;`, comments or dollar quotes, is refused.
 - Shared keys may send an audit-only `X-Curral-Caller-Context`; audit events
   gain `actor`, `identity` and `caller`, and refused identities are recorded
   as `delegation_denied`.

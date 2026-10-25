@@ -134,6 +134,13 @@ predicates are ANDed with the `--row-filters` file's, then applied before the
 caller's own filters, joins and aggregations. This works for any caller, not
 only delegated ones.
 
+Each predicate, `--row-filters` rule and `{"sql": ...}` mask must be a single
+expression: balanced parentheses outside quotes, and no `;`, comments or
+dollar quotes. Anything else denies the request (or fails the load), so a
+value such as `x') OR ('1'='1` cannot widen a filter. Still, do not build SQL
+by interpolating `input.identity` into strings: compare against the identity
+inside the SQL instead.
+
 Filters and SQL masks can read the structured identity from the JSON session
 variable `curral_identity` (empty when not delegated), for example
 `json_extract_string(getvariable('curral_identity'), '$.page.slug')`, next to

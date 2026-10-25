@@ -17,6 +17,8 @@ func TestPolicyRowFilters(t *testing.T) {
 		{`row_filters := {"sales.main.orders":false}`, true},
 		{`row_filters := {"sales.main.orders":""}`, true},
 		{`row_filters := "not an object"`, true},
+		{`row_filters := {"sales.main.orders":"region = 'x') OR ('1'='1'"}`, true},
+		{`row_filters := {"sales.main.orders":"id = 1; SELECT 1"}`, true},
 	} {
 		t.Run(tc.rule, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "policy.rego")

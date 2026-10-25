@@ -386,3 +386,56 @@ func expandValue(v any) (any, error) {
 	}
 	return v, nil
 }
+
+// StandaloneExpr reports whether s can be wrapped in parentheses and
+// combined with other SQL without escaping them: its parentheses balance
+// outside string literals and quoted identifiers, and it holds no statement
+// separator, comment or dollar quote. Row filters and SQL masks may be built
+// by a policy from request attributes; this keeps a value such as
+// "x') OR ('1'='1" from turning one predicate into an OR with another.
+func StandaloneExpr(s string) bool {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '\'', '"':
+			// E'...' strings take backslash escapes.
+			escapes := c == '\'' && i > 0 && (s[i-1] == 'e' || s[i-1] == 'E') &&
+				(i == 1 || !isIdentByte(s[i-2]))
+			j := i + 1
+			for ; j < len(s); j++ {
+				if escapes && s[j] == '\\' {
+					j++
+					continue
+				}
+				if s[j] == c {
+					if j+1 < len(s) && s[j+1] == c {
+						j++
+						continue
+					}
+					break
+				}
+			}
+			if j >= len(s) {
+				return false
+			}
+			i = j
+		case '(':
+			depth++
+		case ')':
+			if depth--; depth < 0 {
+				return false
+			}
+		case ';', '$':
+			return false
+		case '-', '/':
+			if i+1 < len(s) && (s[i+1] == '-' && c == '-' || s[i+1] == '*' && c == '/') {
+				return false
+			}
+		}
+	}
+	return depth == 0
+}
+
+func isIdentByte(b byte) bool {
+	return b == '_' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
+}
