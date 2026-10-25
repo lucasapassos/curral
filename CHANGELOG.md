@@ -5,6 +5,8 @@ notes are taken from its section here.
 
 ## [Unreleased]
 
+## [v0.7.0] - 2026-10-25
+
 ### Added
 - Execution delegation: API keys with `delegation: true` query on behalf of
   the identity they name in `X-Curral-Execution-Context`, over HTTP and
