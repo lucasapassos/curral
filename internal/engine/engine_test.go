@@ -543,11 +543,21 @@ func TestHiddenDescribe(t *testing.T) {
 		"SELECT * FROM (SHOW orders), (SHOW salaries)":                             true,
 		"SELECT * FROM (SHOW orders) JOIN (SELECT * FROM (SHOW salaries)) ON true": true,
 		// A direct call stays in functions, for the allowlist to decide.
-		"SELECT * FROM pragma_show('orders'), (SHOW salaries)": true,
+		"SELECT * FROM pragma_show('orders'), (SHOW salaries)": false,
+		// A SHOW or DESCRIBE DuckDB never plans (an unused CTE) cannot stand
+		// in for a scan of another table.
+		"WITH x AS (SELECT * FROM (SHOW orders)) SELECT * FROM pragma_show('salaries')": false,
+		"WITH x AS (SELECT * FROM (SHOW orders)) SELECT * FROM meta_show":               false,
+		"WITH x AS (DESCRIBE orders) SELECT * FROM meta":                                false,
+		"WITH x AS (SHOW orders) SELECT * FROM x":                                       false,
 	} {
 		insp, _, err := run(e, Request{SQL: q}, func(context.Context, Inspection) error { return ErrForbidden })
 		if !errors.Is(err, ErrForbidden) || insp.Resolved != resolved {
 			t.Errorf("%s: resolved=%v err=%v, want resolved=%v", q, insp.Resolved, err, resolved)
+		}
+		// A pragma_show written by the caller is never taken off the list.
+		if strings.Contains(q, "pragma_show(") && !slices.Contains(insp.Functions, "pragma_show") {
+			t.Errorf("%s: functions=%v", q, insp.Functions)
 		}
 	}
 }

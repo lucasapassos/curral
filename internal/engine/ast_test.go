@@ -60,7 +60,9 @@ func TestASTSources(t *testing.T) {
 		}
 	}
 	// A SHOW whose table cannot be told is an error, not an empty list.
-	for _, q := range []string{"SHOW TABLES", `SHOW "tables"`, `SHOW """tables"""`, `SHOW "a.b"`, "SHOW TABLES FROM s", "SELECT * FROM x, (SHOW ALL TABLES)"} {
+	for _, q := range []string{"SHOW TABLES", `SHOW "tables"`, `SHOW """tables"""`, `SHOW "a.b"`, "SHOW TABLES FROM s", "SELECT * FROM x, (SHOW ALL TABLES)",
+		// pragma_show matches its special names ignoring case.
+		"SHOW __SHOW_TABLES_EXPANDED", "SHOW __Show_Tables_Expanded", `SHOW "TABLES"`, `SHOW "Variables"`} {
 		err := conn.Raw(func(dc any) error {
 			_, _, err := astSources(context.Background(), dc.(*duckdb.Conn), q)
 			return err

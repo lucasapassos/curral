@@ -188,16 +188,22 @@ func (e *Engine) inspectShows(ctx context.Context, c *duckdb.Conn, query string,
 	var named []string    // SHOW <bare name>, answered by a pragma_show scan
 	directPragmaShow := 0 // pragma_show('...') written as a table function
 	unresolved := false
-	var walk func(n any)
-	walk = func(n any) {
+	var walk func(n any, inCTE bool)
+	walk = func(n any, inCTE bool) {
 		switch v := n.(type) {
 		case []any:
 			for _, x := range v {
-				walk(x)
+				walk(x, inCTE)
 			}
 		case map[string]any:
 			switch v["type"] {
 			case "SHOW_REF":
+				// DuckDB does not plan a CTE nobody reads, so a DESCRIBE or
+				// SHOW there would be counted below without a result in the
+				// plan, leaving room for one hidden in a view.
+				if inCTE && v["show_type"] != "SUMMARY" {
+					unresolved = true
+				}
 				q, ok := v["query"].(map[string]any)
 				switch v["show_type"] {
 				case "SUMMARY":
@@ -229,12 +235,12 @@ func (e *Engine) inspectShows(ctx context.Context, c *duckdb.Conn, query string,
 					}
 				}
 			}
-			for _, x := range v {
-				walk(x)
+			for k, x := range v {
+				walk(x, inCTE || k == "cte_map")
 			}
 		}
 	}
-	walk(stmts)
+	walk(stmts, false)
 	if unresolved {
 		insp.Resolved = false
 	}
@@ -271,32 +277,38 @@ func (e *Engine) inspectShows(ctx context.Context, c *duckdb.Conn, query string,
 		insp.Resolved = insp.Resolved && si.Resolved
 		insp.HiddenRemoteScans += si.HiddenRemoteScans
 	}
-	// Each SHOW of a bare name accounts for one pragma_show scan, which is
-	// how DuckDB answers it, not a function the caller chose. Any other is
-	// a direct call (left to the function allowlist) or, beyond those, one
-	// hidden in a view or table macro describing a table nobody named.
+	// Each SHOW of a bare name runs as one pragma_show scan, which is how
+	// DuckDB answers it, not a function the caller chose. The plan does not
+	// say which name a scan reads, so the scans are taken off the functions
+	// only when they are exactly those SHOWs. Otherwise the statement is
+	// unresolved: a direct pragma_show('...') call next to a SHOW cannot be
+	// told apart from it, and any scan beyond the statement's own is hidden
+	// in a view or table macro, describing a table nobody named. Direct
+	// calls always stay in the functions, for the allowlist to decide.
 	pragmaShows := 0
-	for i := 0; i < len(insp.Functions); i++ {
-		if insp.Functions[i] != "pragma_show" {
-			continue
+	for _, f := range insp.Functions {
+		if f == "pragma_show" {
+			pragmaShows++
 		}
-		if pragmaShows < len(named) {
-			insp.Functions = slices.Delete(insp.Functions, i, i+1)
-			i--
-		}
-		pragmaShows++
 	}
-	if pragmaShows > len(named)+directPragmaShow {
+	switch {
+	case pragmaShows != len(named)+directPragmaShow, len(named) > 0 && directPragmaShow > 0:
 		insp.Resolved = false
+	case len(named) > 0:
+		insp.Functions = slices.DeleteFunc(insp.Functions, func(f string) bool { return f == "pragma_show" })
 	}
 	return len(inner), nil
 }
 
 // showName returns the table a DuckDB 2.0 SHOW of a bare name describes. Its
 // name reaches pragma_show as a string that DuckDB parses again as a
-// qualified name, and the catalog listings (SHOW TABLES, ...) are matched on
-// names carrying literal quotes, so only a plain name, without dots or
-// quotes, is taken at face value; anything else is unresolved.
+// qualified name, and the catalog listings (SHOW TABLES, ...) are matched,
+// ignoring case, on names carrying literal quotes or __show_tables_expanded,
+// so only a plain name, without dots or quotes and none of those, is taken
+// at face value; anything else is unresolved.
+// Names DuckDB's SHOW answers with a catalog listing, without their quotes.
+var showListings = map[string]bool{"tables": true, "databases": true, "schemas": true, "variables": true}
+
 func showName(ref map[string]any) (string, bool) {
 	name, _ := ref["table_name"].(string)
 	cat, _ := ref["catalog_name"].(string)
@@ -306,7 +318,7 @@ func showName(ref map[string]any) (string, bool) {
 	if name == "" || cat != "" || sch != "" || len(path) != 1 || path[0] != name {
 		return "", false
 	}
-	if strings.ContainsAny(name, `."`) || strings.HasPrefix(name, "__show") {
+	if strings.ContainsAny(name, `."`) || showListings[strings.ToLower(name)] || strings.HasPrefix(strings.ToLower(name), "__show") {
 		return "", false
 	}
 	return name, true
