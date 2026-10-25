@@ -113,7 +113,7 @@ func TestDelegatedRowFiltersAndMasks(t *testing.T) {
 		ids = append(ids, config.Identity{Match: "portal:" + kind + ":7", Roles: []string{"live"}})
 	}
 	s.SetAuth(auth.New(&config.Users{APIKeys: []config.APIKey{{Name: "portal", KeyHash: hash, Delegation: true,
-		Attributes: map[string]string{"tenant": "tenant-a"}}}, Identities: ids}, 0))
+		Attributes: map[string]string{"organization_id": "org-a"}}}, Identities: ids}, 0))
 	dir := t.TempDir()
 	pf := filepath.Join(dir, "policy.rego")
 	os.WriteFile(pf, []byte(`package curral
@@ -121,7 +121,7 @@ import rego.v1
 default allow := false
 allow if {
  input.actor.name == "portal"
- input.identity.tenant == input.actor.attributes.tenant
+ input.identity.organization.id == input.actor.attributes.organization_id
  startswith(input.user, "portal:")
  input.statement_type == "SELECT"
  input.resolved
@@ -150,7 +150,7 @@ row_filters := {"sales.main.orders":"id > 0"} if input.identity.kind in {"user",
 	call := delegatedClient(t, ts, key)
 	body := `{"sql":"WITH dataset AS (SELECT id,amount FROM sales.main.orders) SELECT count(*) n,sum(amount) total FROM (SELECT * FROM dataset) q"}`
 	for _, kind := range []string{"user", "page", "guest"} {
-		identity := map[string]any{"subject": "portal:" + kind + ":7", "kind": kind, "tenant": "tenant-a"}
+		identity := map[string]any{"subject": "portal:" + kind + ":7", "kind": kind, "organization": map[string]any{"id": "org-a"}}
 		if root := os.Getenv("CURRAL_CONTRACT_CLIENT"); root != "" {
 			// Optional cross-repository check: a delegating client's own
 			// contract test runs against this server.
@@ -170,9 +170,9 @@ row_filters := {"sales.main.orders":"id > 0"} if input.identity.kind in {"user",
 			t.Fatalf("%s: %d %s, want %s", kind, status, got, want)
 		}
 	}
-	other := map[string]any{"subject": "portal:user:7", "kind": "user", "tenant": "tenant-b"}
+	other := map[string]any{"subject": "portal:user:7", "kind": "user", "organization": map[string]any{"id": "org-b"}}
 	if status, _, got := call("POST", "/v1/query", map[string]string{executionContextHeader: contextHeader(other)}, body); status != 403 {
-		t.Fatalf("other tenant: %d %s", status, got)
+		t.Fatalf("other organization: %d %s", status, got)
 	}
 }
 
