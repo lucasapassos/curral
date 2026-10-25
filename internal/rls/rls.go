@@ -73,6 +73,9 @@ func Load(path string) (*Rules, error) {
 			if strings.TrimSpace(rule.Where) == "" {
 				return nil, fmt.Errorf("%s: %s rule %d has no where", path, name, i+1)
 			}
+			if !config.StandaloneExpr(rule.Where) {
+				return nil, fmt.Errorf("%s: %s rule %d: where must be a single SQL expression", path, name, i+1)
+			}
 			if len(rule.Roles) == 0 && len(rule.Users) == 0 {
 				return nil, fmt.Errorf("%s: %s rule %d matches nobody (roles or users)", path, name, i+1)
 			}

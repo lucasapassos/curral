@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -105,5 +106,44 @@ func TestIdentities(t *testing.T) {
 	u, err := LoadUsers(writeFile(t, "identities: [{match: \"*@x.com\", roles: [analyst]}]"))
 	if err != nil || len(u.Identities) != 1 {
 		t.Fatalf("%+v %v", u, err)
+	}
+}
+
+func TestAPIKeyDelegation(t *testing.T) {
+	key := "api_keys: [{name: portal, key_sha256: " + strings.Repeat("a", 64) + ", delegation: true, attributes: %s}]"
+	for _, attrs := range []string{"{\"bad-name\": x}", "{tenant: \"a\\nb\"}", "{tenant: \"" + strings.Repeat("x", 257) + "\"}"} {
+		if _, err := LoadUsers(writeFile(t, fmt.Sprintf(key, attrs))); err == nil {
+			t.Errorf("%s: expected error", attrs)
+		}
+	}
+	u, err := LoadUsers(writeFile(t, fmt.Sprintf(key, "{tenant: tenant-a}")))
+	if err != nil || !u.APIKeys[0].Delegation || u.APIKeys[0].Attributes["tenant"] != "tenant-a" {
+		t.Fatalf("%+v %v", u, err)
+	}
+}
+
+func TestStandaloneExpr(t *testing.T) {
+	for s, want := range map[string]bool{
+		"region = 'north'":                   true,
+		"id IN (1, (2))":                     true,
+		"name = 'it''s (open'":               true,
+		`"we(ird" = 1`:                       true,
+		`regexp_replace(x, '\d', '*') <> ''`: true,
+		`x = E'\'' AND (y)`:                  true,
+		"region = 'x') OR ('1'='1'":          false,
+		"1=1) OR (1=1":                       false,
+		"(1=1":                               false,
+		"a = 1; DROP TABLE t":                false,
+		"a = 1 -- )":                         false,
+		"a = 1 /* ) */":                      false,
+		"a = $$x$$":                          false,
+		"a = 'unterminated":                  false,
+		`x = E'\') OR (true'`:                true,
+		`x = E'\'') OR (true`:                false,
+		"json_extract_string(getvariable('curral_identity'), '$.page.slug') = 'x'": true,
+	} {
+		if got := StandaloneExpr(s); got != want {
+			t.Errorf("%q: got %v, want %v", s, got, want)
+		}
 	}
 }

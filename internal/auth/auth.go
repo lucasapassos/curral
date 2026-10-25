@@ -23,6 +23,14 @@ type Principal struct {
 	Name   string
 	Roles  []string
 	Method string // basic, api_key, jwt
+	// Delegation and Attributes come from the API key entry. On a delegated
+	// principal, Actor names that key and Identity is what it asserted;
+	// Caller is the audit-only context a shared key may send instead.
+	Delegation bool
+	Attributes map[string]string
+	Actor      string
+	Identity   *ExecutionContext
+	Caller     *ExecutionContext
 }
 
 // Authentication methods.
@@ -64,7 +72,8 @@ func New(users *config.Users, ttl time.Duration) *Authenticator {
 		var h [32]byte
 		hex.Decode(h[:], []byte(strings.ToLower(k.KeyHash)))
 		exp, _ := k.ExpiresAt()
-		a.keys[h] = apiKey{p: &Principal{Name: k.Name, Roles: k.Roles, Method: MethodAPIKey}, expires: exp}
+		a.keys[h] = apiKey{p: &Principal{Name: k.Name, Roles: k.Roles, Method: MethodAPIKey,
+			Delegation: k.Delegation, Attributes: k.Attributes}, expires: exp}
 	}
 	// Unknown users still pay one bcrypt so timing does not reveal them.
 	a.dummy, _ = bcrypt.GenerateFromPassword([]byte("curral-dummy"), bcrypt.DefaultCost)

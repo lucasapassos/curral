@@ -139,6 +139,18 @@ func (f *flightServer) begin(ctx context.Context, method string, setHeader func(
 		_ = setHeader(out)
 		return nil, status.Error(codes.Unauthenticated, "invalid credentials")
 	}
+	on := surfaceRead
+	if method == handshakeMethod {
+		on = surfaceIntro
+	}
+	effective, err := f.s.executionPrincipal(p, md.Get(executionContextHeader), md.Get(callerContextHeader), on)
+	if err != nil {
+		f.s.delegationDenied(c, p)
+		_ = setHeader(out)
+		return nil, status.Error(codes.PermissionDenied, "execution identity refused")
+	}
+	p = effective
+	out.Set(strings.ToLower(effectiveSubjectHeader), p.Name)
 	if method == handshakeMethod {
 		bearer := authz
 		if token, ok := f.sessions.Issue(f.s.authn.Load(), p); ok {

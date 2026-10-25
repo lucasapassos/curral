@@ -110,6 +110,7 @@ type serveFlags struct {
 	policyQuery    string
 	limitsQuery    string
 	masksQuery     string
+	filtersQuery   string
 	docsQuery      string
 	docsDir        string
 	jevKey         string
@@ -163,6 +164,7 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.StringVar(&f.catalog, "catalog", "", "catalog file: extensions, secrets, databases to ATTACH (required)")
 	fs.StringVar(&f.users, "users", "", "users file with bcrypt password hashes and roles (required)")
 	fs.Var(&f.policies, "policy", "Rego policy file, or JSON/YAML data file exposed as data.* (repeatable, required)")
+	fs.StringVar(&f.filtersQuery, "policy-row-filters-query", "data.curral.row_filters", "Rego table-to-SQL row predicates, ANDed with file-based RLS")
 	fs.StringVar(&f.policyQuery, "policy-query", "data.curral.allow", "Rego decision that must evaluate to true")
 	fs.StringVar(&f.masksQuery, "policy-masks-query", "", "optional Rego rule with column masks per table, e.g. data.curral.masks")
 	fs.StringVar(&f.docsDir, "docs-dir", "", "directory of semantic documents served at /v1/docs, one JSON file each; empty disables. Reloaded on SIGHUP")
@@ -318,7 +320,7 @@ func runServe(args []string, checkOnly bool) error {
 		return err
 	}
 	loadPolicy := func(ctx context.Context) (*policy.Policy, error) {
-		q := policy.Queries{Allow: f.policyQuery, Limits: f.limitsQuery, Masks: f.masksQuery}
+		q := policy.Queries{Allow: f.policyQuery, Limits: f.limitsQuery, Masks: f.masksQuery, Filters: f.filtersQuery}
 		if f.docsDir != "" {
 			q.Docs = f.docsQuery
 		}

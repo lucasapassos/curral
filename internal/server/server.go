@@ -98,12 +98,19 @@ func (s *Server) protections(ctx context.Context, pol *policy.Policy, input map[
 	if err != nil {
 		return nil, err
 	}
+	filters, err := pol.RowFilters(ctx, input)
+	if err != nil {
+		return nil, err
+	}
 	rules := s.rowFilters.Load()
 	// Remote tables (Iceberg) read through a view or macro are invisible to
 	// the rewrite. If this user is filtered or masked on any remote table,
 	// such a statement could read it unprotected: refuse it.
 	if insp.HiddenRemoteScans > 0 {
 		limited := rules.TablesFor(p.Name, p.Roles)
+		for t := range filters {
+			limited = append(limited, t)
+		}
 		for t := range masks {
 			limited = append(limited, t)
 		}
@@ -119,6 +126,15 @@ func (s *Server) protections(ctx context.Context, pol *policy.Policy, input map[
 		var pr engine.Protection
 		if where, ok := rules.Filter(t, p.Name, p.Roles); ok {
 			pr.Filter = where
+		}
+		for ft, predicate := range filters {
+			if strings.EqualFold(ft, t) {
+				if pr.Filter != "" {
+					pr.Filter = "(" + pr.Filter + ") AND (" + predicate + ")"
+				} else {
+					pr.Filter = predicate
+				}
+			}
 		}
 		for mt, cols := range masks {
 			if strings.EqualFold(mt, t) {
@@ -168,6 +184,7 @@ var errAudit = errors.New("audit log unavailable: query refused")
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/capabilities", s.authedOn(surfaceIntro, s.capabilities))
 	mux.HandleFunc("POST /v1/query", s.authed(s.query))
 	mux.HandleFunc("GET /v1/databases", s.authed(s.databases))
 	mux.HandleFunc("GET /v1/schema", s.authed(s.schema))
@@ -203,7 +220,10 @@ func requestID(r *http.Request) string {
 
 type handler func(http.ResponseWriter, *http.Request, *auth.Principal)
 
-func (s *Server) authed(h handler) http.HandlerFunc {
+// authed authenticates a read: a delegated identity may run it.
+func (s *Server) authed(h handler) http.HandlerFunc { return s.authedOn(surfaceRead, h) }
+
+func (s *Server) authedOn(on surface, h handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		p, blockedFor, blocked := s.login(s.httpCaller(r), r.Header.Get("Authorization"), nil)
 		switch {
@@ -217,8 +237,23 @@ func (s *Server) authed(h handler) http.HandlerFunc {
 			}
 			writeError(w, http.StatusUnauthorized, "invalid credentials")
 		default:
-			h(w, r, p)
+			effective, err := s.executionPrincipal(p, r.Header.Values(executionContextHeader), r.Header.Values(callerContextHeader), on)
+			if err != nil {
+				s.delegationDenied(s.httpCaller(r), p)
+				writeError(w, http.StatusForbidden, "execution identity refused")
+				return
+			}
+			w.Header().Set(effectiveSubjectHeader, effective.Name)
+			h(w, r, effective)
 		}
+	}
+}
+
+func (s *Server) delegationDenied(c caller, p *auth.Principal) {
+	if s.Audit != nil {
+		ev := s.event(c, "delegation_denied", p)
+		ev.Decision, ev.DecidedBy, ev.Status = "deny", "delegation", http.StatusForbidden
+		s.Audit.Record(ev)
 	}
 }
 
@@ -413,6 +448,13 @@ func (s *Server) event(c caller, kind string, p *auth.Principal) *audit.Event {
 	}
 	if p != nil {
 		ev.User, ev.Roles, ev.AuthMethod = p.Name, p.Roles, p.Method
+		ev.Actor = p.Actor
+		if p.Identity != nil {
+			ev.Identity = p.Identity.Fields
+		}
+		if p.Caller != nil {
+			ev.Caller = p.Caller.Fields
+		}
 	}
 	return ev
 }
@@ -700,6 +742,10 @@ func (s *Server) runQuery(ctx context.Context, p *auth.Principal, ev *audit.Even
 			// Lake scans behind views/macros, whose tables are unknown.
 			"hidden_remote_scans": i.HiddenRemoteScans,
 		}
+		policyIdentity(input, p)
+		if delegated(p) && i.StatementType != "SELECT" {
+			return engine.ErrForbidden
+		}
 		ok, err := pol.Allow(ctx, input)
 		if err == nil && ok {
 			// Limits are part of the decision: if they cannot be
@@ -774,7 +820,7 @@ func (s *Server) runQuery(ctx context.Context, p *auth.Principal, ev *audit.Even
 	err := s.Engine.Query(ctx, engine.Request{
 		EmitArrow: emitArrow, Describe: q.describe,
 		SQL: q.sql, Params: q.params, Database: q.database, Timing: &timing, ExecTimeout: &execTimeout,
-		Protect: &run.protect, User: p.Name, Roles: p.Roles,
+		Protect: &run.protect, User: p.Name, Roles: p.Roles, IdentityJSON: identityJSON(p.Identity),
 	}, authorize, emit)
 	run.err, run.maxRows = err, rowLimit()
 	if q.dryRun {
@@ -1179,6 +1225,7 @@ func (s *Server) listSchema(ctx context.Context, p *auth.Principal, ev *audit.Ev
 			"resolved":            i.Resolved,
 			"hidden_remote_scans": i.HiddenRemoteScans,
 		}
+		policyIdentity(input, p)
 		ok, err := pol.Allow(ctx, input)
 		if err == nil && ok {
 			var pr map[string]engine.Protection

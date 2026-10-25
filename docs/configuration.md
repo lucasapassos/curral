@@ -33,6 +33,7 @@ list: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--policy-query` | `data.curral.allow` | decision that must be `true` |
 | `--policy-limits-query` | (off) | optional rule with per-request limits, e.g. `data.curral.limits` |
 | `--policy-masks-query` | (off) | optional rule with column masks, e.g. `data.curral.masks` |
+| `--policy-row-filters-query` | `data.curral.row_filters` | rule with SQL row predicates per table, ANDed with `--row-filters`; undefined adds none |
 | `--docs-dir` | (off) | directory of semantic documents served at `/v1/docs`; reloaded on `SIGHUP` |
 | `--policy-docs-query` | `data.curral.docs_allow` | decision allowing writes to `/v1/docs`; undefined means deny |
 | `--jev-key` | (off) | TypeSafe API key: `/v1/docs/search` asks Jev which documents fit the question; prefer `CURRAL_JEV_KEY`. Sends the candidate documents to TypeSafe |
