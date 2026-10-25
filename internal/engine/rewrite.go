@@ -413,7 +413,7 @@ func stripLocations(n any) any {
 	case map[string]any:
 		out := make(map[string]any, len(v))
 		for k, x := range v {
-			if k != "query_location" {
+			if k != "query_location" && k != "query_location_length" {
 				out[k] = stripLocations(x)
 			}
 		}

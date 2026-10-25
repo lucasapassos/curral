@@ -53,7 +53,7 @@ jobs:
       - name: seed example databases
         run: |
           mkdir -p data
-          uv run --no-project --with duckdb==1.5.6 python - <<'PY'
+          uv run --no-project --with duckdb==2.0.0 python - <<'PY'
           import duckdb
           c = duckdb.connect("data/sales.duckdb")
           c.execute("CREATE TABLE orders AS SELECT range AS id, (random()*1000)::DECIMAL(10,2) AS amount FROM range(1000000)")
