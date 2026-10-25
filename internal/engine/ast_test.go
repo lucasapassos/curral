@@ -33,6 +33,11 @@ func TestASTSources(t *testing.T) {
 		{"WITH t AS (SELECT 1) SELECT * FROM t, s.t", []string{"s.t"}, nil},
 		{"WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT * FROM r", nil, nil},
 		{"SELECT * FROM x WHERE id IN (SELECT id FROM y) UNION SELECT * FROM iceberg_scan('s3://b/t')", []string{"x", "y"}, []string{"iceberg_scan"}},
+		// Names deeper than catalog.schema.table (nested schemas) keep every part.
+		{"SELECT * FROM a.b.c.d", []string{"a.b.c.d"}, nil},
+		// SHOW names its table directly, or through an inner query; CTEs do
+		// not shadow a SHOW.
+		{"WITH t AS (SELECT 1) SELECT * FROM (SHOW t), (SHOW s.u), (DESCRIBE v)", []string{"s.u", "t", "v"}, nil},
 	}
 	for _, c := range cases {
 		var tables [][]string
@@ -52,6 +57,16 @@ func TestASTSources(t *testing.T) {
 		slices.Sort(got)
 		if !slices.Equal(got, c.tables) || !slices.Equal(funcs, c.funcs) {
 			t.Errorf("%s\n  tables=%v funcs=%v", c.sql, got, funcs)
+		}
+	}
+	// A SHOW whose table cannot be told is an error, not an empty list.
+	for _, q := range []string{"SHOW TABLES", `SHOW "tables"`, `SHOW """tables"""`, `SHOW "a.b"`, "SHOW TABLES FROM s", "SELECT * FROM x, (SHOW ALL TABLES)"} {
+		err := conn.Raw(func(dc any) error {
+			_, _, err := astSources(context.Background(), dc.(*duckdb.Conn), q)
+			return err
+		})
+		if err == nil {
+			t.Errorf("%s: no error", q)
 		}
 	}
 }

@@ -1029,9 +1029,16 @@ func TestNoMetadataLeaks(t *testing.T) {
 		{`{"sql":"DESCRIBE salaries"}`, 403},
 		{`{"sql":"SELECT * FROM (DESCRIBE salaries)"}`, 403},
 		{`{"sql":"SHOW salaries"}`, 403},
+		{`{"sql":"SHOW sales.main.salaries"}`, 403},
+		{`{"sql":"SHOW \"salaries\""}`, 403},
+		{`{"sql":"SELECT * FROM orders, (SHOW salaries)"}`, 403},
 		{`{"sql":"DESCRIBE SELECT value FROM salaries"}`, 403},
 		{`{"sql":"SHOW TABLES"}`, 403},
+		{`{"sql":"SHOW \"\"\"tables\"\"\""}`, 403},
+		{`{"sql":"SHOW threads"}`, 403},
 		{`{"sql":"DESCRIBE orders"}`, 200},
+		{`{"sql":"SHOW orders"}`, 200},
+		{`{"sql":"SHOW sales.main.orders"}`, 200},
 	} {
 		if r := do(t, ts, "analyst", c.sql); r.status != c.status {
 			t.Errorf("%s: %d %s", c.sql, r.status, r.body)

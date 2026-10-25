@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
@@ -166,12 +167,14 @@ var showStarters = map[string]bool{
 }
 
 // inspectShows covers DESCRIBE and SHOW, which DuckDB answers while binding:
-// their plan reads no table (a CHUNK_GET), so the plan-based inspection sees
-// nothing and the metadata of any table would be readable. Each DESCRIBE's
-// inner query is inspected as if it ran, so the policy sees the tables whose
-// columns it reveals. SHOW of the catalog itself (SHOW TABLES, SHOW
-// DATABASES, ...) lists objects the policy cannot attribute: unresolved.
-// SUMMARIZE scans its input, so the plan already covers it.
+// their plan reads no table (a CHUNK_GET, or a PRAGMA_SHOW scan for SHOW of
+// a bare name), so the plan-based inspection sees nothing and the metadata of
+// any table would be readable. Each DESCRIBE's inner query is inspected as if
+// it ran, so the policy sees the tables whose columns it reveals; SHOW of a
+// bare name is inspected as SELECT * FROM that name. SHOW of the catalog
+// itself (SHOW TABLES, SHOW DATABASES, ...) lists objects the policy cannot
+// attribute: unresolved. SUMMARIZE scans its input, so the plan already
+// covers it.
 //
 // It returns the number of DESCRIBEs found, to be matched against the plan.
 func (e *Engine) inspectShows(ctx context.Context, c *duckdb.Conn, query string, args []driver.NamedValue, database string, insp *Inspection) (int, error) {
@@ -182,6 +185,8 @@ func (e *Engine) inspectShows(ctx context.Context, c *duckdb.Conn, query string,
 		return 0, nil
 	}
 	var inner []any
+	var named []string    // SHOW <bare name>, answered by a pragma_show scan
+	directPragmaShow := 0 // pragma_show('...') written as a table function
 	unresolved := false
 	var walk func(n any)
 	walk = func(n any) {
@@ -191,13 +196,37 @@ func (e *Engine) inspectShows(ctx context.Context, c *duckdb.Conn, query string,
 				walk(x)
 			}
 		case map[string]any:
-			if v["type"] == "SHOW_REF" {
-				switch q, ok := v["query"].(map[string]any); {
-				case v["show_type"] == "SUMMARY":
-				case v["show_type"] == "DESCRIBE" && ok:
+			switch v["type"] {
+			case "SHOW_REF":
+				q, ok := v["query"].(map[string]any)
+				switch v["show_type"] {
+				case "SUMMARY":
+				case "DESCRIBE":
+					if !ok {
+						unresolved = true
+						break
+					}
 					inner = append(inner, q)
+				case "SHOW":
+					if ok {
+						// SHOW SELECT ... and SHOW of a qualified name, which
+						// DuckDB describes through this inner query.
+						inner = append(inner, q)
+					} else if name, ok := showName(v); ok {
+						named = append(named, name)
+					} else {
+						unresolved = true
+					}
 				default:
+					// SHOW_SPECIAL (TABLES, DATABASES, ...), SHOW_FROM and
+					// anything newer.
 					unresolved = true
+				}
+			case "TABLE_FUNCTION":
+				if fn, ok := v["function"].(map[string]any); ok {
+					if name, ok := fn["function_name"].(string); ok && strings.EqualFold(name, "pragma_show") {
+						directPragmaShow++
+					}
 				}
 			}
 			for _, x := range v {
@@ -209,6 +238,7 @@ func (e *Engine) inspectShows(ctx context.Context, c *duckdb.Conn, query string,
 	if unresolved {
 		insp.Resolved = false
 	}
+	subs := make([]string, 0, len(inner)+len(named))
 	for _, node := range inner {
 		doc, err := json.Marshal(map[string]any{
 			"error":      false,
@@ -223,6 +253,15 @@ func (e *Engine) inspectShows(ctx context.Context, c *duckdb.Conn, query string,
 			insp.Resolved = false
 			continue
 		}
+		subs = append(subs, sub)
+	}
+	for _, name := range named {
+		// DuckDB describes the table or view of that name, falling back to a
+		// setting when there is none; the SELECT then fails to plan, which
+		// leaves the statement unresolved.
+		subs = append(subs, "SELECT * FROM "+quoteIdent(name))
+	}
+	for _, sub := range subs {
 		si, err := e.inspect(ctx, c, duckdb.STATEMENT_TYPE_SELECT, sub, args, database)
 		if err != nil {
 			return 0, err
@@ -232,17 +271,58 @@ func (e *Engine) inspectShows(ctx context.Context, c *duckdb.Conn, query string,
 		insp.Resolved = insp.Resolved && si.Resolved
 		insp.HiddenRemoteScans += si.HiddenRemoteScans
 	}
+	// Each SHOW of a bare name accounts for one pragma_show scan, which is
+	// how DuckDB answers it, not a function the caller chose. Any other is
+	// a direct call (left to the function allowlist) or, beyond those, one
+	// hidden in a view or table macro describing a table nobody named.
+	pragmaShows := 0
+	for i := 0; i < len(insp.Functions); i++ {
+		if insp.Functions[i] != "pragma_show" {
+			continue
+		}
+		if pragmaShows < len(named) {
+			insp.Functions = slices.Delete(insp.Functions, i, i+1)
+			i--
+		}
+		pragmaShows++
+	}
+	if pragmaShows > len(named)+directPragmaShow {
+		insp.Resolved = false
+	}
 	return len(inner), nil
 }
 
+// showName returns the table a DuckDB 2.0 SHOW of a bare name describes. Its
+// name reaches pragma_show as a string that DuckDB parses again as a
+// qualified name, and the catalog listings (SHOW TABLES, ...) are matched on
+// names carrying literal quotes, so only a plain name, without dots or
+// quotes, is taken at face value; anything else is unresolved.
+func showName(ref map[string]any) (string, bool) {
+	name, _ := ref["table_name"].(string)
+	cat, _ := ref["catalog_name"].(string)
+	sch, _ := ref["schema_name"].(string)
+	qn, _ := ref["qualified_name"].(map[string]any)
+	path, _ := qn["path"].([]any)
+	if name == "" || cat != "" || sch != "" || len(path) != 1 || path[0] != name {
+		return "", false
+	}
+	if strings.ContainsAny(name, `."`) || strings.HasPrefix(name, "__show") {
+		return "", false
+	}
+	return name, true
+}
+
 // astSources lists base table references (minus CTE names in scope) and table
-// function calls of a SELECT, from DuckDB's own parser.
+// function calls of a SELECT, from DuckDB's own parser. Tables named by SHOW
+// count as references (CTEs do not shadow them); a SHOW whose table cannot be
+// told (a catalog listing, a name DuckDB parses again) is an error.
 func astSources(ctx context.Context, c *duckdb.Conn, query string) (tables [][]string, funcs []string, err error) {
 	stmts, err := parseSQL(ctx, c, query)
 	if err != nil {
 		return nil, nil, err
 	}
 
+	unknownShow := false
 	var walk func(n any, ctes []string)
 	walk = func(n any, ctes []string) {
 		switch v := n.(type) {
@@ -264,18 +344,21 @@ func astSources(ctx context.Context, c *duckdb.Conn, query string) (tables [][]s
 				}
 			}
 			switch v["type"] {
-			case "BASE_TABLE":
-				cat, _ := v["catalog_name"].(string)
-				sch, _ := v["schema_name"].(string)
-				name, _ := v["table_name"].(string)
-				if cat == "" && sch == "" && contains(ctes, strings.ToLower(name)) {
-					break
-				}
-				var parts []string
-				for _, p := range []string{cat, sch, name} {
-					if p != "" {
-						parts = append(parts, p)
+			case "SHOW_REF":
+				// With an inner query, its tables are found below.
+				if _, ok := v["query"].(map[string]any); ok {
+					if t := v["show_type"]; t != "DESCRIBE" && t != "SUMMARY" && t != "SHOW" {
+						unknownShow = true
 					}
+				} else if name, ok := showName(v); ok && v["show_type"] == "SHOW" {
+					tables = append(tables, []string{name})
+				} else {
+					unknownShow = true
+				}
+			case "BASE_TABLE":
+				parts := tableParts(v)
+				if len(parts) == 1 && contains(ctes, strings.ToLower(parts[0])) {
+					break
 				}
 				tables = append(tables, parts)
 			case "TABLE_FUNCTION":
@@ -291,7 +374,36 @@ func astSources(ctx context.Context, c *duckdb.Conn, query string) (tables [][]s
 		}
 	}
 	walk(stmts, nil)
+	if unknownShow {
+		return nil, nil, errors.New("SHOW of a catalog listing or an unparseable name")
+	}
 	return tables, funcs, nil
+}
+
+// tableParts returns the name of a BASE_TABLE reference as written. Since
+// DuckDB 2.0 a name may have more than three parts (nested schemas), which
+// catalog_name, schema_name and table_name cannot hold: the full path is in
+// qualified_name, and the separate fields are only a fallback.
+func tableParts(ref map[string]any) []string {
+	qn, _ := ref["qualified_name"].(map[string]any)
+	if path, ok := qn["path"].([]any); ok && len(path) > 0 {
+		parts := make([]string, 0, len(path))
+		for _, p := range path {
+			if s, ok := p.(string); ok && s != "" {
+				parts = append(parts, s)
+			}
+		}
+		if len(parts) == len(path) {
+			return parts
+		}
+	}
+	var parts []string
+	for _, k := range []string{"catalog_name", "schema_name", "table_name"} {
+		if p, _ := ref[k].(string); p != "" {
+			parts = append(parts, p)
+		}
+	}
+	return parts
 }
 
 func contains(s []string, v string) bool {
