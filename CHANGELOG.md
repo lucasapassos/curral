@@ -50,6 +50,8 @@ notes are taken from its section here.
   stores the secret in `%APPDATA%\curral\credentials` encrypted with DPAPI.
 
 ### Fixed
+- Nested `SHOW`/`DESCRIBE` results cannot hide metadata reads of unauthorized
+  tables through views or macros when matching the statement to its plan.
 - `scripts/curral.sh` broke Basic auth when the user or password contained
   `"`.
 

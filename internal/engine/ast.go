@@ -228,6 +228,12 @@ func (e *Engine) inspectShows(ctx context.Context, c *duckdb.Conn, query string,
 					// anything newer.
 					unresolved = true
 				}
+				// The inner query is inspected separately below. Its metadata
+				// results do not appear in this plan and must not count toward
+				// matching this statement's bind-time results or pragma scans.
+				if v["show_type"] != "SUMMARY" {
+					return
+				}
 			case "TABLE_FUNCTION":
 				if fn, ok := v["function"].(map[string]any); ok {
 					if name, ok := fn["function_name"].(string); ok && strings.EqualFold(name, "pragma_show") {

@@ -534,6 +534,14 @@ func TestHiddenDescribe(t *testing.T) {
 		"INSERT INTO orders SELECT 1, 1 FROM meta":            false,
 		"SELECT * FROM (DESCRIBE orders)":                     true,
 		"SELECT * FROM (DESCRIBE orders), (SHOW logs.events)": true,
+		// Nested metadata queries are inspected separately: only the outer
+		// result occurs in this plan, so inner results cannot hide a view's.
+		"SELECT * FROM (SHOW SELECT * FROM (SHOW main.orders))":             true,
+		"SELECT * FROM (SHOW SELECT * FROM (SHOW orders))":                  true,
+		"SELECT * FROM (DESCRIBE SELECT * FROM (DESCRIBE orders))":          true,
+		"SELECT * FROM (SHOW SELECT * FROM (SHOW main.orders)), meta_show3": false,
+		"SELECT * FROM (SHOW SELECT * FROM (SHOW main.orders)), meta":       false,
+		"SELECT * FROM (DESCRIBE SELECT * FROM (DESCRIBE orders)), meta":    false,
 		// SHOW of a bare name runs as a pragma_show scan, not a CHUNK_GET.
 		"SELECT * FROM meta_show":                                                  false,
 		"SELECT * FROM meta_show3":                                                 false,
