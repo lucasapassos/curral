@@ -25,7 +25,7 @@ jobs:
     environment: release
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: check Docker Hub credentials
@@ -45,7 +45,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: build
@@ -60,7 +60,7 @@ jobs:
           cp README.md CHANGELOG.md LICENSE dist/$name/
           cp -r examples dist/$name/
           tar -C dist -czf dist/$name.tar.gz $name
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.arch }}
           path: dist/*.tar.gz
@@ -103,7 +103,7 @@ jobs:
           touch "digests/${DIGEST#sha256:}"
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: digest-${{ matrix.arch }}
           path: digests/*
@@ -113,7 +113,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: digest-*
           path: digests
@@ -137,7 +137,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: bin-*
           path: dist
