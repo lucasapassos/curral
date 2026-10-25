@@ -25,6 +25,9 @@ type Event struct {
 	TS                time.Time           `json:"ts"`
 	Event             string              `json:"event"` // query, schema, auth_failure, doc_create, doc_update, doc_delete, ...
 	RequestID         string              `json:"request_id"`
+	Actor             string              `json:"actor,omitempty"`
+	Identity          any                 `json:"identity,omitempty"`
+	Caller            any                 `json:"caller,omitempty"`
 	User              string              `json:"user"`
 	AuthMethod        string              `json:"auth_method,omitempty"` // basic, api_key, jwt
 	Roles             []string            `json:"roles,omitempty"`

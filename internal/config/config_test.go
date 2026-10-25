@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,6 +105,19 @@ func TestIdentities(t *testing.T) {
 	}
 	u, err := LoadUsers(writeFile(t, "identities: [{match: \"*@x.com\", roles: [analyst]}]"))
 	if err != nil || len(u.Identities) != 1 {
+		t.Fatalf("%+v %v", u, err)
+	}
+}
+
+func TestAPIKeyDelegation(t *testing.T) {
+	key := "api_keys: [{name: portal, key_sha256: " + strings.Repeat("a", 64) + ", delegation: true, attributes: %s}]"
+	for _, attrs := range []string{"{\"bad-name\": x}", "{tenant: \"a\\nb\"}", "{tenant: \"" + strings.Repeat("x", 257) + "\"}"} {
+		if _, err := LoadUsers(writeFile(t, fmt.Sprintf(key, attrs))); err == nil {
+			t.Errorf("%s: expected error", attrs)
+		}
+	}
+	u, err := LoadUsers(writeFile(t, fmt.Sprintf(key, "{tenant: tenant-a}")))
+	if err != nil || !u.APIKeys[0].Delegation || u.APIKeys[0].Attributes["tenant"] != "tenant-a" {
 		t.Fatalf("%+v %v", u, err)
 	}
 }

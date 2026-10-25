@@ -6,6 +6,7 @@ The endpoints curral exposes, their request and response formats, and the bundle
 
 | Endpoint | Auth | |
 |---|---|---|
+| `GET /v1/capabilities` | yes | the credential and its [delegation](delegation.md) contract |
 | `POST /v1/query` | yes | run a statement (or a dry run) |
 | `GET /v1/schema` | yes | tables, views and columns the caller may query |
 | `GET /v1/databases` | yes | attached databases |

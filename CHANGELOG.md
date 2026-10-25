@@ -6,6 +6,20 @@ notes are taken from its section here.
 ## [Unreleased]
 
 ### Added
+- Execution delegation: API keys with `delegation: true` query on behalf of
+  the identity they name in `X-Curral-Execution-Context`, over HTTP and
+  Flight SQL. The policy sees it as `input.identity` and the key as
+  `input.actor` (with the key's `attributes`); its own roles are never
+  used, requests are read-only and responses confirm the identity in
+  `X-Curral-Effective-Subject`. See `docs/delegation.md`.
+- `GET /v1/capabilities` describes the credential and the delegation
+  contract.
+- Policy row predicates (`--policy-row-filters-query`, default
+  `data.curral.row_filters`), ANDed with the `--row-filters` file, and the
+  `curral_identity` session variable for filters and masks.
+- Shared keys may send an audit-only `X-Curral-Caller-Context`; audit events
+  gain `actor`, `identity` and `caller`, and refused identities are recorded
+  as `delegation_denied`.
 - The agent skill keeps curral credentials out of the conversation:
   `scripts/curral.sh login`, run by the user in a terminal, asks for the
   URL and the password (not echoed) and saves them to

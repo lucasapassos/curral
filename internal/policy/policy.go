@@ -19,10 +19,11 @@ import (
 )
 
 type Policy struct {
-	query  rego.PreparedEvalQuery
-	limits *rego.PreparedEvalQuery // optional per-request limits
-	masks  *rego.PreparedEvalQuery // optional column masks
-	docs   *rego.PreparedEvalQuery // optional semantic document writes
+	query   rego.PreparedEvalQuery
+	limits  *rego.PreparedEvalQuery // optional per-request limits
+	masks   *rego.PreparedEvalQuery // optional column masks
+	filters *rego.PreparedEvalQuery // optional row predicates
+	docs    *rego.PreparedEvalQuery // optional semantic document writes
 	// SHA256 identifies the policy and data files loaded, so audit records
 	// show which version of the rules made each decision.
 	SHA256 string
@@ -41,10 +42,11 @@ func Load(ctx context.Context, query string, files []string, limitsQuery ...stri
 
 // Queries names the rules a policy is evaluated with.
 type Queries struct {
-	Allow  string // required decision, e.g. data.curral.allow
-	Limits string // optional, e.g. data.curral.limits
-	Masks  string // optional, e.g. data.curral.masks
-	Docs   string // optional, e.g. data.curral.docs_allow
+	Allow   string // required decision, e.g. data.curral.allow
+	Limits  string // optional, e.g. data.curral.limits
+	Masks   string // optional, e.g. data.curral.masks
+	Filters string // optional, e.g. data.curral.row_filters
+	Docs    string // optional, e.g. data.curral.docs_allow
 }
 
 // LoadQueries compiles the policy files once for every configured query.
@@ -78,6 +80,13 @@ func LoadQueries(ctx context.Context, files []string, q Queries) (*Policy, error
 			return nil, fmt.Errorf("policy masks: %w", err)
 		}
 		p.masks = &mq
+	}
+	if q.Filters != "" {
+		fq, err := prepare(q.Filters)
+		if err != nil {
+			return nil, fmt.Errorf("policy row filters: %w", err)
+		}
+		p.filters = &fq
 	}
 	if q.Docs != "" {
 		dq, err := prepare(q.Docs)
@@ -294,4 +303,36 @@ func allowed(ctx context.Context, q rego.PreparedEvalQuery, input map[string]any
 		return false, err
 	}
 	return rs.Allowed(), nil
+}
+
+// RowFilters evaluates table -> SQL predicate. Undefined means no additional
+// predicate; errors fail closed. Predicates are ANDed with file-based RLS.
+func (p *Policy) RowFilters(ctx context.Context, input map[string]any) (map[string]string, error) {
+	if p.filters == nil {
+		return nil, nil
+	}
+	v, err := ast.InterfaceToValue(input)
+	if err != nil {
+		return nil, err
+	}
+	rs, err := p.filters.Eval(ctx, rego.EvalParsedInput(v))
+	if err != nil {
+		return nil, err
+	}
+	if len(rs) == 0 || len(rs[0].Expressions) == 0 {
+		return nil, nil
+	}
+	tables, ok := rs[0].Expressions[0].Value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("row_filters must be an object")
+	}
+	out := map[string]string{}
+	for table, value := range tables {
+		predicate, ok := value.(string)
+		if len(strings.Split(table, ".")) != 3 || !ok || strings.TrimSpace(predicate) == "" {
+			return nil, fmt.Errorf("invalid row filter for %q", table)
+		}
+		out[table] = predicate
+	}
+	return out, nil
 }

@@ -140,6 +140,12 @@ what the user may query and run SQL under the same policy; see
 teaches an assistant to discover the schema, validate with `dry_run` and
 query within its permissions.
 
+## Trusted service delegation
+
+A trusted service can query on behalf of its own users: the policy, row
+filters and masks then apply to the effective identity it names, never to
+its API key. See [execution delegation](docs/delegation.md).
+
 ## Writing a policy
 
 The policy receives what the statement does and returns `allow`:

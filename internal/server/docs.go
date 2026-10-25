@@ -23,10 +23,10 @@ func (s *Server) docRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/docs", s.authed(s.listDocs))
 	mux.HandleFunc("GET /v1/docs/{id}", s.authed(s.getDoc))
 	mux.HandleFunc("POST /v1/docs/search", s.authed(s.searchDocs))
-	mux.HandleFunc("POST /v1/docs", s.authed(s.docWriter("create")))
-	mux.HandleFunc("PUT /v1/docs/{id}", s.authed(s.docWriter("update")))
-	mux.HandleFunc("PATCH /v1/docs/{id}", s.authed(s.docWriter("update")))
-	mux.HandleFunc("DELETE /v1/docs/{id}", s.authed(s.docWriter("delete")))
+	mux.HandleFunc("POST /v1/docs", s.authedOn(surfaceWrite, s.docWriter("create")))
+	mux.HandleFunc("PUT /v1/docs/{id}", s.authedOn(surfaceWrite, s.docWriter("update")))
+	mux.HandleFunc("PATCH /v1/docs/{id}", s.authedOn(surfaceWrite, s.docWriter("update")))
+	mux.HandleFunc("DELETE /v1/docs/{id}", s.authedOn(surfaceWrite, s.docWriter("delete")))
 }
 
 // docSummary is a document without its body and SQL, for ?fields=header.

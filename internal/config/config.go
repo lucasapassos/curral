@@ -123,6 +123,13 @@ type APIKey struct {
 	KeyHash string   `yaml:"key_sha256"`
 	Roles   []string `yaml:"roles"`
 	Expires string   `yaml:"expires"` // optional, RFC 3339 or YYYY-MM-DD
+	// Delegation makes the key a trusted service that must name the
+	// effective identity of every data request (X-Curral-Execution-Context).
+	// Its own roles are never used for those requests.
+	Delegation bool `yaml:"delegation"`
+	// Attributes describe the service to the policy (input.actor.attributes)
+	// and to the service itself (GET /v1/capabilities), e.g. its tenant.
+	Attributes map[string]string `yaml:"attributes"`
 }
 
 // ExpiresAt parses Expires; zero means no expiry.
@@ -295,6 +302,11 @@ func LoadUsers(path string) (*Users, error) {
 		}
 		if seen[k.Name] || keys[k.Name] {
 			return nil, fmt.Errorf("%s: duplicate name %q", path, k.Name)
+		}
+		for name, v := range k.Attributes {
+			if !identRe.MatchString(name) || len(name) > 64 || len(v) > 256 || strings.ContainsAny(v, "\r\n\x00") {
+				return nil, fmt.Errorf("%s: api key %q: invalid attribute %q", path, k.Name, name)
+			}
 		}
 		keys[k.Name] = true
 		if _, err := k.ExpiresAt(); err != nil {

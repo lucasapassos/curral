@@ -335,9 +335,11 @@ type Request struct {
 	// read protected tables; the statement is rewritten to apply them.
 	Protect *map[string]Protection
 	// User and Roles are exposed to filters and masks as the session
-	// variables curral_user and curral_roles (getvariable(...)).
-	User  string
-	Roles []string
+	// variables curral_user and curral_roles (getvariable(...)), and a
+	// delegated identity, as JSON, as curral_identity ('' otherwise).
+	User         string
+	Roles        []string
+	IdentityJSON string
 }
 
 // Description is what a statement takes and returns, read without running
@@ -590,7 +592,7 @@ func (e *Engine) Query(ctx context.Context, req Request,
 				return err
 			}
 			if needVars {
-				if err := setSessionVariables(ctx, c, req.User, req.Roles); err != nil {
+				if err := setSessionVariables(ctx, c, req.User, req.Roles, req.IdentityJSON); err != nil {
 					return err
 				}
 			}
@@ -732,7 +734,7 @@ func (e *Engine) expandRef(ctx context.Context, c *duckdb.Conn, name, database s
 // setSessionVariables exposes the caller to filters and masks. The
 // connection is new for this request, and users cannot run SET VARIABLE
 // themselves (one statement per request, and it would be the statement).
-func setSessionVariables(ctx context.Context, c *duckdb.Conn, user string, roles []string) error {
+func setSessionVariables(ctx context.Context, c *duckdb.Conn, user string, roles []string, identity string) error {
 	rl := make([]any, len(roles))
 	for i, r := range roles {
 		rl[i] = r
@@ -744,9 +746,9 @@ func setSessionVariables(ctx context.Context, c *duckdb.Conn, user string, roles
 	if len(roles) == 0 {
 		list = "[]::VARCHAR[]"
 	}
-	// One round trip; both statements are built here, not from user input.
+	// One round trip; the statements are built here, not from user input.
 	_, err = c.ExecContext(ctx, "SET VARIABLE curral_user = "+quoteString(user)+
-		"; SET VARIABLE curral_roles = "+list, nil)
+		"; SET VARIABLE curral_roles = "+list+"; SET VARIABLE curral_identity = "+quoteString(identity), nil)
 	return err
 }
 

@@ -35,6 +35,14 @@ The per-role data lives in `examples/roles.json`, passed as a second
 `--policy`. The decision rule is `data.curral.allow` by default
 (`--policy-query`).
 
+## Delegated identities and policy row filters
+
+When a trusted service queries on someone's behalf, `input.user` is the
+effective subject, `input.identity` the context the service sent and
+`input.actor` the service's key, with its `attributes`. The policy can also
+return `row_filters`, SQL predicates per table, in addition to masks; they are
+ANDed with the file-based filters. See [execution delegation](delegation.md).
+
 ## Per-role limits
 
 With `--policy-limits-query data.curral.limits`, once the policy allows the

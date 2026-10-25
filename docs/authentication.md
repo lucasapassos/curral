@@ -16,6 +16,11 @@ Three methods, chosen by the `Authorization` header:
 - **API keys**: `curral gen-api-key etl-job etl` prints the key **once**, along with
   the entry for the users file. The file stores only the key's SHA-256.
   `expires` is optional. Like users, API keys reload on `SIGHUP`.
+- **Delegation**: an API key with `delegation: true` belongs to a trusted
+  service that queries on behalf of its own users, naming each one in
+  `X-Curral-Execution-Context`. Its own roles are never used; the effective
+  identity gets the roles `identities:` maps to its subject. See
+  [Execution delegation](delegation.md).
 - **JWT**:
   - **Startup:** curral runs OIDC discovery and downloads the JWKS. If the provider is unreachable, startup fails.
   - **Keys:** the JWKS is refreshed in the background.
@@ -33,7 +38,8 @@ curral serve ... --oidc-issuer https://sso.example.com/realms/main --oidc-audien
 
 Some providers send no roles in the token (Google, for instance). The
 `identities` section of the users file assigns roles per user or per e-mail
-domain, and reloads on `SIGHUP`:
+domain, and reloads on `SIGHUP`. It also gives roles to the subjects a
+[delegating service](delegation.md) names:
 
 ```yaml
 identities:
