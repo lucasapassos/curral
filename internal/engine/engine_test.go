@@ -362,6 +362,11 @@ func TestExecTimeout(t *testing.T) {
 // the tables whose metadata they reveal come from the parse tree.
 func TestInspectDescribe(t *testing.T) {
 	e := newEngine(t, Options{})
+	for _, q := range []string{`CREATE TABLE "my table"(x INT)`, `CREATE TABLE "q""t"(x INT)`, `CREATE TABLE "a.b"(x INT)`} {
+		if _, _, err := run(e, Request{SQL: q}, allowAll); err != nil {
+			t.Fatal(q, err)
+		}
+	}
 	cases := []struct {
 		sql      string
 		tables   []string
@@ -378,6 +383,36 @@ func TestInspectDescribe(t *testing.T) {
 		{"SUMMARIZE orders", []string{"sales.main.orders"}, true},
 		{"SHOW TABLES", []string{}, false},
 		{"SHOW ALL TABLES", []string{}, false},
+		// SHOW of a name describes that table (DuckDB 2.0 parses it apart
+		// from DESCRIBE): bare names through pragma_show, qualified ones
+		// through an inner query.
+		{"SHOW main.salaries", []string{"sales.main.salaries"}, true},
+		{"SHOW sales.salaries", []string{"sales.main.salaries"}, true},
+		{"SHOW sales.main.salaries", []string{"sales.main.salaries"}, true},
+		{"show sales.crm.clients", []string{"sales.crm.clients"}, true},
+		{"SHOW logs.events", []string{"logs.main.events"}, true},
+		{"SHOW big_orders", []string{"sales.main.orders"}, true},
+		{`SHOW "salaries"`, []string{"sales.main.salaries"}, true},
+		{`SHOW "sales"."main"."salaries"`, []string{"sales.main.salaries"}, true},
+		{`SHOW "my table"`, []string{`sales.main."my table"`}, true},
+		{`SHOW sales.main."q""t"`, []string{`sales.main."q""t"`}, true},
+		{"SHOW SELECT name FROM salaries", []string{"sales.main.salaries"}, true},
+		{"SELECT * FROM (SHOW salaries) WHERE column_name = 'value'", []string{"sales.main.salaries"}, true},
+		{"SELECT * FROM orders JOIN (SHOW logs.events) ON true", []string{"logs.main.events", "sales.main.orders"}, true},
+		{"SELECT * FROM (SHOW orders), (SHOW crm.clients)", []string{"sales.crm.clients", "sales.main.orders"}, true},
+		// A bare name DuckDB would parse again (dots, quotes), a catalog
+		// listing or a setting: unresolved.
+		{`SHOW "a.b"`, []string{}, false},
+		{`SHOW "tables"`, []string{}, false},
+		{`SHOW """tables"""`, []string{}, false},
+		{"SHOW __show_tables_expanded", []string{}, false},
+		{"SHOW DATABASES", []string{}, false},
+		{"SHOW TABLES FROM sales", []string{}, false},
+		{"SHOW threads", []string{}, false},
+		// A name that does not bind is asked about as DESCRIBE of it is.
+		{"SHOW nosuch", []string{"sales.main.nosuch"}, true},
+		{"DESCRIBE nosuch", []string{"sales.main.nosuch"}, true},
+		{"SELECT * FROM orders, (SHOW DATABASES)", []string{"sales.main.orders"}, false},
 		{"SELECT id FROM orders ORDER BY id DESC", []string{"sales.main.orders"}, true},
 		{"EXPLAIN DESCRIBE salaries", []string{"sales.main.salaries"}, true},
 		// Writes that would store DESCRIBE output: DuckDB cannot serialize
@@ -398,6 +433,10 @@ func TestInspectDescribe(t *testing.T) {
 		}
 		if !slices.Equal(nonNil(insp.Tables), c.tables) || insp.Resolved != c.resolved {
 			t.Errorf("%s: tables=%v resolved=%v, want %v %v", c.sql, insp.Tables, insp.Resolved, c.tables, c.resolved)
+		}
+		// The pragma_show scan behind SHOW is not a function the caller chose.
+		if slices.Contains(insp.Functions, "pragma_show") {
+			t.Errorf("%s: functions=%v", c.sql, insp.Functions)
 		}
 	}
 }
@@ -480,6 +519,9 @@ func TestHiddenDescribe(t *testing.T) {
 	for _, q := range []string{
 		"CREATE VIEW meta AS SELECT * FROM (DESCRIBE salaries)",
 		"CREATE MACRO m() AS TABLE SELECT * FROM (DESCRIBE salaries)",
+		"CREATE VIEW meta_show AS SELECT * FROM (SHOW salaries)",
+		"CREATE VIEW meta_show3 AS SELECT * FROM (SHOW sales.main.salaries)",
+		"CREATE MACRO m_show() AS TABLE SELECT * FROM (SHOW salaries)",
 	} {
 		if _, _, err := run(e, Request{SQL: q}, allowAll); err != nil {
 			t.Fatal(q, err)
@@ -492,10 +534,38 @@ func TestHiddenDescribe(t *testing.T) {
 		"INSERT INTO orders SELECT 1, 1 FROM meta":            false,
 		"SELECT * FROM (DESCRIBE orders)":                     true,
 		"SELECT * FROM (DESCRIBE orders), (SHOW logs.events)": true,
+		// Nested metadata queries are inspected separately: only the outer
+		// result occurs in this plan, so inner results cannot hide a view's.
+		"SELECT * FROM (SHOW SELECT * FROM (SHOW main.orders))":             true,
+		"SELECT * FROM (SHOW SELECT * FROM (SHOW orders))":                  true,
+		"SELECT * FROM (DESCRIBE SELECT * FROM (DESCRIBE orders))":          true,
+		"SELECT * FROM (SHOW SELECT * FROM (SHOW main.orders)), meta_show3": false,
+		"SELECT * FROM (SHOW SELECT * FROM (SHOW main.orders)), meta":       false,
+		"SELECT * FROM (DESCRIBE SELECT * FROM (DESCRIBE orders)), meta":    false,
+		// SHOW of a bare name runs as a pragma_show scan, not a CHUNK_GET.
+		"SELECT * FROM meta_show":                                                  false,
+		"SELECT * FROM meta_show3":                                                 false,
+		"SELECT * FROM m_show()":                                                   false,
+		"SELECT * FROM (SHOW orders), meta_show":                                   false,
+		"SELECT * FROM pragma_show('orders'), meta_show":                           false,
+		"SELECT * FROM (SHOW orders), (SHOW salaries)":                             true,
+		"SELECT * FROM (SHOW orders) JOIN (SELECT * FROM (SHOW salaries)) ON true": true,
+		// A direct call stays in functions, for the allowlist to decide.
+		"SELECT * FROM pragma_show('orders'), (SHOW salaries)": false,
+		// A SHOW or DESCRIBE DuckDB never plans (an unused CTE) cannot stand
+		// in for a scan of another table.
+		"WITH x AS (SELECT * FROM (SHOW orders)) SELECT * FROM pragma_show('salaries')": false,
+		"WITH x AS (SELECT * FROM (SHOW orders)) SELECT * FROM meta_show":               false,
+		"WITH x AS (DESCRIBE orders) SELECT * FROM meta":                                false,
+		"WITH x AS (SHOW orders) SELECT * FROM x":                                       false,
 	} {
 		insp, _, err := run(e, Request{SQL: q}, func(context.Context, Inspection) error { return ErrForbidden })
 		if !errors.Is(err, ErrForbidden) || insp.Resolved != resolved {
 			t.Errorf("%s: resolved=%v err=%v, want resolved=%v", q, insp.Resolved, err, resolved)
+		}
+		// A pragma_show written by the caller is never taken off the list.
+		if strings.Contains(q, "pragma_show(") && !slices.Contains(insp.Functions, "pragma_show") {
+			t.Errorf("%s: functions=%v", q, insp.Functions)
 		}
 	}
 }

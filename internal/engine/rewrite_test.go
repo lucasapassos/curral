@@ -79,6 +79,11 @@ func TestProtectRefusals(t *testing.T) {
 		"CREATE TABLE crm.copy AS SELECT * FROM orders": "only be read with SELECT",
 		"SELECT * FROM orders TABLESAMPLE 50%":          "TABLESAMPLE",
 		"EXPLAIN SELECT * FROM orders":                  "only be read with SELECT",
+		// Metadata reads the rewrite cannot reach are refused alike.
+		"DESCRIBE orders":             "indirectly",
+		"SHOW orders":                 "indirectly",
+		"SHOW sales.main.orders":      "indirectly",
+		"SELECT * FROM (SHOW orders)": "indirectly",
 	} {
 		_, err := runProtected(e, sql, nil)
 		if !errors.Is(err, ErrForbidden) || !strings.Contains(err.Error(), want) {

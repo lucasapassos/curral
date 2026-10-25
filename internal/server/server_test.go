@@ -1022,6 +1022,9 @@ masks := {"sales.main.salaries": {"value": "null"}} if not "admin" in input.role
 // through DuckDB's "did you mean" suggestions.
 func TestNoMetadataLeaks(t *testing.T) {
 	ts := newServer(t)
+	if r := do(t, ts, "admin", `{"sql":"CREATE VIEW hidden_meta AS SELECT * FROM (SHOW sales.main.salaries)"}`); r.status != 200 {
+		t.Fatalf("create metadata view: %d %s", r.status, r.body)
+	}
 	for _, c := range []struct {
 		sql    string
 		status int
@@ -1029,9 +1032,20 @@ func TestNoMetadataLeaks(t *testing.T) {
 		{`{"sql":"DESCRIBE salaries"}`, 403},
 		{`{"sql":"SELECT * FROM (DESCRIBE salaries)"}`, 403},
 		{`{"sql":"SHOW salaries"}`, 403},
+		{`{"sql":"SHOW sales.main.salaries"}`, 403},
+		{`{"sql":"SHOW \"salaries\""}`, 403},
+		{`{"sql":"SELECT * FROM orders, (SHOW salaries)"}`, 403},
 		{`{"sql":"DESCRIBE SELECT value FROM salaries"}`, 403},
 		{`{"sql":"SHOW TABLES"}`, 403},
+		{`{"sql":"SHOW \"\"\"tables\"\"\""}`, 403},
+		{`{"sql":"SHOW threads"}`, 403},
 		{`{"sql":"DESCRIBE orders"}`, 200},
+		{`{"sql":"SHOW orders"}`, 200},
+		{`{"sql":"SHOW sales.main.orders"}`, 200},
+		{`{"sql":"SELECT * FROM (SHOW SELECT * FROM (SHOW main.orders))"}`, 200},
+		{`{"sql":"SELECT * FROM (SHOW SELECT * FROM (SHOW orders))"}`, 200},
+		{`{"sql":"SELECT * FROM (SHOW SELECT * FROM (SHOW main.orders)), hidden_meta"}`, 403},
+		{`{"sql":"SELECT * FROM (DESCRIBE SELECT * FROM (DESCRIBE orders)), hidden_meta"}`, 403},
 	} {
 		if r := do(t, ts, "analyst", c.sql); r.status != c.status {
 			t.Errorf("%s: %d %s", c.sql, r.status, r.body)

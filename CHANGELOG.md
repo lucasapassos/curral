@@ -19,6 +19,17 @@ notes are taken from its section here.
   `curral_identity` session variable for filters and masks.
 
 ### Changed
+- DuckDB 2.0.0 (was 1.5.6). Database files DuckDB 2.0 creates (a catalog
+  path that does not exist yet, files seeded with DuckDB 2.0) use storage
+  format v2.0.0+, which older curral releases (DuckDB 1.x) cannot open, so
+  there is no going back to an older release with them; back them up
+  first. Existing 1.x files keep their storage version when written.
+- `SHOW <table>` goes through the policy as a read of that table under
+  DuckDB 2.0's parser too. `SHOW` of a name that DuckDB would read as a
+  setting, or that it parses again (dots or quotes inside one quoted
+  identifier), is unresolved; qualify the table or use `DESCRIBE`. So are
+  `SHOW`/`DESCRIBE` inside a `WITH` clause, and a bare `SHOW` next to a
+  direct `pragma_show(...)` call.
 - Row filters (file and policy) and `{"sql": ...}` masks must each be a
   single SQL expression; a filter that could escape its parentheses, or
   holds `;`, comments or dollar quotes, is refused.
@@ -39,6 +50,8 @@ notes are taken from its section here.
   stores the secret in `%APPDATA%\curral\credentials` encrypted with DPAPI.
 
 ### Fixed
+- Nested `SHOW`/`DESCRIBE` results cannot hide metadata reads of unauthorized
+  tables through views or macros when matching the statement to its plan.
 - `scripts/curral.sh` broke Basic auth when the user or password contained
   `"`.
 

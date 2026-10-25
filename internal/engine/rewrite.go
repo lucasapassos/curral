@@ -159,18 +159,20 @@ func (e *Engine) buildRewrite(ctx context.Context, c *duckdb.Conn, query, databa
 					}
 				}
 			}
-			if v["type"] == "BASE_TABLE" {
-				cat, _ := v["catalog_name"].(string)
-				sch, _ := v["schema_name"].(string)
-				name, _ := v["table_name"].(string)
-				if cat == "" && sch == "" && contains(ctes, strings.ToLower(name)) {
-					return v // a CTE, not a table
-				}
-				var parts []string
-				for _, p := range []string{cat, sch, name} {
-					if p != "" {
-						parts = append(parts, p)
+			// SHOW of a bare name describes the table without a reference
+			// the rewrite can replace (nor a scan in the plan): counting it
+			// refuses the statement, as DESCRIBE of the table is refused.
+			if _, ok := v["query"].(map[string]any); v["type"] == "SHOW_REF" && !ok {
+				if name, ok := showName(v); ok {
+					if table, ok := byKey[strings.ToLower(e.qualify([]string{name}, database))]; ok {
+						refs[table]++
 					}
+				}
+			}
+			if v["type"] == "BASE_TABLE" {
+				parts := tableParts(v)
+				if len(parts) == 1 && contains(ctes, strings.ToLower(parts[0])) {
+					return v // a CTE, not a table
 				}
 				qualified := e.qualify(parts, database)
 				if e.IsRemote(qualified) {
@@ -413,7 +415,7 @@ func stripLocations(n any) any {
 	case map[string]any:
 		out := make(map[string]any, len(v))
 		for k, x := range v {
-			if k != "query_location" {
+			if k != "query_location" && k != "query_location_length" {
 				out[k] = stripLocations(x)
 			}
 		}
