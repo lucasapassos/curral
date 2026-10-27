@@ -295,8 +295,9 @@ func TestDocsScopeSchema(t *testing.T) {
 	lastServer.SetPolicy(pol)
 
 	ids := map[string]string{}
-	for name, tables := range map[string]string{"orders": `["sales.main.orders"]`, "salaries": `["salaries"]`, "general": `[]`} {
-		r := docReq(t, ts, "POST", "poet", "/v1/docs", `{"header":{"title":"`+name+` notes"},"context":{"tables":`+tables+`,"body":"about `+name+`"}}`)
+	for name, context := range map[string]string{"orders": `"tables":["sales.main.orders"]`, "salaries": `"tables":["salaries"]`, "general": `"tables":[]`,
+		"sales schema": `"schemas":["sales.main"]`, "hr schema": `"schemas":["hr.main"]`} {
+		r := docReq(t, ts, "POST", "poet", "/v1/docs", `{"header":{"title":"`+name+` notes"},"context":{`+context+`,"body":"about `+name+`"}}`)
 		if r.status != 201 {
 			t.Fatalf("create %s: %d %s", name, r.status, r.body)
 		}
@@ -319,8 +320,10 @@ func TestDocsScopeSchema(t *testing.T) {
 		}
 		return ts
 	}
-	// The analyst reads orders, not salaries.
-	if r := docReq(t, ts, "GET", "analyst", "/v1/docs", ""); r.status != 200 || len(titles(r)) != 2 || slices.Contains(titles(r), "salaries notes") {
+	// The analyst reads orders (so the sales schema), not salaries; nobody
+	// here reads an hr schema, so that document is served to no one.
+	if r := docReq(t, ts, "GET", "analyst", "/v1/docs", ""); r.status != 200 || len(titles(r)) != 3 ||
+		slices.Contains(titles(r), "salaries notes") || slices.Contains(titles(r), "hr schema notes") {
 		t.Fatalf("analyst list: %d %v", r.status, titles(r))
 	}
 	if r := docReq(t, ts, "GET", "analyst", "/v1/docs/"+ids["salaries"], ""); r.status != 404 {
@@ -332,8 +335,8 @@ func TestDocsScopeSchema(t *testing.T) {
 	if r := docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"salaries notes"}`); r.status != 200 || slices.Contains(titles(r), "salaries notes") {
 		t.Fatalf("analyst search: %d %v", r.status, titles(r))
 	}
-	// The admin reads everything.
-	if r := docReq(t, ts, "GET", "admin", "/v1/docs", ""); r.status != 200 || len(titles(r)) != 3 {
+	// The admin reads everything about existing tables.
+	if r := docReq(t, ts, "GET", "admin", "/v1/docs", ""); r.status != 200 || len(titles(r)) != 4 || slices.Contains(titles(r), "hr schema notes") {
 		t.Fatalf("admin list: %d %v", r.status, titles(r))
 	}
 	if r := docReq(t, ts, "POST", "admin", "/v1/docs/search", `{"q":"salaries notes"}`); r.status != 200 || !slices.Contains(titles(r), "salaries notes") {
@@ -341,7 +344,7 @@ func TestDocsScopeSchema(t *testing.T) {
 	}
 	// Scope all: the analyst reads everything again.
 	lastServer.DocsScope = DocsScopeAll
-	if r := docReq(t, ts, "GET", "analyst", "/v1/docs", ""); r.status != 200 || len(titles(r)) != 3 {
+	if r := docReq(t, ts, "GET", "analyst", "/v1/docs", ""); r.status != 200 || len(titles(r)) != 5 {
 		t.Fatalf("analyst list, scope all: %d %v", r.status, titles(r))
 	}
 }
