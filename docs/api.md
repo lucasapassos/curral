@@ -121,6 +121,12 @@ people) to read before writing queries. Each one is a JSON file,
   parts, so `orders` finds `sales.main.orders`) and `?q=` (text in title,
   description or `used_for`) narrow it, all case-insensitive.
   `?fields=header` leaves out `body` and `sqls`.
+- **Scope:** with `--docs-scope schema`, a document that names `tables` is
+  served (listed, fetched, searched) only to a caller who may query at least
+  one of them, decided as for `/v1/schema` and audited as a `docs_scope`
+  event; an out-of-scope id answers 404. Documents naming no table reach
+  everyone. The default, `all`, serves every document to every authenticated
+  user. `GET /v1/capabilities` reports the mode in `docs.scope`.
 - **Searching:** `POST /v1/docs/search` returns the documents that best fit a
   question; see [below](#searching-documents).
 - **Writing:** `POST /v1/docs` creates (201, `Location` and `ETag`), `PUT
@@ -128,6 +134,8 @@ people) to read before writing queries. Each one is a JSON file,
   merge patch](https://www.rfc-editor.org/rfc/rfc7396) (`null` removes a
   field) and `DELETE /v1/docs/{id}` removes it (204). Who may write is decided
   by the policy; see [Authorization](authorization.md#semantic-documents).
+  A delegating key writes only when marked `docs_write`, and then as the
+  identity it names; see [delegation](delegation.md#semantic-documents).
 - **Concurrent edits:** `GET` returns an `ETag`; send it back in `If-Match` on
   `PUT`, `PATCH` or `DELETE` and the write fails with 412 if someone else
   changed the document in between.

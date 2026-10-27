@@ -49,7 +49,7 @@ type searchResponse struct {
 	Results        []searchHit `json:"results"`
 }
 
-func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, _ *auth.Principal) {
+func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
 	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.MaxBody))
 	if err != nil {
 		status := http.StatusBadRequest
@@ -87,7 +87,12 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, _ *auth.Prin
 		}
 		return d
 	}
-	f := docs.Filter{Table: in.Table, Schema: in.Schema}
+	allow, status, msg := s.docScope(r, p)
+	if status != http.StatusOK {
+		writeScopeError(w, status, msg)
+		return
+	}
+	f := docs.Filter{Table: in.Table, Schema: in.Schema, Allow: allow}
 
 	if s.Judge == nil {
 		out := searchResponse{Ranker: "bm25", Results: []searchHit{}}

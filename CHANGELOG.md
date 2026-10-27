@@ -5,6 +5,21 @@ notes are taken from its section here.
 
 ## [Unreleased]
 
+### Added
+- `--docs-scope schema`: a semantic document that names tables is served
+  only to callers who may query at least one of them (listed, fetched and
+  searched as for `/v1/schema`, audited as `docs_scope`); documents naming
+  no table reach everyone. The default `all` keeps serving every document
+  to every authenticated user.
+- `GET /v1/capabilities` reports `docs` (`enabled`, `scope`,
+  `delegated_writes`), so a client knows whether `/v1/docs` is served
+  without probing it.
+- Delegated document writes: a delegating key with `docs_write: true`
+  creates, updates and deletes semantic documents on behalf of the identity
+  it names. The docs decision then sees `input.identity` and `input.actor`
+  and the document's author is the identity. Without the flag, delegated
+  requests keep refusing writes.
+
 ## [v0.7.0] - 2026-10-25
 
 ### Added

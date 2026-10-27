@@ -24,7 +24,9 @@ api_keys:
   Without one, or with one Curral refuses, the request is denied: it never
   falls back to the key's own roles.
 - Delegated requests are read-only (`SELECT`) even if a policy mistakenly
-  allows writes, and they can never write semantic documents.
+  allows writes. Semantic documents are read as the identity; writing them
+  on its behalf needs `docs_write: true` on the key (see
+  [below](#semantic-documents)).
 - `attributes` reach the policy as `input.actor.attributes` and the service
   as `GET /v1/capabilities`. Use them to scope what each key may assert, for
   instance a tenant. Keys must be identifiers; values are strings of at most
@@ -35,11 +37,14 @@ no data access and returns:
 
 ```json
 {"execution_context_version": 1, "delegation_required": true, "subject": "portal",
- "attributes": {"tenant": "tenant-a"}, "formats": ["json","csv","ndjson","arrow"], "version": "..."}
+ "attributes": {"tenant": "tenant-a"}, "formats": ["json","csv","ndjson","arrow"],
+ "docs": {"enabled": true, "scope": "schema", "delegated_writes": false}, "version": "..."}
 ```
 
 A client should check it before sending identities and refuse servers that do
-not advertise the version it implements.
+not advertise the version it implements. `docs` says whether `/v1/docs` is
+served, under which `--docs-scope`, and whether this key may write documents
+on behalf of its identities (`delegated_writes`).
 
 ## The execution context
 
@@ -72,9 +77,39 @@ should check it.
 
 Delegation applies to `/v1/query` (dry runs included), `/v1/schema`,
 `/v1/databases`, document reads (`GET /v1/docs`, `GET /v1/docs/{id}`,
-`POST /v1/docs/search`) and Flight SQL. A Flight handshake with a delegating
-key returns the same key, never a session token: send the identity with every
-call.
+`POST /v1/docs/search`), document writes with `docs_write` and Flight SQL. A
+Flight handshake with a delegating key returns the same key, never a session
+token: send the identity with every call.
+
+## Semantic documents
+
+A delegated identity reads documents like any user, and with
+`--docs-scope schema` only those about tables it may query. Writes
+(`POST`, `PUT`, `PATCH`, `DELETE /v1/docs`) are refused for a delegating key
+unless its entry has `docs_write: true`:
+
+```yaml
+api_keys:
+  - name: portal
+    key_sha256: <generated-sha256>
+    delegation: true
+    docs_write: true
+```
+
+The write then runs as the effective identity: the docs decision
+(`--policy-docs-query`) receives `input.user` (the subject), `input.roles`
+(from `identities:`), `input.identity` and `input.actor`, next to the usual
+`action`, `doc` and `current`; the document's `author` is the subject. The
+key itself still cannot write, with or without the flag. Tie the rule to the
+actor, as for queries:
+
+```rego
+docs_allow if {
+  input.actor.name == "portal"
+  input.identity.kind == "user"
+  "poet" in input.roles
+}
+```
 
 ## Policy
 

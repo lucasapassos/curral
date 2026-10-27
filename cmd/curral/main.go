@@ -113,6 +113,7 @@ type serveFlags struct {
 	filtersQuery   string
 	docsQuery      string
 	docsDir        string
+	docsScope      string
 	jevKey         string
 	jevThreshold   float64
 	jevFloor       float64
@@ -169,6 +170,7 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.StringVar(&f.masksQuery, "policy-masks-query", "", "optional Rego rule with column masks per table, e.g. data.curral.masks")
 	fs.StringVar(&f.docsDir, "docs-dir", "", "directory of semantic documents served at /v1/docs, one JSON file each; empty disables. Reloaded on SIGHUP")
 	fs.StringVar(&f.docsQuery, "policy-docs-query", "data.curral.docs_allow", "Rego decision allowing writes to /v1/docs (undefined = deny); used with --docs-dir")
+	fs.StringVar(&f.docsScope, "docs-scope", server.DocsScopeAll, "who reads which documents: all (every authenticated user reads every document) or schema (a document about tables is served only to callers who may query one of them, as in /v1/schema)")
 	fs.StringVar(&f.jevKey, "jev-key", "", "TypeSafe API key: /v1/docs/search asks Jev which documents fit the question (sends their content to TypeSafe); empty ranks by BM25 alone. Prefer CURRAL_JEV_KEY")
 	fs.Float64Var(&f.jevThreshold, "jev-threshold", rerank.DefaultThreshold, "minimum Jev probability (0-1) for a document to match a search")
 	fs.Float64Var(&f.jevFloor, "jev-floor", rerank.DefaultFloor, "when no document reaches --jev-threshold, return those at or above this as weak matches (below_threshold); 0 returns the best whatever their probability")
@@ -234,6 +236,9 @@ func parseFlags(args []string) (*serveFlags, error) {
 	}
 	if (f.tlsCert == "") != (f.tlsKey == "") {
 		return nil, fmt.Errorf("--tls-cert and --tls-key go together")
+	}
+	if !server.ValidDocsScope(f.docsScope) {
+		return nil, fmt.Errorf("--docs-scope must be %s or %s", server.DocsScopeAll, server.DocsScopeSchema)
 	}
 	if f.jevThreshold <= 0 || f.jevThreshold > 1 {
 		return nil, fmt.Errorf("--jev-threshold must be above 0 and at most 1")
@@ -438,7 +443,8 @@ func runServe(args []string, checkOnly bool) error {
 		if srv.Docs, err = docs.Open(f.docsDir); err != nil {
 			return err
 		}
-		log.Info("semantic documents enabled", "dir", f.docsDir, "docs", srv.Docs.Len(), "policy_query", f.docsQuery)
+		srv.DocsScope = f.docsScope
+		log.Info("semantic documents enabled", "dir", f.docsDir, "docs", srv.Docs.Len(), "policy_query", f.docsQuery, "scope", f.docsScope)
 		srv.SearchThreshold, srv.SearchFloor, srv.SearchShortlist = f.jevThreshold, f.jevFloor, f.shortlist
 		if f.jevKey != "" {
 			srv.Judge = &rerank.Jev{Key: f.jevKey, Timeout: f.jevTimeout}

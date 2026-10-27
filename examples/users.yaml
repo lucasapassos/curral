@@ -23,6 +23,12 @@ api_keys:
     key_sha256: "49e4c3b903ad51d4840cd5a065be4d2c0e967f0ff088fcd1ac9769369d5d01d9"
     roles: [etl]
     # expires: 2027-12-31
+  # A trusted service querying on behalf of its users (docs/delegation.md):
+  # - name: portal
+  #   key_sha256: "<sha256>"
+  #   delegation: true
+  #   docs_write: true      # may also write /v1/docs as the identity it names
+  #   attributes: { tenant: tenant-a }
 
 # Roles for OIDC users (e.g. Google, whose tokens carry no roles), matched on
 # --oidc-user-claim: an exact value or a whole e-mail domain. Added to any

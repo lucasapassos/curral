@@ -160,7 +160,26 @@ func (d Doc) Matches(f Filter) bool {
 			return false
 		}
 	}
+	if f.Allow != nil && !f.Allow(d) {
+		return false
+	}
 	return true
+}
+
+// Readable reports whether d may be shown to someone who can read the
+// fully qualified tables in visible: a document that names tables must
+// name at least one of them; a document about no table in particular is
+// always readable.
+func (d Doc) Readable(visible []string) bool {
+	if len(d.Context.Tables) == 0 {
+		return true
+	}
+	for _, t := range d.Context.Tables {
+		if nameIn(t, visible) {
+			return true
+		}
+	}
+	return false
 }
 
 // nameIn matches a name exactly or as the last parts of a qualified one, so
@@ -181,4 +200,7 @@ type Filter struct {
 	Table  string // a table the document is about
 	Schema string // a schema the document is about
 	Q      string // substring of title, description or used_for
+	// Allow, when set, is an extra condition every document must pass
+	// (used to scope documents to the tables a caller may read).
+	Allow func(Doc) bool
 }

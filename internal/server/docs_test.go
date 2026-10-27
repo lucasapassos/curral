@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -273,5 +274,74 @@ other_tables if { some t in input.current.tables; not startswith(t, "sales.") }
 	}
 	if r := docReq(t, ts, "DELETE", "poet", "/v1/docs/"+id(own), ""); r.status != 204 {
 		t.Errorf("delete in scope: %d %s", r.status, r.body)
+	}
+}
+
+// With --docs-scope schema, a document about tables is served only to a
+// caller who may read one of them; documents about no table reach everyone,
+// and an out-of-scope id reads as missing.
+func TestDocsScopeSchema(t *testing.T) {
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := newServerWithAudit(t, "", func(s *Server) { s.Docs, s.DocsScope = store, DocsScopeSchema })
+	pol, err := policy.LoadQueries(context.Background(),
+		[]string{"../../examples/policy.rego", "../../examples/roles.json"},
+		policy.Queries{Allow: "data.curral.allow", Docs: "data.curral.docs_allow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastServer.SetPolicy(pol)
+
+	ids := map[string]string{}
+	for name, tables := range map[string]string{"orders": `["sales.main.orders"]`, "salaries": `["salaries"]`, "general": `[]`} {
+		r := docReq(t, ts, "POST", "poet", "/v1/docs", `{"header":{"title":"`+name+` notes"},"context":{"tables":`+tables+`,"body":"about `+name+`"}}`)
+		if r.status != 201 {
+			t.Fatalf("create %s: %d %s", name, r.status, r.body)
+		}
+		var d docs.Doc
+		json.Unmarshal([]byte(r.body), &d)
+		ids[name] = d.ID
+	}
+	titles := func(r result) []string {
+		var out struct {
+			Docs    []docs.Doc
+			Results []struct{ Doc docs.Doc }
+		}
+		json.Unmarshal([]byte(r.body), &out)
+		var ts []string
+		for _, d := range out.Docs {
+			ts = append(ts, d.Header.Title)
+		}
+		for _, h := range out.Results {
+			ts = append(ts, h.Doc.Header.Title)
+		}
+		return ts
+	}
+	// The analyst reads orders, not salaries.
+	if r := docReq(t, ts, "GET", "analyst", "/v1/docs", ""); r.status != 200 || len(titles(r)) != 2 || slices.Contains(titles(r), "salaries notes") {
+		t.Fatalf("analyst list: %d %v", r.status, titles(r))
+	}
+	if r := docReq(t, ts, "GET", "analyst", "/v1/docs/"+ids["salaries"], ""); r.status != 404 {
+		t.Fatalf("analyst get out of scope: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "GET", "analyst", "/v1/docs/"+ids["general"], ""); r.status != 200 {
+		t.Fatalf("analyst get general: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"salaries notes"}`); r.status != 200 || slices.Contains(titles(r), "salaries notes") {
+		t.Fatalf("analyst search: %d %v", r.status, titles(r))
+	}
+	// The admin reads everything.
+	if r := docReq(t, ts, "GET", "admin", "/v1/docs", ""); r.status != 200 || len(titles(r)) != 3 {
+		t.Fatalf("admin list: %d %v", r.status, titles(r))
+	}
+	if r := docReq(t, ts, "POST", "admin", "/v1/docs/search", `{"q":"salaries notes"}`); r.status != 200 || !slices.Contains(titles(r), "salaries notes") {
+		t.Fatalf("admin search: %d %v", r.status, titles(r))
+	}
+	// Scope all: the analyst reads everything again.
+	lastServer.DocsScope = DocsScopeAll
+	if r := docReq(t, ts, "GET", "analyst", "/v1/docs", ""); r.status != 200 || len(titles(r)) != 3 {
+		t.Fatalf("analyst list, scope all: %d %v", r.status, titles(r))
 	}
 }

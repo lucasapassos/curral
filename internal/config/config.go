@@ -130,6 +130,10 @@ type APIKey struct {
 	// Attributes describe the service to the policy (input.actor.attributes)
 	// and to the service itself (GET /v1/capabilities), e.g. its tenant.
 	Attributes map[string]string `yaml:"attributes"`
+	// DocsWrite lets a delegating key create, update and delete semantic
+	// documents on behalf of the identity it names, when the docs policy
+	// allows that identity. Without it, delegated requests never write.
+	DocsWrite bool `yaml:"docs_write"`
 }
 
 // ExpiresAt parses Expires; zero means no expiry.

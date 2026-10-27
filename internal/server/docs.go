@@ -9,15 +9,53 @@ import (
 	"github.com/lucasapassos/curral/internal/audit"
 	"github.com/lucasapassos/curral/internal/auth"
 	"github.com/lucasapassos/curral/internal/docs"
+	"github.com/lucasapassos/curral/internal/engine"
 )
 
-// Semantic documents: every authenticated user reads them; the policy's
-// docs decision says who creates, updates and deletes them.
+// Semantic documents: every authenticated user reads them (all of them, or
+// with --docs-scope schema only those about tables they may query); the
+// policy's docs decision says who creates, updates and deletes them.
 
 var (
 	errDocDenied = errors.New("not allowed to write semantic documents")
 	errDocPolicy = errors.New("policy evaluation failed")
 )
+
+// Values of --docs-scope.
+const (
+	DocsScopeAll    = "all"    // every authenticated user reads every document
+	DocsScopeSchema = "schema" // documents about tables need a readable table
+)
+
+// ValidDocsScope reports whether v is a --docs-scope value.
+func ValidDocsScope(v string) bool { return v == DocsScopeAll || v == DocsScopeSchema }
+
+// docScope returns the condition documents must pass to be shown to p.
+// Under DocsScopeAll everything passes. Under DocsScopeSchema the tables p
+// may read are listed as for /v1/schema (same policy, same audit event,
+// kind "docs_scope"), and a document naming tables must name one of them.
+// A status other than 200 comes with the message the client may see.
+func (s *Server) docScope(r *http.Request, p *auth.Principal) (func(docs.Doc) bool, int, string) {
+	if s.DocsScope != DocsScopeSchema {
+		return nil, http.StatusOK, ""
+	}
+	tables, status, msg := s.listSchema(r.Context(), p, s.newEvent(r, "docs_scope", p), engine.SchemaFilter{}, nil)
+	if status != http.StatusOK {
+		return nil, status, msg
+	}
+	visible := make([]string, len(tables))
+	for i, t := range tables {
+		visible[i] = t.Qualified()
+	}
+	return func(d docs.Doc) bool { return d.Readable(visible) }, http.StatusOK, ""
+}
+
+func writeScopeError(w http.ResponseWriter, status int, msg string) {
+	if status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests {
+		w.Header().Set("Retry-After", "1")
+	}
+	writeError(w, status, msg)
+}
 
 func (s *Server) docRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/docs", s.authed(s.listDocs))
@@ -47,9 +85,14 @@ func summary(d docs.Doc) docSummary {
 
 // listDocs lists documents, most recently updated first. ?table=, ?schema=
 // and ?q= narrow the list; ?fields=header leaves out bodies and SQL.
-func (s *Server) listDocs(w http.ResponseWriter, r *http.Request, _ *auth.Principal) {
+func (s *Server) listDocs(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
 	q := r.URL.Query()
-	list := s.Docs.List(docs.Filter{Table: q.Get("table"), Schema: q.Get("schema"), Q: q.Get("q")})
+	allow, status, msg := s.docScope(r, p)
+	if status != http.StatusOK {
+		writeScopeError(w, status, msg)
+		return
+	}
+	list := s.Docs.List(docs.Filter{Table: q.Get("table"), Schema: q.Get("schema"), Q: q.Get("q"), Allow: allow})
 	switch q.Get("fields") {
 	case "":
 		writeJSON(w, http.StatusOK, map[string]any{"docs": list})
@@ -64,7 +107,7 @@ func (s *Server) listDocs(w http.ResponseWriter, r *http.Request, _ *auth.Princi
 	}
 }
 
-func (s *Server) getDoc(w http.ResponseWriter, r *http.Request, _ *auth.Principal) {
+func (s *Server) getDoc(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
 	id := r.PathValue("id")
 	if !docs.ValidID(id) {
 		writeError(w, http.StatusNotFound, docs.ErrNotFound.Error())
@@ -73,6 +116,16 @@ func (s *Server) getDoc(w http.ResponseWriter, r *http.Request, _ *auth.Principa
 	d, tag, err := s.Docs.Get(id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	allow, status, msg := s.docScope(r, p)
+	if status != http.StatusOK {
+		writeScopeError(w, status, msg)
+		return
+	}
+	// Out of scope reads as missing: the id must not reveal the document.
+	if allow != nil && !allow(d) {
+		writeError(w, http.StatusNotFound, docs.ErrNotFound.Error())
 		return
 	}
 	w.Header().Set("ETag", tag)
@@ -136,8 +189,11 @@ func (s *Server) docWriter(action string) handler {
 		// The policy sees both versions: a rule scoped to some tables must
 		// check what the document is about now (current) as well as what it
 		// will be about (doc), or an update could take over any document.
+		// A delegated write (docs_write key) carries the identity and the
+		// actor, so the policy can tie what a service may write to its users.
 		check := func(old, next *docs.Doc) error {
 			input := map[string]any{"action": action, "user": p.Name, "roles": p.Roles}
+			policyIdentity(input, p)
 			if old != nil {
 				input["doc_id"], input["author"], input["current"] = old.ID, old.Header.Author, docPolicyView(old)
 			}

@@ -28,9 +28,12 @@ type Principal struct {
 	// Caller is the audit-only context a shared key may send instead.
 	Delegation bool
 	Attributes map[string]string
-	Actor      string
-	Identity   *ExecutionContext
-	Caller     *ExecutionContext
+	// DocsWrite (delegating keys only) allows delegated semantic document
+	// writes; the docs policy still decides for the effective identity.
+	DocsWrite bool
+	Actor     string
+	Identity  *ExecutionContext
+	Caller    *ExecutionContext
 }
 
 // Authentication methods.
@@ -73,7 +76,7 @@ func New(users *config.Users, ttl time.Duration) *Authenticator {
 		hex.Decode(h[:], []byte(strings.ToLower(k.KeyHash)))
 		exp, _ := k.ExpiresAt()
 		a.keys[h] = apiKey{p: &Principal{Name: k.Name, Roles: k.Roles, Method: MethodAPIKey,
-			Delegation: k.Delegation, Attributes: k.Attributes}, expires: exp}
+			Delegation: k.Delegation, Attributes: k.Attributes, DocsWrite: k.Delegation && k.DocsWrite}, expires: exp}
 	}
 	// Unknown users still pay one bcrypt so timing does not reveal them.
 	a.dummy, _ = bcrypt.GenerateFromPassword([]byte("curral-dummy"), bcrypt.DefaultCost)

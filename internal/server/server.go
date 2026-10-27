@@ -69,6 +69,10 @@ type Server struct {
 	Version               string
 
 	Docs *docs.Store // semantic documents; nil disables /v1/docs
+	// DocsScope is DocsScopeAll (every authenticated user reads every
+	// document) or DocsScopeSchema (a document about tables is served only
+	// when the caller may read one of them).
+	DocsScope string
 	// Judge, when set, decides which documents /v1/docs/search returns and
 	// ranks them; nil ranks by BM25 alone.
 	Judge           rerank.Judge
