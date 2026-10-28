@@ -2,8 +2,10 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/lucasapassos/curral/internal/audit"
@@ -162,6 +164,38 @@ func writeSchemaError(w http.ResponseWriter, status int, msg string) {
 	writeError(w, status, msg)
 }
 
+// maxFilterNames caps the tables and schemas lists of a listing or search.
+const maxFilterNames = 100
+
+// nameFilter checks the single (table) and list (tables) forms of a name
+// filter: both at once is a mistake, and a list is capped. Blank items are
+// dropped.
+func nameFilter(field, one string, list []string) ([]string, error) {
+	var out []string
+	for _, n := range list {
+		if n = strings.TrimSpace(n); n != "" {
+			out = append(out, n)
+		}
+	}
+	switch {
+	case one != "" && len(out) > 0:
+		return nil, fmt.Errorf("%s and %ss cannot both be given", field, field)
+	case len(out) > maxFilterNames:
+		return nil, fmt.Errorf("%ss has %d items; the limit is %d", field, len(out), maxFilterNames)
+	}
+	return out, nil
+}
+
+// listedNames reads a list parameter given repeated (?tables=a&tables=b)
+// or comma-separated (?tables=a,b).
+func listedNames(values []string) []string {
+	var out []string
+	for _, v := range values {
+		out = append(out, strings.Split(v, ",")...)
+	}
+	return out
+}
+
 func (s *Server) docRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/docs", s.authed(s.listDocs))
 	mux.HandleFunc("GET /v1/docs/{id}", s.authed(s.getDoc))
@@ -188,9 +222,10 @@ func summary(d docs.Doc) docSummary {
 	return out
 }
 
-// listDocs lists documents, most recently updated first. ?table=, ?schema=
-// and ?q= narrow the list; ?fields=header leaves out bodies and SQL. Each
-// document says which of its tables the caller may query.
+// listDocs lists documents, most recently updated first. ?table= (or
+// ?tables=, a list), ?schema= (or ?schemas=) and ?q= narrow the list;
+// ?fields=header leaves out bodies and SQL. Each document says which of
+// its tables the caller may query.
 func (s *Server) listDocs(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
 	q := r.URL.Query()
 	header := q.Get("fields") == "header"
@@ -198,12 +233,22 @@ func (s *Server) listDocs(w http.ResponseWriter, r *http.Request, p *auth.Princi
 		writeError(w, http.StatusBadRequest, "fields must be header or empty")
 		return
 	}
+	f := docs.Filter{Table: q.Get("table"), Schema: q.Get("schema"), Q: q.Get("q")}
+	var err error
+	if f.Tables, err = nameFilter("table", f.Table, listedNames(q["tables"])); err == nil {
+		f.Schemas, err = nameFilter("schema", f.Schema, listedNames(q["schemas"]))
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	a, status, msg := s.docAccess(r, p)
 	if status != http.StatusOK {
 		writeSchemaError(w, status, msg)
 		return
 	}
-	list := s.Docs.List(docs.Filter{Table: q.Get("table"), Schema: q.Get("schema"), Q: q.Get("q"), Allow: a.allow})
+	f.Allow = a.allow
+	list := s.Docs.List(f)
 	out := make([]any, len(list))
 	for i, d := range list {
 		out[i] = a.view(d, header)

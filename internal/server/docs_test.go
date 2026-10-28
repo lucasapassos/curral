@@ -129,6 +129,23 @@ func TestDocsAPI(t *testing.T) {
 	if json.Unmarshal([]byte(r.body), &list); len(list.Docs) != 0 {
 		t.Fatalf("filtered list: %s", r.body)
 	}
+	// Lists match any name, repeated or comma-separated; not with the
+	// single form, and capped.
+	for _, query := range []string{"?tables=customers,orders", "?tables=customers&tables=orders", "?tables=,orders,"} {
+		r = docReq(t, ts, "GET", "analyst", "/v1/docs"+query, "")
+		if json.Unmarshal([]byte(r.body), &list); r.status != 200 || len(list.Docs) != 1 {
+			t.Fatalf("%s: %d %s", query, r.status, r.body)
+		}
+	}
+	r = docReq(t, ts, "GET", "analyst", "/v1/docs?tables=orders&schemas=main", "")
+	if json.Unmarshal([]byte(r.body), &list); r.status != 200 || len(list.Docs) != 0 {
+		t.Fatalf("tables and schemas both apply: %d %s", r.status, r.body)
+	}
+	for _, query := range []string{"?table=orders&tables=orders", "?schema=a&schemas=b", "?tables=" + strings.Repeat("t,", maxFilterNames) + "t"} {
+		if r := docReq(t, ts, "GET", "analyst", "/v1/docs"+query, ""); r.status != 400 {
+			t.Fatalf("%s: %d %s", query, r.status, r.body)
+		}
+	}
 	for _, path := range []string{"/v1/docs/nope", "/v1/docs/..%2Fetc", "/v1/docs/0000000000000000"} {
 		if r := docReq(t, ts, "GET", "analyst", path, ""); r.status != 404 {
 			t.Fatalf("%s: %d", path, r.status)

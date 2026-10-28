@@ -127,8 +127,11 @@ people) to read before writing queries. Each one is a JSON file,
 - **Reading:** every authenticated user. `GET /v1/docs` lists full documents,
   most recently updated first; `?table=`, `?schema=` (exact name or its last
   parts, so `orders` finds `sales.main.orders`) and `?q=` (text in title,
-  description or `used_for`) narrow it, all case-insensitive.
-  `?fields=header` leaves out `body` and `sqls`.
+  description or `used_for`) narrow it, all case-insensitive. `?tables=`
+  and `?schemas=` take several names (repeated or comma-separated, up to
+  100 each) and keep a document about any of them; `table` with `tables`,
+  or `schema` with `schemas`, is a 400. `?fields=header` leaves out `body`
+  and `sqls`.
 - **Access:** each document listed or searched carries `accessible_tables`
   and `inaccessible_tables`: the entries of its `tables` the caller may
   query and the rest (a name counts as accessible when every object it
@@ -193,8 +196,11 @@ curl -u analyst:analyst-pw -d '{"q":"monthly revenue per customer","limit":3}' l
 ```
 
 - **Request:** `q` (required), optional `table` and `schema` filters (as in
-  the listing), `limit` (default 5, at most 50) and `fields` (`full`, the
-  default, or `header`). Each `doc` carries `accessible_tables` and
+  the listing) or their list forms `tables` and `schemas` (any of up to 100
+  names; not together with the single form), `limit` (default 5, at most
+  50) and `fields` (`full`, the default, or `header`). The filters apply
+  before ranking, so documents outside them take no place in the Jev
+  shortlist or the limit. Each `doc` carries `accessible_tables` and
   `inaccessible_tables`, as in the listing.
 - **Ranking:** words are matched without case or accents, identifiers split
   on `_` and `.`, and a plural `s` is ignored. Matches in the title count

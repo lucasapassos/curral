@@ -25,11 +25,13 @@ const (
 )
 
 type searchRequest struct {
-	Q      string `json:"q"`
-	Table  string `json:"table"`
-	Schema string `json:"schema"`
-	Limit  int    `json:"limit"`
-	Fields string `json:"fields"`
+	Q       string   `json:"q"`
+	Table   string   `json:"table"`
+	Tables  []string `json:"tables"` // any of them; not with Table
+	Schema  string   `json:"schema"`
+	Schemas []string `json:"schemas"` // any of them; not with Schema
+	Limit   int      `json:"limit"`
+	Fields  string   `json:"fields"`
 }
 
 // searchHit is one result. Score is the Judge's probability when Judged,
@@ -81,13 +83,23 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, p *auth.Prin
 	if in.Limit == 0 {
 		in.Limit = defaultSearchLimit
 	}
+	// The filters apply before ranking, so documents outside them take no
+	// place in the shortlist or the limit.
+	f := docs.Filter{Table: in.Table, Schema: in.Schema}
+	if f.Tables, err = nameFilter("table", in.Table, in.Tables); err == nil {
+		f.Schemas, err = nameFilter("schema", in.Schema, in.Schemas)
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	a, status, msg := s.docAccess(r, p)
 	if status != http.StatusOK {
 		writeSchemaError(w, status, msg)
 		return
 	}
 	view := func(d docs.Doc) any { return a.view(d, in.Fields == "header") }
-	f := docs.Filter{Table: in.Table, Schema: in.Schema, Allow: a.allow}
+	f.Allow = a.allow
 
 	if s.Judge == nil {
 		out := searchResponse{Ranker: "bm25", Results: []searchHit{}}

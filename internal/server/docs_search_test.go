@@ -63,6 +63,9 @@ func seedDocs(t *testing.T, dir string) {
 		{"Refunds", "Refunded orders have status refunded.", "sales.main.refunds"},
 	} {
 		in := docs.Doc{Header: docs.Header{Title: d.title}, Context: docs.Context{Tables: []string{d.table}, Body: d.body}}
+		if strings.HasPrefix(d.table, "crm.") {
+			in.Context.Schemas = []string{"crm.main"}
+		}
 		if _, _, err := store.Create(in, "poet", nil); err != nil {
 			t.Fatal(err)
 		}
@@ -112,6 +115,26 @@ func TestDocsSearchBM25(t *testing.T) {
 	if !slices.Equal(got.titles(), []string{"Refunds"}) {
 		t.Fatalf("table filter: %v", got.titles())
 	}
+	// A list matches any of its names and is applied before the limit, so
+	// a document outside it takes no place.
+	got = search(t, docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"orders","tables":["refunds","nope"],"limit":1}`))
+	if !slices.Equal(got.titles(), []string{"Refunds"}) {
+		t.Fatalf("tables filter: %v", got.titles())
+	}
+	got = search(t, docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"orders","tables":["sales.main.refunds","orders"]}`))
+	if !slices.Equal(got.titles(), []string{"Monthly revenue", "Refunds"}) {
+		t.Fatalf("tables filter, two names: %v", got.titles())
+	}
+	got = search(t, docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"customer","schemas":["crm.main","nope"]}`))
+	if !slices.Equal(got.titles(), []string{"Customer churn"}) {
+		t.Fatalf("schemas filter: %v", got.titles())
+	}
+	many := strings.Repeat(`"t",`, maxFilterNames) + `"t"`
+	for _, body := range []string{`{"q":"x","table":"a","tables":["b"]}`, `{"q":"x","schema":"a","schemas":["b"]}`, `{"q":"x","tables":[` + many + `]}`} {
+		if r := docReq(t, ts, "POST", "analyst", "/v1/docs/search", body); r.status != 400 {
+			t.Errorf("%s: %d %s", body, r.status, r.body)
+		}
+	}
 }
 
 func TestDocsSearchJudged(t *testing.T) {
@@ -129,6 +152,11 @@ func TestDocsSearchJudged(t *testing.T) {
 	}
 	// The judge sees max(shortlist, limit) candidates.
 	if len(judge.seen) != 3 {
+		t.Fatalf("judge saw %v", judge.seen)
+	}
+	// Filtered out documents take no place in the shortlist.
+	search(t, docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"orders","tables":["refunds","customers"],"limit":1}`))
+	if !slices.Equal(judge.seen, []string{"Refunds", "Customer churn"}) {
 		t.Fatalf("judge saw %v", judge.seen)
 	}
 	got = search(t, docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"orders","limit":1}`))

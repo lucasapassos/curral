@@ -148,10 +148,7 @@ func mergePatch(target, patch any) any {
 // Matches reports whether d passes f. Empty filter fields match everything;
 // comparisons ignore case.
 func (d Doc) Matches(f Filter) bool {
-	if f.Table != "" && !nameIn(f.Table, d.Context.Tables) {
-		return false
-	}
-	if f.Schema != "" && !nameIn(f.Schema, d.Context.Schemas) {
+	if !anyNameIn(f.Table, f.Tables, d.Context.Tables) || !anyNameIn(f.Schema, f.Schemas, d.Context.Schemas) {
 		return false
 	}
 	if q := strings.ToLower(strings.TrimSpace(f.Q)); q != "" {
@@ -183,11 +180,32 @@ func nameIn(name string, list []string) bool {
 	return false
 }
 
-// Filter narrows a listing.
+// anyNameIn reports whether list names one (or Tables, if given) or more
+// of the wanted names; no wanted name matches everything.
+func anyNameIn(one string, wanted, list []string) bool {
+	if one == "" && len(wanted) == 0 {
+		return true
+	}
+	if one != "" && nameIn(one, list) {
+		return true
+	}
+	for _, w := range wanted {
+		if nameIn(w, list) {
+			return true
+		}
+	}
+	return false
+}
+
+// Filter narrows a listing. A document passes when it is about Table or
+// any of Tables (if either is given), about Schema or any of Schemas
+// (likewise), and matches Q and Allow.
 type Filter struct {
-	Table  string // a table the document is about
-	Schema string // a schema the document is about
-	Q      string // substring of title, description or used_for
+	Table   string   // a table the document is about
+	Tables  []string // tables the document may be about (any of them)
+	Schema  string   // a schema the document is about
+	Schemas []string // schemas the document may be about (any of them)
+	Q       string   // substring of title, description or used_for
 	// Allow, when set, is an extra condition every document must pass
 	// (used to scope documents to the tables a caller may read).
 	Allow func(Doc) bool

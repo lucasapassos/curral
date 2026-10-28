@@ -15,6 +15,10 @@ notes are taken from its section here.
   carry `accessible_tables` and `inaccessible_tables`: which of their
   `tables` the caller may query, by the caller's `/v1/schema` listing, in
   both `--docs-scope` modes.
+- `GET /v1/docs` and `POST /v1/docs/search` take `tables` and `schemas`
+  (lists of up to 100 names, any of which matches) besides `table` and
+  `schema`; the filters apply before ranking, so documents outside them
+  take no place in the shortlist or the limit.
 
 ### Changed
 - `GET /v1/docs` and `POST /v1/docs/search` list the caller's schema (one

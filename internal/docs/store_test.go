@@ -151,6 +151,12 @@ func TestListFilters(t *testing.T) {
 		{Filter{Schema: "main"}, []string{b.ID}},
 		{Filter{Q: "CHURN"}, []string{b.ID}},
 		{Filter{Q: "finance"}, []string{a.ID}},
+		// Lists match any of their names, alone or with the single form.
+		{Filter{Tables: []string{"nope", "orders"}}, []string{a.ID}},
+		{Filter{Tables: []string{"nope"}}, nil},
+		{Filter{Table: "nope", Tables: []string{"orders"}}, []string{a.ID}},
+		{Filter{Schemas: []string{"other", "MAIN"}}, []string{b.ID}},
+		{Filter{Tables: []string{"orders"}, Schemas: []string{"main"}}, nil},
 	} {
 		if got := ids(s.List(c.f)); strings.Join(got, ",") != strings.Join(c.want, ",") {
 			t.Errorf("%+v: got %v want %v", c.f, got, c.want)
