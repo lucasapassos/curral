@@ -133,6 +133,46 @@ func (s *Store) List(f Filter) []Doc {
 	return out
 }
 
+// Count returns, for each qualified table name in tables, how many
+// documents passing allow (every one when nil) are about it: a document
+// counts when one of its tables names it exactly or by its last parts, as
+// in Filter, and once however many of its names fit. Keys are the names as
+// given.
+func (s *Store) Count(tables []string, allow func(Doc) bool) map[string]int {
+	bySuffix := map[string][]string{}
+	for _, t := range tables {
+		index(bySuffix, strings.ToLower(t))
+	}
+	out := make(map[string]int, len(tables))
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, e := range s.ids {
+		if allow != nil && !allow(e.doc) {
+			continue
+		}
+		seen := map[string]bool{}
+		for _, n := range e.doc.Context.Tables {
+			for _, t := range bySuffix[strings.ToLower(strings.TrimSpace(n))] {
+				if !seen[t] {
+					seen[t] = true
+					out[t]++
+				}
+			}
+		}
+	}
+	// Keys as given: index lowercased them.
+	if len(out) > 0 {
+		named := make(map[string]int, len(out))
+		for _, t := range tables {
+			if n := out[strings.ToLower(t)]; n > 0 {
+				named[t] = n
+			}
+		}
+		out = named
+	}
+	return out
+}
+
 // Check vets a write just before it is saved: old is the current document
 // (nil on create), next the one about to be saved (nil on delete). An error
 // cancels the write and is returned as is.

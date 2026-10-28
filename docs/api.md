@@ -58,7 +58,7 @@ curl -u admin 'https://curral.example.com/v1/schema?database=lake&schema=analyti
  "tables":[{"database":"lake","schema":"analytics","name":"monthly_revenue","kind":"table",
             "columns":[{"name":"customer","type":"VARCHAR","nullable":true},
                        {"name":"ssn","type":"VARCHAR","nullable":true,"masked":true}],
-            "row_filtered":true}]}
+            "row_filtered":true,"docs":2}]}
 ```
 
 - **Filters:** `database`, `schema` and `table`, case-insensitive.
@@ -68,8 +68,16 @@ curl -u admin 'https://curral.example.com/v1/schema?database=lake&schema=analyti
   is filtered, and columns are flagged when they share a name with a masked
   column.
 - **`comment`:** table and column comments (`COMMENT ON`), when present.
+- **`docs`:** with `--docs-dir`, how many [semantic documents](#semantic-documents-v1docs)
+  are about the table (naming it exactly or by its last parts, as the
+  document filters match); omitted when none. With `--docs-scope schema`
+  only the documents the caller may read count, so a count never reveals a
+  document the listing would hide. Clients can skip `GET /v1/docs` for
+  tables without a count.
 - **`schema` in `databases`:** the schema used for unqualified names.
-- **Audit:** each call produces a `schema` event listing the tables returned.
+- **Audit:** each call produces a `schema` event listing the tables returned
+  (and, when counting documents under `--docs-scope schema`, a `docs_scope`
+  event for the caller's scope).
 
 ### Cache
 

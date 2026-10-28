@@ -78,20 +78,40 @@ func (s *Scope) Readable(d Doc) bool {
 // anyReadable reports whether some name in names fits only readable objects.
 func (s *Scope) anyReadable(idx map[string][]string, names []string) bool {
 	for _, n := range names {
-		objs := idx[strings.ToLower(strings.TrimSpace(n))]
-		if len(objs) == 0 {
-			continue
-		}
-		readable := true
-		for _, o := range objs {
-			if !s.visible[o] {
-				readable = false
-				break
-			}
-		}
-		if readable {
+		if s.readable(idx, n) {
 			return true
 		}
 	}
 	return false
+}
+
+// readable reports whether name fits at least one object in idx and every
+// object it fits is readable.
+func (s *Scope) readable(idx map[string][]string, name string) bool {
+	objs := idx[strings.ToLower(strings.TrimSpace(name))]
+	if len(objs) == 0 {
+		return false
+	}
+	for _, o := range objs {
+		if !s.visible[o] {
+			return false
+		}
+	}
+	return true
+}
+
+// Split sorts the tables d names into those the reader may query and the
+// rest, by the rule of Readable (a name counts when every object it fits
+// is readable; one fitting nothing in the catalog is not accessible). Both
+// lists are non-nil, so a document about no table has two empty ones.
+func (s *Scope) Split(d Doc) (accessible, inaccessible []string) {
+	accessible, inaccessible = []string{}, []string{}
+	for _, t := range d.Context.Tables {
+		if s.readable(s.tables, t) {
+			accessible = append(accessible, t)
+		} else {
+			inaccessible = append(inaccessible, t)
+		}
+	}
+	return accessible, inaccessible
 }

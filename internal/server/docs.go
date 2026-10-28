@@ -38,15 +38,13 @@ func (s *Server) docsScope() string {
 	return s.DocsScope
 }
 
-// docScope returns the condition documents must pass to be shown to p, nil
-// when every document is. Under DocsScopeSchema the tables p may read are
-// listed as for /v1/schema (same policy, same audit event, kind
-// "docs_scope") and a document naming tables or schemas must name a
-// readable one; see docs.Scope. A status other than 200 comes with the
-// message the client may see.
-func (s *Server) docScope(r *http.Request, p *auth.Principal) (func(docs.Doc) bool, int, string) {
-	if s.docsScope() != DocsScopeSchema {
-		return nil, http.StatusOK, ""
+// catalogScope indexes the catalog for p: every table in it and those p
+// may read, listed as for /v1/schema (same policy, same audit event, kind
+// "docs_scope"); see docs.Scope. Without an engine the catalog is empty. A
+// status other than 200 comes with the message the client may see.
+func (s *Server) catalogScope(r *http.Request, p *auth.Principal) (*docs.Scope, int, string) {
+	if s.Engine == nil {
+		return docs.NewScope(nil, nil), http.StatusOK, ""
 	}
 	var all []string
 	tables, status, msg := s.listSchema(r.Context(), p, s.newEvent(r, "docs_scope", p), engine.SchemaFilter{},
@@ -58,7 +56,43 @@ func (s *Server) docScope(r *http.Request, p *auth.Principal) (func(docs.Doc) bo
 	for i, t := range tables {
 		visible[i] = t.Qualified()
 	}
-	return docs.NewScope(all, visible).Readable, http.StatusOK, ""
+	return docs.NewScope(all, visible), http.StatusOK, ""
+}
+
+// docScope returns the condition documents must pass to be shown to p, nil
+// when every document is. Under DocsScopeSchema a document naming tables
+// or schemas must name a readable one, by the caller's catalogScope.
+func (s *Server) docScope(r *http.Request, p *auth.Principal) (func(docs.Doc) bool, int, string) {
+	if s.docsScope() != DocsScopeSchema {
+		return nil, http.StatusOK, ""
+	}
+	scope, status, msg := s.catalogScope(r, p)
+	if status != http.StatusOK {
+		return nil, status, msg
+	}
+	return scope.Readable, http.StatusOK, ""
+}
+
+// countDocs sets Docs on each listed table: how many documents are about
+// it (naming it exactly or by its last parts). Under DocsScopeSchema only
+// the documents the caller may read count, so a count never reveals a
+// document the listing would hide; deciding that takes the caller's scope,
+// listed and audited as for the documents themselves. A status other than
+// 200 comes with the message the client may see.
+func (s *Server) countDocs(r *http.Request, p *auth.Principal, tables []engine.TableSchema) (int, string) {
+	allow, status, msg := s.docScope(r, p)
+	if status != http.StatusOK {
+		return status, msg
+	}
+	names := make([]string, len(tables))
+	for i, t := range tables {
+		names[i] = t.Qualified()
+	}
+	counts := s.Docs.Count(names, allow)
+	for i := range tables {
+		tables[i].Docs = counts[names[i]]
+	}
+	return http.StatusOK, ""
 }
 
 // retryAfter marks a 503 or 429 as transient.

@@ -6,6 +6,11 @@ notes are taken from its section here.
 ## [Unreleased]
 
 ### Added
+- `GET /v1/schema` reports `docs` on each table: how many semantic
+  documents are about it, matched as the document filters match names;
+  omitted when none. Under `--docs-scope schema` only documents the caller
+  may read count. A client can skip listing documents for tables without
+  any.
 - `--docs-scope schema`: a semantic document that names tables or schemas
   is served only to callers who may query at least one of them, as listed
   by `/v1/schema` and audited as `docs_scope`. Reads and writes alike

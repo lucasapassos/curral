@@ -494,3 +494,70 @@ func TestDocsWriteErrors(t *testing.T) {
 		t.Fatalf("store error: %d %s", r.status, r.body)
 	}
 }
+
+// /v1/schema counts the documents about each table, matching names as the
+// document filters do. Under --docs-scope schema only documents the caller
+// may read count, so a count never reveals a hidden document.
+func TestSchemaDocCount(t *testing.T) {
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := newServerWithAudit(t, "", func(s *Server) { s.Docs = store })
+	// A second salaries table the analyst may read makes the short name
+	// ambiguous: it fits the denied sales.main.salaries too.
+	for _, ddl := range []string{"CREATE SCHEMA sales.hr", "CREATE TABLE sales.hr.salaries(name VARCHAR)"} {
+		if r := do(t, ts, "admin", `{"sql":"`+ddl+`"}`); r.status != 200 {
+			t.Fatalf("%s: %d %s", ddl, r.status, r.body)
+		}
+	}
+	for title, tables := range map[string][]string{
+		"orders short": {"orders"}, "orders qualified": {"Sales.Main.Orders", "orders"},
+		"salaries short": {"salaries"}, "payroll": {"sales.main.salaries", "orders"}, "general": nil,
+	} {
+		if _, _, err := store.Create(docs.Doc{Header: docs.Header{Title: title}, Context: docs.Context{Tables: tables, Body: "b"}}, "poet", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	counts := func(user, query string) map[string]int {
+		t.Helper()
+		status, out := getSchema(t, ts, user, query)
+		if status != 200 {
+			t.Fatalf("%s schema: %d", user, status)
+		}
+		got := map[string]int{}
+		for _, tb := range out.Tables {
+			got[tb.Qualified()] = tb.Docs
+		}
+		return got
+	}
+	type want map[string]int
+	check := func(name string, got map[string]int, w want) {
+		t.Helper()
+		for table, n := range w {
+			if got[table] != n {
+				t.Errorf("%s: %s has %d docs, want %d (%v)", name, table, got[table], n, got)
+			}
+		}
+	}
+	// Scope all: every document counts, once per table however many of its
+	// names fit; a table no document names has no count (omitted).
+	check("admin", counts("admin", ""), want{"sales.main.orders": 3, "sales.main.salaries": 2, "sales.hr.salaries": 1, "logs.main.events": 0})
+	check("analyst", counts("analyst", ""), want{"sales.main.orders": 3, "sales.hr.salaries": 1})
+	check("filtered", counts("admin", "?table=orders"), want{"sales.main.orders": 3})
+	status, out := getSchema(t, ts, "admin", "?table=events")
+	if b, _ := json.Marshal(out.Tables); status != 200 || strings.Contains(string(b), `"docs"`) {
+		t.Errorf("a table without documents: %d %s", status, b)
+	}
+
+	// Scope schema: the analyst may not read the "salaries short" document
+	// (its only name also fits the denied table), so sales.hr.salaries
+	// counts none for them and still one for the admin.
+	lastServer.DocsScope = DocsScopeSchema
+	check("admin scoped", counts("admin", ""), want{"sales.main.orders": 3, "sales.main.salaries": 2, "sales.hr.salaries": 1})
+	check("analyst scoped", counts("analyst", ""), want{"sales.main.orders": 3, "sales.hr.salaries": 0})
+
+	// Without documents enabled nothing is counted.
+	lastServer.Docs = nil
+	check("disabled", counts("admin", ""), want{"sales.main.orders": 0})
+}

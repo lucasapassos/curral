@@ -229,3 +229,36 @@ func TestCheck(t *testing.T) {
 		t.Fatalf("denied writes changed the document: %+v", got.Header)
 	}
 }
+
+func TestStoreCount(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for title, tables := range map[string][]string{
+		"a": {"orders"}, "b": {"SALES.main.orders", " orders "}, "c": {"salaries"}, "d": {"main.salaries", "nope"}, "e": nil,
+	} {
+		if _, _, err := s.Create(Doc{Header: Header{Title: title}, Context: Context{Tables: tables, Body: "b"}}, "u", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tables := []string{"sales.main.orders", "hr.main.salaries", "Sales.Main.Salaries", "logs.main.events"}
+	got := s.Count(tables, nil)
+	want := map[string]int{"sales.main.orders": 2, "hr.main.salaries": 2, "Sales.Main.Salaries": 2}
+	if len(got) != len(want) {
+		t.Fatalf("count: %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s: %d, want %d", k, got[k], v)
+		}
+	}
+	// A condition narrows what counts; nothing matching leaves no keys.
+	only := func(d Doc) bool { return d.Header.Title == "c" }
+	if got := s.Count(tables, only); len(got) != 2 || got["hr.main.salaries"] != 1 {
+		t.Errorf("filtered count: %v", got)
+	}
+	if got := s.Count(tables, func(Doc) bool { return false }); len(got) != 0 {
+		t.Errorf("empty count: %v", got)
+	}
+}
