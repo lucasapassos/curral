@@ -208,8 +208,10 @@ func (s *Server) docWriter(action string) handler {
 		// Under --docs-scope schema a document out of the caller's scope is
 		// as good as missing on writes too: a write would otherwise read it
 		// back (PATCH returns the document) or reveal it by its status. The
-		// version checked here is the one written: without an If-Match from
-		// the client the write is conditional on the ETag seen now.
+		// version checked here is the one written: the client's If-Match
+		// (none and "*" included) is settled against it now, and the store
+		// then insists on exactly this version, so a document changed in
+		// between is never written, or read back, unchecked.
 		ifMatch := r.Header.Get("If-Match")
 		if r.Method != http.MethodPost {
 			allow, status, msg := s.docScope(r, p)
@@ -224,9 +226,11 @@ func (s *Server) docWriter(action string) handler {
 					finish(http.StatusNotFound, "error", "scope", docs.ErrNotFound.Error())
 					return
 				}
-				if ifMatch == "" {
-					ifMatch = tag
+				if !docs.ETagMatches(ifMatch, tag) {
+					finish(http.StatusPreconditionFailed, "error", "request", docs.ErrPrecondition.Error())
+					return
 				}
+				ifMatch = tag
 			}
 		}
 

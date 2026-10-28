@@ -187,7 +187,7 @@ func (s *Store) update(id, user, ifMatch string, check Check, change func(Doc) (
 	if !ok {
 		return Doc{}, "", ErrNotFound
 	}
-	if !matches(ifMatch, e.etag) {
+	if !ETagMatches(ifMatch, e.etag) {
 		return Doc{}, "", ErrPrecondition
 	}
 	in, err := change(e.doc)
@@ -216,7 +216,7 @@ func (s *Store) Delete(id, ifMatch string, check Check) error {
 	if !ok {
 		return ErrNotFound
 	}
-	if !matches(ifMatch, e.etag) {
+	if !ETagMatches(ifMatch, e.etag) {
 		return ErrPrecondition
 	}
 	if check != nil {
@@ -268,7 +268,10 @@ func (s *Store) write(d Doc) (Doc, string, error) {
 
 func (s *Store) path(id string) string { return filepath.Join(s.dir, id+".json") }
 
-func matches(ifMatch, tag string) bool {
+// ETagMatches reports whether an If-Match header accepts tag: no header
+// and "*" accept anything, otherwise one of the listed tags, weak or not,
+// must be it.
+func ETagMatches(ifMatch, tag string) bool {
 	if ifMatch == "" || ifMatch == "*" {
 		return true
 	}

@@ -375,7 +375,7 @@ func TestDocsScopeSchema(t *testing.T) {
 	if r := docReq(t, ts, "PATCH", "poet", "/v1/docs/not-an-id", `{}`); r.status != 404 {
 		t.Fatalf("invalid id: %d %s", r.status, r.body)
 	}
-	r := docReq(t, ts, "PATCH", "poet", "/v1/docs/"+ids["general"], `{"header":{"title":"general notes, revised"}}`)
+	r := docReq(t, ts, "PATCH", "poet", "/v1/docs/"+ids["general"], `{"header":{"title":"general notes, revised"}}`, "If-Match", "*")
 	if r.status != 200 || !strings.Contains(r.body, "general notes, revised") {
 		t.Fatalf("patch in scope: %d %s", r.status, r.body)
 	}
