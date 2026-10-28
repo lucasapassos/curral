@@ -187,7 +187,9 @@ The original query runs on top of that subquery, which has three consequences:
 - **No oracle:** `WHERE ssn = '...'`, joins and groupings operate on the masked
   values, so the real value cannot be found by elimination.
 - **SELECT only:** a non-SELECT that reads a protected table (`INSERT ...
-  SELECT`, `CREATE TABLE AS`) gets 403.
+  SELECT`, `CREATE TABLE AS`, `EXPLAIN`) gets 403. `DESCRIBE` and `SHOW`
+  of the table return its columns, as `GET /v1/schema` does for the same
+  caller, and `SUMMARIZE` reads the filtered, masked rows.
 - **Fail-closed:** the query is also denied, with `decided_by: protection` in
   the audit log, when:
   - the table is read **indirectly**, through a view or macro (the number of
@@ -201,8 +203,9 @@ The original query runs on top of that subquery, which has three consequences:
   - the query is a `PIVOT`.
 
 **Tracking:** the dry run and the audit log show `row_filters` and
-`masked_columns`, and rewritten queries count in
-`curral_queries_rewritten_total`.
+`masked_columns`, a dry run of a statement that would be refused here
+answers `decided_by: protection` with the reason, and rewritten queries
+count in `curral_queries_rewritten_total`.
 
 **Verification:** a differential test compares each protected query with the
 same query over a copy of the table that is already filtered and masked; the

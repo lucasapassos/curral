@@ -13,6 +13,8 @@ The endpoints curral exposes, their request and response formats, and the bundle
 | `GET /v1/docs`, `GET /v1/docs/{id}` | yes | semantic documents (with `--docs-dir`) |
 | `POST /v1/docs`, `PUT`/`PATCH`/`DELETE /v1/docs/{id}` | yes | write semantic documents, as the policy allows |
 | `GET /healthz` | no | liveness |
+| `GET /` | no | index: version, where the skill and its scripts are, the endpoints, the authentication schemes |
+| `GET /skill`, `GET /skill/{file}` | no | the agent skill's documentation (`skills/curral`) served from the binary; the scripts too with `--serve-skill all`, over TLS or to loopback. See [AI agents](agents.md) |
 
 The Prometheus `/metrics` endpoint lives on a separate port; see
 [Operations](operations.md). With `--flight-listen`, the same data is also
@@ -32,7 +34,7 @@ With `Authorization: Basic ...` (or a bearer token, see
   `application/vnd.apache.arrow.stream`). It can also come from `?format=` or the `Accept` header.
 - **`database`**: catalog used for unqualified names. The default comes from the catalog's `default` field.
 - **`max_rows`**: row limit for this response. It can only **lower** the limit in effect: the smallest of `--max-rows`, the role's `max_rows` in the policy and the request wins. No `LIMIT` is added to the SQL: the server stops reading the result when the limit is reached and signals the cut (`X-Curral-Max-Rows`, trailer `X-Curral-Error: row limit reached`, `error` field in JSON). Queries with `ORDER BY`, aggregation or window functions compute everything before the first row; for cheap samples, put a `LIMIT` in the SQL itself.
-- **Blocked catalog functions**: `duckdb_tables()`, `duckdb_views()`, `duckdb_columns()`, `duckdb_schemas()` and similar, the `information_schema.*`, `pg_catalog.*` and `sqlite_master` views, plus `SHOW TABLES` and `PRAGMA show_tables`, respond 403 for every role. They walk every attached catalog, and two of them running at once over an Iceberg catalog crash the process (a DuckDB bug). To list the catalog, use `/v1/schema`.
+- **Blocked catalog functions**: `duckdb_tables()`, `duckdb_views()`, `duckdb_columns()`, `duckdb_schemas()` and similar, the `information_schema.*`, `pg_catalog.*` and `sqlite_master` views, plus `SHOW TABLES` and `PRAGMA show_tables`, respond 403 for every role. They walk every attached catalog, and two of them running at once over an Iceberg catalog crash the process (a DuckDB bug). To list the catalog, use `/v1/schema`. `DESCRIBE table` and `SHOW table` work for the tables the caller may read, protected ones included.
 - **JSON response**: `{"columns":[{"name","type"}],"data":[{...}],"row_count":N}`.
 - **Types converted to strings**: DECIMAL, HUGEINT and UUID, so no precision is lost.
 - **Error mid-stream**: once the 200 status has been sent, the error goes in the `X-Curral-Error` trailer. In JSON it also appears as an `"error"` field. The `X-Curral-Row-Count` trailer carries the total row count.
@@ -268,6 +270,7 @@ curl -u analyst:analyst-pw -d '{"sql":"DELETE FROM orders WHERE id = 1","dry_run
 ```
 
 - **Engine denials** (ATTACH, `UPDATE EXTENSIONS`...) show up as `"decided_by":"engine"`.
+- **Protection denials** show up as `"decided_by":"protection"` with a `reason`: the policy allows the statement, but its row filters or masks cannot be applied to it (a protected table read through a view, `EXPLAIN`, a write that reads it), so the run would be refused with 403.
 - **Invalid SQL** still responds 400.
 - **Scope:** the dry run evaluates the policy for the authenticated user themselves. It is audited as a `dry_run` event but kept out of the query metrics.
 

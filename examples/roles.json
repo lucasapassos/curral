@@ -28,6 +28,21 @@
         "sales"
       ],
       "deny_tables": []
+    },
+    "poet": {
+      "read": [
+        "sales",
+        "logs"
+      ],
+      "write": [],
+      "deny_tables": [
+        "sales.main.salaries"
+      ],
+      "limits": {
+        "timeout": "30s",
+        "max_rows": 10000,
+        "max_concurrency": 2
+      }
     }
   },
   "masks": {

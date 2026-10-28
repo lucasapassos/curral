@@ -34,6 +34,27 @@ notes are taken from its section here.
 - Each `POST /v1/docs/search` result carries `matched`: the question's
   terms found in the document and the fields holding them.
 
+- The server hands out its own agent skill, so an agent needs nothing but
+  the URL: `GET /` describes the server (version, endpoints, authentication,
+  the install command) and `GET /skill/...` serves `skills/curral`'s
+  `SKILL.md` and `references/api.md` from the binary, unauthenticated.
+  Scripts are code, so by default (`--serve-skill docs`) they come from the
+  repository pinned to the server's version; `--serve-skill all` serves them
+  too (over TLS or to loopback only), for networks without GitHub access,
+  and `--serve-skill off` removes both routes.
+- `skills/curral/scripts/install.sh` downloads the skill into a directory
+  from the repository (`CURRAL_SKILL_REF`) or from a server
+  (`CURRAL_SKILL_SOURCE`).
+- `docs/agents.md`: installing the skill in Claude Code, Codex, Hermes,
+  OpenClaw and omp, credentials, and what to configure on a server for
+  agents to do well.
+- `scripts/curral.sh` and `curral.ps1` read `CURRAL_CA` (a PEM file with a
+  private CA) from the environment or the credentials file, gain a
+  `capabilities` command (`GET /v1/capabilities`), and explain a 404 from
+  `/v1/docs` as the feature being off.
+- The example `poet` role reads `sales` and `logs`, so the account that
+  writes semantic documents can see the tables it documents.
+
 ### Changed
 - Document filters match names both ways: `?table=sales.main.orders` finds
   a document about `orders` as `?table=orders` already found one about
@@ -54,6 +75,20 @@ notes are taken from its section here.
   and the document's author is the identity. Without the flag, delegated
   requests keep refusing writes; the flag on a key without `delegation` is
   refused when the users file loads.
+- `DESCRIBE` and `SHOW` of a table with row filters or masks return its
+  columns, as `GET /v1/schema` already does for the same caller, instead of
+  being refused as indirect reads; `SUMMARIZE` keeps reading the protected
+  rows and `EXPLAIN` stays refused.
+- A dry run of a statement whose row filters or masks cannot be applied
+  (a protected table behind a view, `EXPLAIN`, a write that reads it) now
+  answers `decision: deny, decided_by: protection` with the reason, as the
+  run would, instead of `allow`.
+- Several statements in one request get `one statement per request` as
+  the error instead of the driver's message.
+- The skill documents the writing journey (`dry_run` first, one statement
+  per request, no transactions), table and column comments, `EXPLAIN` on
+  protected tables, working with several servers (`CURRAL_CONFIG`), and
+  asks the agent to offer recording what it learned as a semantic document.
 
 ## [v0.7.0] - 2026-10-25
 

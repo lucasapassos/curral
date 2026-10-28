@@ -46,9 +46,10 @@ curral is the missing layer in between:
   with `SIGHUP`.
 - **Friendly to tools and AI agents.** `GET /v1/schema` lists only what the
   caller may query, `dry_run` explains a policy decision without executing
-  anything, Arrow output streams straight into pandas, polars or DuckDB, and
-  an optional Flight SQL port lets DBeaver, DataGrip and ADBC clients
-  connect under the same rules.
+  anything, semantic documents tell agents what the tables mean, the server
+  hands out its own agent skill at `GET /skill`, Arrow output streams
+  straight into pandas, polars or DuckDB, and an optional Flight SQL port
+  lets DBeaver, DataGrip and ADBC clients connect under the same rules.
 
 ## Quickstart
 
@@ -136,9 +137,18 @@ connect through the Arrow Flight SQL JDBC driver
 what the user may query and run SQL under the same policy; see
 [API](docs/api.md#flight-sql-dbeaver-datagrip-jdbc-adbc).
 
-**AI agents.** [`skills/curral`](skills/curral) is an agent skill that
-teaches an assistant to discover the schema, validate with `dry_run` and
-query within its permissions.
+**AI agents.** [`skills/curral`](skills/curral) is an agent skill (Claude
+Code, Codex, Hermes, OpenClaw, omp...) that teaches an assistant to discover
+the schema, read the semantic documents, validate with `dry_run` and query
+within its permissions, without the credentials ever passing through the
+conversation. Every server also describes itself and hands out the skill's
+documentation, so an agent needs nothing but the URL:
+
+```sh
+curl -s http://localhost:8080/        # endpoints, authentication and the command that installs the skill
+```
+
+See [AI agents](docs/agents.md).
 
 ## Trusted service delegation
 
@@ -203,6 +213,7 @@ and automatic HTTPS.
 | [API](docs/api.md) | `/v1/query`, `/v1/schema`, formats, errors, dry-run, CLI, Flight SQL for IDEs |
 | [Authentication](docs/authentication.md) | users, API keys, OIDC (Keycloak, Auth0, Entra, Google), TLS, brute-force protection |
 | [Authorization](docs/authorization.md) | policy input, per-role limits, fairness, row-level security and masking |
+| [AI agents](docs/agents.md) | the agent skill, zero-install from the server, installing it in Claude Code, Codex, Hermes, OpenClaw and omp, making a server agent-friendly |
 | [Security](docs/security.md) | built-in guarantees, audit log, how inspection is verified, known limitations |
 | [Operations](docs/operations.md) | metrics, alerts, performance, releasing |
 | [Deployment](deploy/README.md) | Docker Compose behind Caddy on a single server |

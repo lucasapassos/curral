@@ -161,7 +161,7 @@ func TestQueryAPI(t *testing.T) {
 		{"admin attach", "admin", `{"sql":"ATTACH ':memory:' AS m"}`, 403, "ATTACH statements are not allowed"},
 		{"read only db", "admin", `{"sql":"INSERT INTO logs.events VALUES (1)"}`, 400, "read-only"},
 		{"bad sql", "analyst", `{"sql":"SELEC 1"}`, 400, "syntax error"},
-		{"multi statement", "admin", `{"sql":"SELECT 1; SELECT 2"}`, 400, "multi-statement"},
+		{"multi statement", "admin", `{"sql":"SELECT 1; SELECT 2"}`, 400, "one statement per request"},
 		{"bad format", "analyst", `{"sql":"SELECT 1","format":"xml"}`, 400, "unsupported format"},
 		{"unknown field", "analyst", `{"sql":"SELECT 1","foo":1}`, 400, "unknown field"},
 	}
