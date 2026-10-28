@@ -5,6 +5,12 @@ notes are taken from its section here.
 
 ## [Unreleased]
 
+## [v0.8.0] - 2026-10-27
+
+Agent discovery and onboarding ([#32](https://github.com/lucasapassos/curral/pull/32)),
+and semantic documents scoped to query permissions with delegated writes
+([#31](https://github.com/lucasapassos/curral/pull/31)).
+
 ### Added
 - `GET /v1/schema` reports `docs` on each table: how many semantic
   documents are about it, by the rule of the document filters, so a
@@ -33,7 +39,6 @@ notes are taken from its section here.
   `bm25` otherwise.
 - Each `POST /v1/docs/search` result carries `matched`: the question's
   terms found in the document and the fields holding them.
-
 - The server hands out its own agent skill, so an agent needs nothing but
   the URL: `GET /` describes the server (version, endpoints, authentication,
   the install command) and `GET /skill/...` serves `skills/curral`'s
