@@ -11,7 +11,8 @@ users:
   - name: etl
     password_hash: "$2a$10$bdAmoqFBIWf8pxbPhwQIj.Khrgcq4YPIhmNngGBHOHpCru4kkDHZO"
     roles: [etl]
-  # Writes semantic documents (/v1/docs); see docs_allow in policy.rego.
+  # Writes semantic documents (/v1/docs); see docs_allow in policy.rego. It
+  # reads sales and logs (roles.json): one documents what one can see.
   - name: poet
     password_hash: "$2a$10$F/vO73dQ9H99ZyksfWFk3.GTTZZi3Q0etLCcefxxq3OnhKhkmb4gu"
     roles: [poet]

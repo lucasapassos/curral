@@ -77,14 +77,16 @@ func (e *Engine) protect(ctx context.Context, c *duckdb.Conn, query string, args
 			remoteScans++
 		}
 	}
+	// References inside a DESCRIBE or SHOW return column metadata only and
+	// are answered while binding, so the plan has no scan for them.
 	for _, t := range slices.Sorted(maps.Keys(prot)) {
 		if e.IsRemote(t) {
-			if remoteScans != rw.remoteRefs {
+			if remoteScans != rw.remoteRefs-rw.metaRemoteRefs {
 				return "", false, errProtected("%s may be read indirectly (view or macro); query it directly", t)
 			}
 			continue
 		}
-		if scans[strings.ToLower(t)] != rw.refs[t] {
+		if scans[strings.ToLower(t)] != rw.refs[t]-rw.metaRefs[t] {
 			return "", false, errProtected("%s is read indirectly (view or macro); query it directly", t)
 		}
 	}
@@ -92,11 +94,15 @@ func (e *Engine) protect(ctx context.Context, c *duckdb.Conn, query string, args
 }
 
 // rewrite is a statement with its protected tables replaced, plus how many
-// direct references it had (per protected table, and to remote catalogs).
+// direct references it had (per protected table, and to remote catalogs),
+// and how many of those sit inside a DESCRIBE or SHOW: they reveal column
+// names and types, as GET /v1/schema does, never rows, and the plan does
+// not scan them.
 type rewrite struct {
-	sql        string
-	refs       map[string]int
-	remoteRefs int
+	sql            string
+	refs, metaRefs map[string]int
+	remoteRefs     int
+	metaRemoteRefs int
 	// needVars: some filter or mask reads getvariable() directly or calls a
 	// user macro (which might), so the session variables must be set.
 	needVars bool
@@ -138,17 +144,21 @@ func (e *Engine) buildRewrite(ctx context.Context, c *duckdb.Conn, query, databa
 
 	// Replace references, counting them per table (and references to remote
 	// catalogs, whose plan scans carry no table name).
-	refs := map[string]int{}
-	remoteRefs := 0
+	refs, metaRefs := map[string]int{}, map[string]int{}
+	remoteRefs, metaRemoteRefs := 0, 0
 	var subqueryErr error
-	var walk func(n any, ctes []string) any
-	walk = func(n any, ctes []string) any {
+	// meta: inside a DESCRIBE or SHOW (not SUMMARIZE, which reads the rows).
+	var walk func(n any, ctes []string, meta bool) any
+	walk = func(n any, ctes []string, meta bool) any {
 		switch v := n.(type) {
 		case []any:
 			for i := range v {
-				v[i] = walk(v[i], ctes)
+				v[i] = walk(v[i], ctes, meta)
 			}
 		case map[string]any:
+			if v["type"] == "SHOW_REF" && v["show_type"] != "SUMMARY" {
+				meta = true
+			}
 			if cm, ok := v["cte_map"].(map[string]any); ok {
 				entries, _ := cm["map"].([]any)
 				for _, en := range entries {
@@ -160,12 +170,13 @@ func (e *Engine) buildRewrite(ctx context.Context, c *duckdb.Conn, query, databa
 				}
 			}
 			// SHOW of a bare name describes the table without a reference
-			// the rewrite can replace (nor a scan in the plan): counting it
-			// refuses the statement, as DESCRIBE of the table is refused.
+			// the rewrite can replace, nor a scan in the plan: metadata
+			// only, like DESCRIBE.
 			if _, ok := v["query"].(map[string]any); v["type"] == "SHOW_REF" && !ok {
 				if name, ok := showName(v); ok {
 					if table, ok := byKey[strings.ToLower(e.qualify([]string{name}, database))]; ok {
 						refs[table]++
+						metaRefs[table]++
 					}
 				}
 			}
@@ -177,12 +188,18 @@ func (e *Engine) buildRewrite(ctx context.Context, c *duckdb.Conn, query, databa
 				qualified := e.qualify(parts, database)
 				if e.IsRemote(qualified) {
 					remoteRefs++
+					if meta {
+						metaRemoteRefs++
+					}
 				}
 				table, ok := byKey[strings.ToLower(qualified)]
 				if !ok {
 					return v
 				}
 				refs[table]++
+				if meta {
+					metaRefs[table]++
+				}
 				if v["sample"] != nil || v["at_clause"] != nil {
 					subqueryErr = errProtected("TABLESAMPLE/AT on protected table %s is not supported", table)
 					return v
@@ -195,12 +212,12 @@ func (e *Engine) buildRewrite(ctx context.Context, c *duckdb.Conn, query, databa
 				return sub
 			}
 			for k, x := range v {
-				v[k] = walk(x, ctes)
+				v[k] = walk(x, ctes, meta)
 			}
 		}
 		return n
 	}
-	walk(doc, nil)
+	walk(doc, nil, false)
 	if subqueryErr != nil {
 		return nil, subqueryErr
 	}
@@ -221,7 +238,7 @@ func (e *Engine) buildRewrite(ctx context.Context, c *duckdb.Conn, query, databa
 			return nil, err
 		}
 	}
-	return &rewrite{sql: sql, refs: refs, remoteRefs: remoteRefs, needVars: needVars}, nil
+	return &rewrite{sql: sql, refs: refs, metaRefs: metaRefs, remoteRefs: remoteRefs, metaRemoteRefs: metaRemoteRefs, needVars: needVars}, nil
 }
 
 // usesSessionVariables reports whether a protection query calls

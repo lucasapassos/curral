@@ -139,6 +139,7 @@ type serveFlags struct {
 	auditQueue     int
 	metricsListen  string
 	flightListen   string
+	serveSkill     string
 	oidcIssuer     string
 	oidcAudience   string
 	oidcUserClaim  string
@@ -195,6 +196,7 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.StringVar(&f.auditSQL, "audit-sql", server.AuditSQLRedacted, "SQL text in audit events: redacted (literals become ?), full or hash")
 	fs.IntVar(&f.auditQueue, "audit-queue", 4096, "audit events buffered in memory")
 	fs.StringVar(&f.metricsListen, "metrics-listen", "", "serve Prometheus /metrics on this separate address (e.g. 127.0.0.1:9090); empty disables")
+	fs.StringVar(&f.serveSkill, "serve-skill", server.SkillDocs, "how much of the agent skill to serve, unauthenticated, at GET / and GET /skill/...: docs (SKILL.md and the API reference; the scripts come from the repository at this version), all (also the scripts, over TLS or to loopback only) or off")
 	fs.StringVar(&f.flightListen, "flight-listen", "", "serve Arrow Flight SQL (JDBC/ADBC clients such as DBeaver and DataGrip) on this address, e.g. :31337, with the same users, policy, TLS and audit as HTTP; empty disables")
 	fs.StringVar(&f.oidcIssuer, "oidc-issuer", "", "accept bearer JWTs from this OIDC issuer (discovery + JWKS); empty disables")
 	fs.StringVar(&f.oidcAudience, "oidc-audience", "", "required audience (aud) of JWTs")
@@ -243,6 +245,11 @@ func parseFlags(args []string) (*serveFlags, error) {
 	}
 	if f.shortlist < 1 {
 		return nil, fmt.Errorf("--search-shortlist must be at least 1")
+	}
+	switch f.serveSkill {
+	case server.SkillDocs, server.SkillAll, server.SkillOff:
+	default:
+		return nil, fmt.Errorf("--serve-skill must be docs, all or off")
 	}
 	switch f.auditSQL {
 	case server.AuditSQLRedacted, server.AuditSQLFull, server.AuditSQLHash:
@@ -424,15 +431,16 @@ func runServe(args []string, checkOnly bool) error {
 	}
 
 	srv := &server.Server{
-		OIDC:     oidc,
-		Metrics:  mtr,
-		Engine:   eng,
-		Log:      log,
-		MaxRows:  f.maxRows,
-		MaxBody:  f.maxBody,
-		Audit:    aw,
-		AuditSQL: f.auditSQL,
-		Version:  version,
+		OIDC:       oidc,
+		Metrics:    mtr,
+		Engine:     eng,
+		Log:        log,
+		MaxRows:    f.maxRows,
+		MaxBody:    f.maxBody,
+		Audit:      aw,
+		AuditSQL:   f.auditSQL,
+		Version:    version,
+		ServeSkill: f.serveSkill,
 	}
 	if f.docsDir != "" {
 		if srv.Docs, err = docs.Open(f.docsDir); err != nil {

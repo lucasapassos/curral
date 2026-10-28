@@ -79,16 +79,27 @@ func TestProtectRefusals(t *testing.T) {
 		"CREATE TABLE crm.copy AS SELECT * FROM orders": "only be read with SELECT",
 		"SELECT * FROM orders TABLESAMPLE 50%":          "TABLESAMPLE",
 		"EXPLAIN SELECT * FROM orders":                  "only be read with SELECT",
-		// Metadata reads the rewrite cannot reach are refused alike.
-		"DESCRIBE orders":             "indirectly",
-		"SHOW orders":                 "indirectly",
-		"SHOW sales.main.orders":      "indirectly",
-		"SELECT * FROM (SHOW orders)": "indirectly",
 	} {
 		_, err := runProtected(e, sql, nil)
 		if !errors.Is(err, ErrForbidden) || !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: %v", sql, err)
 		}
+	}
+	// DESCRIBE and SHOW return column names and types, as GET /v1/schema
+	// does for the same caller, never rows: they are answered over the
+	// protected subquery (the masked column keeps the mask's type), while a
+	// view wrapping them still reads the table indirectly.
+	for _, sql := range []string{"DESCRIBE orders", "SHOW orders", "SHOW sales.main.orders", "SELECT * FROM (SHOW orders)",
+		"DESCRIBE SELECT amount FROM orders", "SELECT column_name FROM (DESCRIBE orders), (SELECT 1)"} {
+		rows, err := runProtected(e, sql, nil)
+		if err != nil || len(rows) == 0 {
+			t.Errorf("%s: %v %v", sql, rows, err)
+		}
+	}
+	// A view over the table describes fine too (its columns, no rows), while
+	// reading it still does not.
+	if rows, err := runProtected(e, "DESCRIBE big_orders", nil); err != nil || len(rows) == 0 {
+		t.Errorf("DESCRIBE of a view over the table: %v %v", rows, err)
 	}
 	// PIVOT expands into several statements and is refused before any check.
 	if _, err := runProtected(e, "PIVOT orders ON id USING sum(amount)", nil); err == nil {

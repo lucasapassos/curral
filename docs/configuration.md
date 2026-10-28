@@ -62,6 +62,7 @@ list: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--audit-sql` | `redacted` | SQL text in the audit log: `redacted`, `full` or `hash` |
 | `--audit-queue` | 4096 | in-memory events waiting to be written |
 | `--metrics-listen` | (off) | separate address for the Prometheus `/metrics`, e.g. `127.0.0.1:9090` |
+| `--serve-skill` | `docs` | how much of the agent skill to serve, unauthenticated, at `GET /` and `GET /skill/...`: `docs` (SKILL.md and the API reference; scripts come from the repository at this version), `all` (also the scripts, over TLS or to loopback only) or `off`; see [AI agents](agents.md) |
 | `--flight-listen` | (off) | serve [Flight SQL](api.md#flight-sql-dbeaver-datagrip-jdbc-adbc) (DBeaver, DataGrip, JDBC, ADBC) on this address, e.g. `:31337`, with the same users, policy, TLS and audit |
 | `--tls-cert` / `--tls-key` | (plain HTTP) | native HTTPS, TLS 1.2+; the certificate reloads on `SIGHUP` |
 | `--trusted-proxy` | (none) | IP/CIDR of a proxy allowed to set `X-Forwarded-For`, repeatable |

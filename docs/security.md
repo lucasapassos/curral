@@ -20,6 +20,22 @@ To report a vulnerability, see [SECURITY.md](../SECURITY.md).
 - **One transaction per request**: inspection, authorization and execution see the same snapshot. Remote catalog metadata is fetched once per request; failures roll back.
 - **No metadata in errors**: binder hints that could name objects the caller cannot read are stripped from responses (see [API](api.md#post-v1query)).
 
+## The agent skill
+
+`GET /` and `GET /skill/...` need no authentication. They serve the agent
+skill's **documentation** (`SKILL.md`, `references/api.md`), which is public
+and the same as in the repository. The skill's **scripts** are code the
+agent executes and that reads its credentials file, so by default
+(`--serve-skill docs`) the server does not serve them: it names the
+repository URL pinned to its own version, and the agent fetches them from
+there. `--serve-skill all` serves them too, for networks without access to
+GitHub, over TLS or to loopback only; it makes whoever controls the server,
+or the connection to it, able to run code on every agent's machine. Note
+that the server already influences agents through what it serves (table
+comments, semantic documents, error messages), as any data source does;
+`--serve-skill off` removes the two routes if even the documentation is
+unwanted.
+
 ## Audit log
 
 With `--audit-log`, each request produces one JSON line in a dedicated file,
