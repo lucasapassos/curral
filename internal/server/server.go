@@ -73,6 +73,10 @@ type Server struct {
 	// document) or DocsScopeSchema (a document about tables is served only
 	// when the caller may read one of them).
 	DocsScope string
+	// DocsValidateNames is DocsNamesOff (tables and schemas are saved as
+	// written), DocsNamesWarn or DocsNamesStrict: writes resolve them to
+	// qualified catalog names, logging or refusing those that do not.
+	DocsValidateNames string
 	// Judge, when set, decides which documents /v1/docs/search returns and
 	// ranks them; nil ranks by BM25 alone.
 	Judge           rerank.Judge

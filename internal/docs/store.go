@@ -175,7 +175,8 @@ func (s *Store) Count(tables []string, allow func(Doc) bool) map[string]int {
 
 // Check vets a write just before it is saved: old is the current document
 // (nil on create), next the one about to be saved (nil on delete). An error
-// cancels the write and is returned as is.
+// cancels the write and is returned as is. A check may rewrite next's
+// tables and schemas (to qualified names); what it leaves is saved.
 type Check func(old, next *Doc) error
 
 // Create stores a new document written by user.

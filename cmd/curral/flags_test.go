@@ -23,6 +23,18 @@ func TestParseFlagsDocsScope(t *testing.T) {
 	if f, err := parseFlags(slices.Concat(base, []string{"--docs-scope", "schema", "--docs-dir", "docs"})); err != nil || f.docsScope != server.DocsScopeSchema {
 		t.Fatalf("scope with docs: %+v %v", f, err)
 	}
+	if f, err := parseFlags(base); err != nil || f.docsNames != server.DocsNamesOff {
+		t.Fatalf("default names: %+v %v", f, err)
+	}
+	if _, err := parseFlags(slices.Concat(base, []string{"--docs-validate-names", "bogus"})); err == nil || !strings.Contains(err.Error(), "--docs-validate-names must be") {
+		t.Fatalf("bogus names: %v", err)
+	}
+	if _, err := parseFlags(slices.Concat(base, []string{"--docs-validate-names", "strict"})); err == nil || !strings.Contains(err.Error(), "needs --docs-dir") {
+		t.Fatalf("names without docs: %v", err)
+	}
+	if f, err := parseFlags(slices.Concat(base, []string{"--docs-validate-names", "warn", "--docs-dir", "docs"})); err != nil || f.docsNames != server.DocsNamesWarn {
+		t.Fatalf("names with docs: %+v %v", f, err)
+	}
 	if _, err := parseFlags(nil); err == nil || !strings.Contains(err.Error(), "missing required flags: --catalog, --users, --policy") {
 		t.Fatalf("no flags: %v", err)
 	}

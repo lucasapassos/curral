@@ -19,6 +19,12 @@ notes are taken from its section here.
   (lists of up to 100 names, any of which matches) besides `table` and
   `schema`; the filters apply before ranking, so documents outside them
   take no place in the shortlist or the limit.
+- `--docs-validate-names off|warn|strict` (default `off`): document writes
+  resolve `context.tables` and `context.schemas` to qualified catalog
+  names, so scopes and clients match them exactly. `strict` refuses (400)
+  a name that fits no object or several; `warn` keeps such names and logs
+  them. The policy sees the resolved names. Resolution reads the whole
+  catalog, so a writer learns whether a name exists.
 
 ### Changed
 - `GET /v1/docs` and `POST /v1/docs/search` list the caller's schema (one

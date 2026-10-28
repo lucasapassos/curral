@@ -669,3 +669,78 @@ func TestSchemaDocCount(t *testing.T) {
 	lastServer.Docs = nil
 	check("disabled", counts("admin", ""), want{"sales.main.orders": 0})
 }
+
+// With --docs-validate-names, writes resolve tables and schemas to their
+// qualified catalog names: strict refuses what fits none or several
+// objects, warn keeps it, off saves everything as written. The policy sees
+// the resolved names.
+func TestDocsValidateNames(t *testing.T) {
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := newServerWithAudit(t, "", func(s *Server) { s.Docs, s.DocsValidateNames = store, DocsNamesStrict })
+	lastServer.SetPolicy(loadRego(t, `allow if "admin" in input.roles
+docs_allow if "poet" in input.roles
+docs_allow if { "admin" in input.roles; every t in input.doc.tables { startswith(t, "sales.") } }`))
+	for _, ddl := range []string{"CREATE SCHEMA sales.hr", "CREATE TABLE sales.hr.salaries(name VARCHAR)"} {
+		if r := do(t, ts, "admin", `{"sql":"`+ddl+`"}`); r.status != 200 {
+			t.Fatalf("%s: %d %s", ddl, r.status, r.body)
+		}
+	}
+	body := func(tables, schemas string) string {
+		return `{"header":{"title":"t"},"context":{"tables":` + tables + `,"schemas":` + schemas + `,"body":"b"}}`
+	}
+	created := func(r result) docs.Doc {
+		t.Helper()
+		if r.status != 201 && r.status != 200 {
+			t.Fatalf("write: %d %s", r.status, r.body)
+		}
+		var d docs.Doc
+		json.Unmarshal([]byte(r.body), &d)
+		return d
+	}
+	// The poet, who may query nothing, still resolves names: that is the
+	// documented cost of the check.
+	d := created(docReq(t, ts, "POST", "poet", "/v1/docs", body(`["orders","Sales.Main.Orders","main.events"]`, `["sales.main","logs.MAIN"]`)))
+	if !slices.Equal(d.Context.Tables, []string{"sales.main.orders", "logs.main.events"}) || !slices.Equal(d.Context.Schemas, []string{"sales.main", "logs.main"}) {
+		t.Fatalf("resolved: %+v", d.Context)
+	}
+	for _, c := range []struct{ tables, schemas, want string }{
+		{`["nope"]`, `[]`, `"nope" is not a table`},
+		{`["salaries"]`, `[]`, `"salaries" fits several tables`},
+		{`[]`, `["main"]`, `"main" fits several schemas`},
+		{`[]`, `["sales"]`, `"sales" is not a schema`},
+	} {
+		r := docReq(t, ts, "POST", "poet", "/v1/docs", body(c.tables, c.schemas))
+		var e struct{ Error string }
+		json.Unmarshal([]byte(r.body), &e)
+		if r.status != 400 || !strings.Contains(e.Error, c.want) {
+			t.Errorf("%s %s: %d %s", c.tables, c.schemas, r.status, r.body)
+		}
+	}
+	// Updates resolve too, and the policy judges the resolved names: the
+	// admin may write about sales tables, by whatever name.
+	d = created(docReq(t, ts, "PATCH", "admin", "/v1/docs/"+d.ID, `{"context":{"tables":["hr.salaries"],"schemas":null}}`))
+	if !slices.Equal(d.Context.Tables, []string{"sales.hr.salaries"}) || d.Context.Schemas != nil {
+		t.Fatalf("patched: %+v", d.Context)
+	}
+	if r := docReq(t, ts, "PUT", "admin", "/v1/docs/"+d.ID, body(`["events"]`, `[]`)); r.status != 403 {
+		t.Fatalf("policy on resolved names: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "PUT", "admin", "/v1/docs/"+d.ID, body(`["nope"]`, `[]`)); r.status != 400 {
+		t.Fatalf("put strict: %d %s", r.status, r.body)
+	}
+
+	// Warn qualifies what resolves and keeps the rest; off touches nothing.
+	lastServer.DocsValidateNames = DocsNamesWarn
+	d = created(docReq(t, ts, "POST", "poet", "/v1/docs", body(`["orders","salaries","nope"]`, `["main"]`)))
+	if !slices.Equal(d.Context.Tables, []string{"sales.main.orders", "salaries", "nope"}) || !slices.Equal(d.Context.Schemas, []string{"main"}) {
+		t.Fatalf("warn: %+v", d.Context)
+	}
+	lastServer.DocsValidateNames = DocsNamesOff
+	d = created(docReq(t, ts, "POST", "poet", "/v1/docs", body(`["orders","nope"]`, `[]`)))
+	if !slices.Equal(d.Context.Tables, []string{"orders", "nope"}) {
+		t.Fatalf("off: %+v", d.Context)
+	}
+}

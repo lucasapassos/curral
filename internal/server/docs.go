@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -19,8 +20,9 @@ import (
 // policy's docs decision says who creates, updates and deletes them.
 
 var (
-	errDocDenied = errors.New("not allowed to write semantic documents")
-	errDocPolicy = errors.New("policy evaluation failed")
+	errDocDenied  = errors.New("not allowed to write semantic documents")
+	errDocPolicy  = errors.New("policy evaluation failed")
+	errDocCatalog = errors.New("catalog unavailable: write refused")
 )
 
 // Values of --docs-scope.
@@ -31,6 +33,48 @@ const (
 
 // ValidDocsScope reports whether v is a --docs-scope value.
 func ValidDocsScope(v string) bool { return v == DocsScopeAll || v == DocsScopeSchema }
+
+// Values of --docs-validate-names.
+const (
+	DocsNamesOff    = "off"    // tables and schemas are saved as written
+	DocsNamesWarn   = "warn"   // resolved names are qualified; the rest logged
+	DocsNamesStrict = "strict" // a name not resolving to one object is a 400
+)
+
+// ValidDocsNames reports whether v is a --docs-validate-names value.
+func ValidDocsNames(v string) bool {
+	return v == DocsNamesOff || v == DocsNamesWarn || v == DocsNamesStrict
+}
+
+// resolveDocNames rewrites the tables and schemas d names to their
+// qualified catalog names, as --docs-validate-names says: nothing when off,
+// and under strict an error (a 400) for a name fitting none or several
+// objects, which warn only logs. The catalog is read whole, not through
+// the writer's policy: a writer thus learns whether a name exists, which
+// is documented, but never what the object holds.
+func (s *Server) resolveDocNames(ctx context.Context, ev *audit.Event, d *docs.Doc) error {
+	mode := s.DocsValidateNames
+	if mode == "" || mode == DocsNamesOff || s.Engine == nil {
+		return nil
+	}
+	var names []string
+	_, err := s.Engine.Schema(ctx, engine.SchemaFilter{}, func(_ context.Context, t engine.TableSchema, _ engine.Inspection) (bool, error) {
+		names = append(names, t.Qualified())
+		return false, nil // the names are all that is needed
+	})
+	if err != nil {
+		s.Log.Error("document write refused: catalog unavailable", "request_id", ev.RequestID, "err", err)
+		return errDocCatalog
+	}
+	unresolved, err := docs.NewCatalog(names).Normalize(d, mode == DocsNamesStrict)
+	if err != nil {
+		return err
+	}
+	if len(unresolved) > 0 {
+		s.Log.Warn("document names not in the catalog", "request_id", ev.RequestID, "user", ev.User, "names", unresolved)
+	}
+	return nil
+}
 
 // docsScope is the configured scope, DocsScopeAll when unset.
 func (s *Server) docsScope() string {
@@ -366,12 +410,18 @@ func (s *Server) docWriter(action string) handler {
 		}
 
 		pol := s.Policy()
+		// The names are resolved first, so the policy sees qualified ones.
 		// The policy sees both versions: a rule scoped to some tables must
 		// check what the document is about now (current) as well as what it
 		// will be about (doc), or an update could take over any document.
 		// A delegated write (docs_write key) carries the identity and the
 		// actor, so the policy can tie what a service may write to its users.
 		check := func(old, next *docs.Doc) error {
+			if next != nil {
+				if err := s.resolveDocNames(r.Context(), ev, next); err != nil {
+					return err
+				}
+			}
 			input := map[string]any{"action": action, "user": p.Name, "roles": p.Roles}
 			policyIdentity(input, p)
 			if old != nil {
@@ -425,6 +475,9 @@ func (s *Server) docWriter(action string) handler {
 			finish(http.StatusForbidden, "deny", "policy", err.Error())
 		case errors.Is(err, errDocPolicy):
 			finish(http.StatusInternalServerError, "error", "policy", err.Error())
+		case errors.Is(err, errDocCatalog):
+			w.Header().Set("Retry-After", "1")
+			finish(http.StatusServiceUnavailable, "error", "catalog", err.Error())
 		case err != nil:
 			s.Log.Error("document write failed", "request_id", ev.RequestID, "err", err)
 			finish(http.StatusInternalServerError, "error", "docs", "could not save the document")

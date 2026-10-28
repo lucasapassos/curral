@@ -120,7 +120,8 @@ people) to read before writing queries. Each one is a JSON file,
 
 - **Required:** `header.title` (up to 200 characters) and `context.body`; each
   `sqls[]` item needs `sql`. Everything else is optional. `tables` and
-  `schemas` are free text, not checked against the catalog.
+  `schemas` are free text, not checked against the catalog unless
+  `--docs-validate-names` says so (below).
 - **Server-set:** `id`, `author` (who created it), `created_at`, `updated_at`
   and `updated_by` (who changed it last). Values sent for them are ignored, so
   a document from a `GET` can be sent back as is. Unknown fields are a 400.
@@ -162,6 +163,17 @@ people) to read before writing queries. Each one is a JSON file,
   by the policy; see [Authorization](authorization.md#semantic-documents).
   A delegating key writes only when marked `docs_write`, and then as the
   identity it names; see [delegation](delegation.md#semantic-documents).
+- **Names:** with `--docs-validate-names strict`, a write resolves each
+  entry of `context.tables` and `context.schemas` to one catalog object
+  (by its qualified name, or by its last parts when only one object fits)
+  and saves the qualified name, so scopes, filters and clients match it
+  exactly; a name fitting nothing or several objects is a 400 naming it.
+  `warn` qualifies what resolves and keeps the rest as written, logging it;
+  `off`, the default, saves names as written. The policy sees the resolved
+  names. The catalog is read whole for this, not through the writer's
+  policy: a writer learns whether a name exists, never what the object
+  holds. While the catalog cannot be read the write is refused (503,
+  `Retry-After`).
 - **Concurrent edits:** `GET` returns an `ETag`; send it back in `If-Match` on
   `PUT`, `PATCH` or `DELETE` and the write fails with 412 if someone else
   changed the document in between.
