@@ -73,6 +73,14 @@ type Server struct {
 	ServeSkill string
 
 	Docs *docs.Store // semantic documents; nil disables /v1/docs
+	// DocsScope is DocsScopeAll (every authenticated user reads every
+	// document) or DocsScopeSchema (a document about tables is served only
+	// when the caller may read one of them).
+	DocsScope string
+	// DocsValidateNames is DocsNamesOff (tables and schemas are saved as
+	// written), DocsNamesWarn or DocsNamesStrict: writes resolve them to
+	// qualified catalog names, logging or refusing those that do not.
+	DocsValidateNames string
 	// Judge, when set, decides which documents /v1/docs/search returns and
 	// ranks them; nil ranks by BM25 alone.
 	Judge           rerank.Judge
@@ -1161,16 +1169,28 @@ type schemaResponse struct {
 
 // schema lists tables and views with their columns, keeping only those the
 // caller could read; see listSchema. ?database=, ?schema= and ?table=
-// narrow the listing.
+// narrow the listing. With semantic documents, each table says how many
+// are about it; under --docs-scope schema that needs the caller's scope,
+// which an unfiltered listing is, so it is listed once.
 func (s *Server) schema(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
 	q := r.URL.Query()
 	f := engine.SchemaFilter{Database: q.Get("database"), Schema: q.Get("schema"), Table: q.Get("table")}
-	tables, status, msg := s.listSchema(r.Context(), p, s.newEvent(r, "schema", p), f, nil)
-	if status != http.StatusOK {
-		if status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests {
-			w.Header().Set("Retry-After", "1")
+	var all []string
+	var match func(engine.TableSchema) bool
+	whole := s.Docs != nil && s.docsScope() == DocsScopeSchema && f == (engine.SchemaFilter{})
+	if whole {
+		match = func(t engine.TableSchema) bool { all = append(all, t.Qualified()); return true }
+	}
+	tables, status, msg := s.listSchema(r.Context(), p, s.newEvent(r, "schema", p), f, match)
+	if status == http.StatusOK && s.Docs != nil {
+		var scope *docs.Scope
+		if whole {
+			scope = docs.NewScope(all, qualifiedNames(tables))
 		}
-		writeError(w, status, msg)
+		status, msg = s.countDocs(r, p, tables, scope)
+	}
+	if status != http.StatusOK {
+		writeSchemaError(w, status, msg)
 		return
 	}
 	writeJSON(w, http.StatusOK, schemaResponse{

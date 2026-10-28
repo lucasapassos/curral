@@ -6,6 +6,34 @@ notes are taken from its section here.
 ## [Unreleased]
 
 ### Added
+- `GET /v1/schema` reports `docs` on each table: how many semantic
+  documents are about it, by the rule of the document filters, so a
+  listing filtered by the table's name shows exactly them; omitted when
+  none. Under `--docs-scope schema` only documents the caller may read
+  count. A client can skip listing documents for tables without any.
+- Documents served by `GET /v1/docs`, `GET /v1/docs/{id}` and `POST
+  /v1/docs/search` can carry `accessible_tables` and `inaccessible_tables`:
+  which of their `tables` the caller may query, by the caller's
+  `/v1/schema` listing. Always under `--docs-scope schema`; under `all`
+  when asked with `?access=true` (`"access": true` in a search).
+- `GET /v1/docs` and `POST /v1/docs/search` take `tables` and `schemas`
+  (lists of up to 100 names, any of which matches) besides `table` and
+  `schema`; the filters apply before ranking, so documents outside them
+  take no place in the shortlist or the limit.
+- `--docs-validate-names off|warn|strict` (default `off`): document writes
+  resolve `context.tables` and `context.schemas` to qualified catalog
+  names, so scopes and clients match them exactly. `strict` refuses (400)
+  a name that fits no object or several; `warn` keeps such names and logs
+  them. The policy sees the resolved names. Resolution reads the whole
+  catalog, so a writer learns whether a name exists.
+- `GET /v1/docs` returns the collection's `ETag` (the documents shown, their
+  versions and the caller's access to their tables) and answers 304 to a
+  matching `If-None-Match`.
+- `GET /v1/capabilities` reports `docs.ranker`: `jev` with `--jev-key`,
+  `bm25` otherwise.
+- Each `POST /v1/docs/search` result carries `matched`: the question's
+  terms found in the document and the fields holding them.
+
 - The server hands out its own agent skill, so an agent needs nothing but
   the URL: `GET /` describes the server (version, endpoints, authentication,
   the install command) and `GET /skill/...` serves `skills/curral`'s
@@ -28,6 +56,25 @@ notes are taken from its section here.
   writes semantic documents can see the tables it documents.
 
 ### Changed
+- Document filters match names both ways: `?table=sales.main.orders` finds
+  a document about `orders` as `?table=orders` already found one about
+  `sales.main.orders`.
+- `--docs-scope schema`: a semantic document that names tables or schemas
+  is served only to callers who may query at least one of them, as listed
+  by `/v1/schema` and audited as `docs_scope`. Reads and writes alike
+  answer 404 for an out-of-scope id, a short name shared across databases
+  counts only when every table it fits is readable, and documents naming
+  no table or schema reach everyone. The default `all` keeps serving every
+  document to every authenticated user.
+- `GET /v1/capabilities` reports `docs` (`enabled`, `scope`,
+  `delegated_writes`), so a client knows whether `/v1/docs` is served
+  without probing it.
+- Delegated document writes: a delegating key with `docs_write: true`
+  creates, updates and deletes semantic documents on behalf of the identity
+  it names. The docs decision then sees `input.identity` and `input.actor`
+  and the document's author is the identity. Without the flag, delegated
+  requests keep refusing writes; the flag on a key without `delegation` is
+  refused when the users file loads.
 - `DESCRIBE` and `SHOW` of a table with row filters or masks return its
   columns, as `GET /v1/schema` already does for the same caller, instead of
   being refused as indirect reads; `SUMMARIZE` keeps reading the protected

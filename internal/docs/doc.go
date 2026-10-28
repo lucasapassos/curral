@@ -148,10 +148,7 @@ func mergePatch(target, patch any) any {
 // Matches reports whether d passes f. Empty filter fields match everything;
 // comparisons ignore case.
 func (d Doc) Matches(f Filter) bool {
-	if f.Table != "" && !nameIn(f.Table, d.Context.Tables) {
-		return false
-	}
-	if f.Schema != "" && !nameIn(f.Schema, d.Context.Schemas) {
+	if !anyNameIn(f.Table, f.Tables, d.Context.Tables) || !anyNameIn(f.Schema, f.Schemas, d.Context.Schemas) {
 		return false
 	}
 	if q := strings.ToLower(strings.TrimSpace(f.Q)); q != "" {
@@ -160,25 +157,64 @@ func (d Doc) Matches(f Filter) bool {
 			return false
 		}
 	}
+	if f.Allow != nil && !f.Allow(d) {
+		return false
+	}
 	return true
 }
 
-// nameIn matches a name exactly or as the last parts of a qualified one, so
-// "orders" and "main.orders" both find "sales.main.orders".
+// Unscoped reports whether d is about no table or schema in particular,
+// so every Scope shows it.
+func (d Doc) Unscoped() bool { return len(d.Context.Tables) == 0 && len(d.Context.Schemas) == 0 }
+
+// nameIn reports whether name fits an entry of list: the same name, or
+// either the last parts of the other, so "orders" and "sales.main.orders"
+// find each other and "main.orders" finds both. Case is ignored. The same
+// rule counts documents per table (Store.Count), so a count and a filter
+// by the same name agree.
 func nameIn(name string, list []string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
 	for _, s := range list {
-		s = strings.ToLower(s)
-		if s == name || strings.HasSuffix(s, "."+name) {
+		if namesFit(strings.ToLower(s), name) {
 			return true
 		}
 	}
 	return false
 }
 
-// Filter narrows a listing.
+// namesFit reports whether two lowercase names fit each other: equal, or
+// one ending with "." and the other.
+func namesFit(a, b string) bool {
+	return a == b || strings.HasSuffix(a, "."+b) || strings.HasSuffix(b, "."+a)
+}
+
+// anyNameIn reports whether list names one (or Tables, if given) or more
+// of the wanted names; no wanted name matches everything.
+func anyNameIn(one string, wanted, list []string) bool {
+	if one == "" && len(wanted) == 0 {
+		return true
+	}
+	if one != "" && nameIn(one, list) {
+		return true
+	}
+	for _, w := range wanted {
+		if nameIn(w, list) {
+			return true
+		}
+	}
+	return false
+}
+
+// Filter narrows a listing. A document passes when it is about Table or
+// any of Tables (if either is given), about Schema or any of Schemas
+// (likewise), and matches Q and Allow.
 type Filter struct {
-	Table  string // a table the document is about
-	Schema string // a schema the document is about
-	Q      string // substring of title, description or used_for
+	Table   string   // a table the document is about
+	Tables  []string // tables the document may be about (any of them)
+	Schema  string   // a schema the document is about
+	Schemas []string // schemas the document may be about (any of them)
+	Q       string   // substring of title, description or used_for
+	// Allow, when set, is an extra condition every document must pass
+	// (used to scope documents to the tables a caller may read).
+	Allow func(Doc) bool
 }

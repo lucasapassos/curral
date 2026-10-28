@@ -130,6 +130,10 @@ type APIKey struct {
 	// Attributes describe the service to the policy (input.actor.attributes)
 	// and to the service itself (GET /v1/capabilities), e.g. its tenant.
 	Attributes map[string]string `yaml:"attributes"`
+	// DocsWrite lets a delegating key create, update and delete semantic
+	// documents on behalf of the identity it names, when the docs policy
+	// allows that identity. Without it, delegated requests never write.
+	DocsWrite bool `yaml:"docs_write"`
 }
 
 // ExpiresAt parses Expires; zero means no expiry.
@@ -307,6 +311,9 @@ func LoadUsers(path string) (*Users, error) {
 			if !identRe.MatchString(name) || len(name) > 64 || len(v) > 256 || strings.ContainsAny(v, "\r\n\x00") {
 				return nil, fmt.Errorf("%s: api key %q: invalid attribute %q", path, k.Name, name)
 			}
+		}
+		if k.DocsWrite && !k.Delegation {
+			return nil, fmt.Errorf("%s: api key %q: docs_write needs delegation: true", path, k.Name)
 		}
 		keys[k.Name] = true
 		if _, err := k.ExpiresAt(); err != nil {

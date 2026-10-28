@@ -25,7 +25,8 @@ const (
 	// Flight handshake): a delegating key needs no identity there.
 	surfaceIntro
 	// surfaceWrite changes state on the caller's behalf (document writes):
-	// never delegated.
+	// delegated only by a key marked docs_write, and then as the effective
+	// identity, which the docs policy still has to allow.
 	surfaceWrite
 )
 
@@ -47,7 +48,7 @@ func (s *Server) executionPrincipal(p *auth.Principal, effective, caller []strin
 	}
 	switch {
 	case len(effective) == 1:
-		if on != surfaceRead {
+		if on != surfaceRead && !(on == surfaceWrite && p.DocsWrite) {
 			return nil, auth.ErrExecutionIdentity
 		}
 		c, err := auth.DecodeExecutionContext(effective[0])
@@ -106,5 +107,20 @@ func (s *Server) capabilities(w http.ResponseWriter, r *http.Request, p *auth.Pr
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"execution_context_version": 1, "version": s.Version,
 		"delegation_required": p.Delegation, "subject": p.Name, "attributes": attrs,
-		"formats": []string{"json", "csv", "ndjson", "arrow"}})
+		"formats": []string{"json", "csv", "ndjson", "arrow"}, "docs": s.docsCapability(p)})
+}
+
+// docsCapability tells a client whether /v1/docs is served, whether documents
+// are scoped to the tables the identity may read, what ranks a search (jev
+// when a Judge is configured, bm25 otherwise) and whether this key may
+// write documents on behalf of the identities it names.
+func (s *Server) docsCapability(p *auth.Principal) map[string]any {
+	if s.Docs == nil {
+		return map[string]any{"enabled": false}
+	}
+	ranker := "bm25"
+	if s.Judge != nil {
+		ranker = "jev"
+	}
+	return map[string]any{"enabled": true, "scope": s.docsScope(), "ranker": ranker, "delegated_writes": p.Delegation && p.DocsWrite}
 }

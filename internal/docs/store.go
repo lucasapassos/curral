@@ -116,26 +116,86 @@ func (s *Store) Get(id string) (Doc, string, error) {
 
 // List returns the documents matching f, most recently updated first.
 func (s *Store) List(f Filter) []Doc {
+	out, _ := s.ListTagged(f)
+	return out
+}
+
+// ListTagged is List with each document's ETag, in the same order.
+func (s *Store) ListTagged(f Filter) ([]Doc, []string) {
 	s.mu.RLock()
-	out := make([]Doc, 0, len(s.ids))
+	hits := make([]entry, 0, len(s.ids))
 	for _, e := range s.ids {
 		if e.doc.Matches(f) {
-			out = append(out, e.doc)
+			hits = append(hits, e)
 		}
 	}
 	s.mu.RUnlock()
-	slices.SortFunc(out, func(a, b Doc) int {
-		if c := b.Header.UpdatedAt.Compare(a.Header.UpdatedAt); c != 0 {
+	slices.SortFunc(hits, func(a, b entry) int {
+		if c := b.doc.Header.UpdatedAt.Compare(a.doc.Header.UpdatedAt); c != 0 {
 			return c
 		}
-		return strings.Compare(a.ID, b.ID)
+		return strings.Compare(a.doc.ID, b.doc.ID)
 	})
+	out, tags := make([]Doc, len(hits)), make([]string, len(hits))
+	for i, e := range hits {
+		out[i], tags[i] = e.doc, e.etag
+	}
+	return out, tags
+}
+
+// Count returns, for each qualified table name in tables, how many
+// documents passing allow (every one when nil) are about it: a document
+// counts when one of its tables fits the name as a Filter by that name
+// would find the document (the same name, or either the last parts of the
+// other), and once however many of its names fit. Keys are the names as
+// given.
+func (s *Store) Count(tables []string, allow func(Doc) bool) map[string]int {
+	// A document name fits a given name by being its last parts (bySuffix)
+	// or by ending with it (given).
+	bySuffix, given := map[string][]string{}, map[string]bool{}
+	for _, t := range tables {
+		t = strings.ToLower(t)
+		given[t] = true
+		indexAs(bySuffix, t)
+	}
+	counts := make(map[string]int, len(tables))
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, e := range s.ids {
+		if allow != nil && !allow(e.doc) {
+			continue
+		}
+		seen := map[string]bool{}
+		for _, n := range e.doc.Context.Tables {
+			n = strings.ToLower(strings.TrimSpace(n))
+			fits := bySuffix[n]
+			for _, k := range suffixes(n)[1:] {
+				if given[k] {
+					fits = append(fits, k)
+				}
+			}
+			for _, t := range fits {
+				if !seen[t] {
+					seen[t] = true
+					counts[t]++
+				}
+			}
+		}
+	}
+	// Keys as given: the index lowercased them.
+	out := make(map[string]int, len(counts))
+	for _, t := range tables {
+		if n := counts[strings.ToLower(t)]; n > 0 {
+			out[t] = n
+		}
+	}
 	return out
 }
 
 // Check vets a write just before it is saved: old is the current document
 // (nil on create), next the one about to be saved (nil on delete). An error
-// cancels the write and is returned as is.
+// cancels the write and is returned as is. A check may rewrite next's
+// tables and schemas (to qualified names); what it leaves is saved.
 type Check func(old, next *Doc) error
 
 // Create stores a new document written by user.
@@ -187,7 +247,7 @@ func (s *Store) update(id, user, ifMatch string, check Check, change func(Doc) (
 	if !ok {
 		return Doc{}, "", ErrNotFound
 	}
-	if !matches(ifMatch, e.etag) {
+	if !ETagMatches(ifMatch, e.etag) {
 		return Doc{}, "", ErrPrecondition
 	}
 	in, err := change(e.doc)
@@ -216,7 +276,7 @@ func (s *Store) Delete(id, ifMatch string, check Check) error {
 	if !ok {
 		return ErrNotFound
 	}
-	if !matches(ifMatch, e.etag) {
+	if !ETagMatches(ifMatch, e.etag) {
 		return ErrPrecondition
 	}
 	if check != nil {
@@ -268,7 +328,10 @@ func (s *Store) write(d Doc) (Doc, string, error) {
 
 func (s *Store) path(id string) string { return filepath.Join(s.dir, id+".json") }
 
-func matches(ifMatch, tag string) bool {
+// ETagMatches reports whether an If-Match (or If-None-Match) header names
+// tag: no header and "*" match anything, otherwise one of the listed tags,
+// weak or not, must be it.
+func ETagMatches(ifMatch, tag string) bool {
 	if ifMatch == "" || ifMatch == "*" {
 		return true
 	}

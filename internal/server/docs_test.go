@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -127,6 +128,23 @@ func TestDocsAPI(t *testing.T) {
 	r = docReq(t, ts, "GET", "analyst", "/v1/docs?table=customers", "")
 	if json.Unmarshal([]byte(r.body), &list); len(list.Docs) != 0 {
 		t.Fatalf("filtered list: %s", r.body)
+	}
+	// Lists match any name, repeated or comma-separated; not with the
+	// single form, and capped.
+	for _, query := range []string{"?tables=customers,orders", "?tables=customers&tables=orders", "?tables=,orders,"} {
+		r = docReq(t, ts, "GET", "analyst", "/v1/docs"+query, "")
+		if json.Unmarshal([]byte(r.body), &list); r.status != 200 || len(list.Docs) != 1 {
+			t.Fatalf("%s: %d %s", query, r.status, r.body)
+		}
+	}
+	r = docReq(t, ts, "GET", "analyst", "/v1/docs?tables=orders&schemas=main", "")
+	if json.Unmarshal([]byte(r.body), &list); r.status != 200 || len(list.Docs) != 0 {
+		t.Fatalf("tables and schemas both apply: %d %s", r.status, r.body)
+	}
+	for _, query := range []string{"?table=orders&tables=orders", "?schema=a&schemas=b", "?tables=" + strings.Repeat("t,", maxFilterNames) + "t"} {
+		if r := docReq(t, ts, "GET", "analyst", "/v1/docs"+query, ""); r.status != 400 {
+			t.Fatalf("%s: %d %s", query, r.status, r.body)
+		}
 	}
 	for _, path := range []string{"/v1/docs/nope", "/v1/docs/..%2Fetc", "/v1/docs/0000000000000000"} {
 		if r := docReq(t, ts, "GET", "analyst", path, ""); r.status != 404 {
@@ -273,5 +291,661 @@ other_tables if { some t in input.current.tables; not startswith(t, "sales.") }
 	}
 	if r := docReq(t, ts, "DELETE", "poet", "/v1/docs/"+id(own), ""); r.status != 204 {
 		t.Errorf("delete in scope: %d %s", r.status, r.body)
+	}
+}
+
+// With --docs-scope schema, a document about tables is served only to a
+// caller who may read one of them; documents about no table reach everyone,
+// and an out-of-scope id reads as missing.
+func TestDocsScopeSchema(t *testing.T) {
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := newServerWithAudit(t, "", func(s *Server) { s.Docs, s.DocsScope = store, DocsScopeSchema })
+	// The admin reads everything, the analyst everything but salaries, and
+	// the poet, who writes, reads nothing.
+	lastServer.SetPolicy(loadRego(t, `allow if "admin" in input.roles
+allow if { "analyst" in input.roles; every t in input.tables { t != "sales.main.salaries" } }
+docs_allow if "admin" in input.roles
+docs_allow if "poet" in input.roles`))
+
+	ids := map[string]string{}
+	for name, context := range map[string]string{"orders": `"tables":["sales.main.orders"]`, "salaries": `"tables":["salaries"]`, "general": `"tables":[]`,
+		"sales schema": `"schemas":["sales.main"]`, "hr schema": `"schemas":["hr.main"]`} {
+		r := docReq(t, ts, "POST", "poet", "/v1/docs", `{"header":{"title":"`+name+` notes"},"context":{`+context+`,"body":"about `+name+`"}}`)
+		if r.status != 201 {
+			t.Fatalf("create %s: %d %s", name, r.status, r.body)
+		}
+		var d docs.Doc
+		json.Unmarshal([]byte(r.body), &d)
+		ids[name] = d.ID
+	}
+	titles := func(r result) []string {
+		var out struct {
+			Docs    []docs.Doc
+			Results []struct{ Doc docs.Doc }
+		}
+		json.Unmarshal([]byte(r.body), &out)
+		var ts []string
+		for _, d := range out.Docs {
+			ts = append(ts, d.Header.Title)
+		}
+		for _, h := range out.Results {
+			ts = append(ts, h.Doc.Header.Title)
+		}
+		return ts
+	}
+	// The analyst reads orders (so the sales schema), not salaries; nobody
+	// here reads an hr schema, so that document is served to no one.
+	if r := docReq(t, ts, "GET", "analyst", "/v1/docs", ""); r.status != 200 || len(titles(r)) != 3 ||
+		slices.Contains(titles(r), "salaries notes") || slices.Contains(titles(r), "hr schema notes") {
+		t.Fatalf("analyst list: %d %v", r.status, titles(r))
+	}
+	if r := docReq(t, ts, "GET", "analyst", "/v1/docs/"+ids["salaries"], ""); r.status != 404 {
+		t.Fatalf("analyst get out of scope: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "GET", "analyst", "/v1/docs/"+ids["general"], ""); r.status != 200 {
+		t.Fatalf("analyst get general: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"salaries notes"}`); r.status != 200 || slices.Contains(titles(r), "salaries notes") {
+		t.Fatalf("analyst search: %d %v", r.status, titles(r))
+	}
+	// The admin reads everything about existing tables.
+	if r := docReq(t, ts, "GET", "admin", "/v1/docs", ""); r.status != 200 || len(titles(r)) != 4 || slices.Contains(titles(r), "hr schema notes") {
+		t.Fatalf("admin list: %d %v", r.status, titles(r))
+	}
+	if r := docReq(t, ts, "POST", "admin", "/v1/docs/search", `{"q":"salaries notes"}`); r.status != 200 || !slices.Contains(titles(r), "salaries notes") {
+		t.Fatalf("admin search: %d %v", r.status, titles(r))
+	}
+	if r := docReq(t, ts, "GET", "admin", "/v1/docs?fields=bogus", ""); r.status != 400 {
+		t.Fatalf("fields=bogus: %d %s", r.status, r.body)
+	}
+
+	// Writes see the same scope. To the poet, who may query no table, and
+	// to the analyst, who may not write, an out-of-scope id is missing
+	// with every method: a PATCH cannot read the document back, and no
+	// status tells an out-of-scope id from an unknown one.
+	bodies := map[string]string{"PATCH": `{}`, "PUT": `{"header":{"title":"x"},"context":{"body":"b"}}`, "DELETE": ""}
+	missing := strings.Repeat("0", len(ids["orders"]))
+	for method, body := range bodies {
+		for user, out := range map[string][]string{"poet": {ids["salaries"], ids["orders"], missing}, "analyst": {ids["salaries"], missing}} {
+			for _, id := range out {
+				if r := docReq(t, ts, method, user, "/v1/docs/"+id, body); r.status != 404 {
+					t.Fatalf("%s %s as %s: %d %s", method, id, user, r.status, r.body)
+				}
+			}
+		}
+	}
+	// In scope, the poet writes as usual: a document about nothing, with
+	// the client's If-Match honored, and the admin reaches every document.
+	if r := docReq(t, ts, "PATCH", "poet", "/v1/docs/"+ids["general"], `{"header":{"title":"general notes, revised"}}`, "If-Match", `"stale"`); r.status != 412 {
+		t.Fatalf("stale If-Match in scope: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "PATCH", "poet", "/v1/docs/"+ids["general"], `{"context":{"body":{"nested":1}}}`); r.status != 400 {
+		t.Fatalf("patch of a field with an object: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "POST", "poet", "/v1/docs", sampleDoc+"{}"); r.status != 400 {
+		t.Fatalf("trailing data: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "PATCH", "poet", "/v1/docs/not-an-id", `{}`); r.status != 404 {
+		t.Fatalf("invalid id: %d %s", r.status, r.body)
+	}
+	r := docReq(t, ts, "PATCH", "poet", "/v1/docs/"+ids["general"], `{"header":{"title":"general notes, revised"}}`, "If-Match", "*")
+	if r.status != 200 || !strings.Contains(r.body, "general notes, revised") {
+		t.Fatalf("patch in scope: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "DELETE", "poet", "/v1/docs/"+ids["general"], "", "If-Match", r.header.Get("ETag")); r.status != 204 {
+		t.Fatalf("delete in scope: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "PATCH", "admin", "/v1/docs/"+ids["salaries"], `{}`); r.status != 200 {
+		t.Fatalf("admin patch: %d %s", r.status, r.body)
+	}
+
+	// Scope all: the analyst reads everything again.
+	lastServer.DocsScope = DocsScopeAll
+	if r := docReq(t, ts, "GET", "analyst", "/v1/docs", ""); r.status != 200 || len(titles(r)) != 4 {
+		t.Fatalf("analyst list, scope all: %d %v", r.status, titles(r))
+	}
+}
+
+// seedScoped stores a document about orders and one about nothing in a new
+// store, for servers that scope by schema.
+func seedScoped(t *testing.T) (store *docs.Store, scoped, general docs.Doc) {
+	t.Helper()
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scoped, _, err = store.Create(docs.Doc{Header: docs.Header{Title: "orders notes"},
+		Context: docs.Context{Tables: []string{"sales.main.orders"}, Body: "b"}}, "admin", nil); err != nil {
+		t.Fatal(err)
+	}
+	if general, _, err = store.Create(docs.Doc{Header: docs.Header{Title: "general notes"},
+		Context: docs.Context{Body: "b"}}, "admin", nil); err != nil {
+		t.Fatal(err)
+	}
+	return store, scoped, general
+}
+
+// scopedCalls are the requests that need the caller's scope: every read
+// of a document about tables, known or not, searches and writes.
+func scopedCalls(scoped docs.Doc) []struct{ method, path, body string } {
+	missing := strings.Repeat("0", len(scoped.ID))
+	return []struct{ method, path, body string }{
+		{"GET", "/v1/docs", ""}, {"GET", "/v1/docs/" + scoped.ID, ""}, {"GET", "/v1/docs/" + missing, ""},
+		{"POST", "/v1/docs/search", `{"q":"orders"}`}, {"PATCH", "/v1/docs/" + scoped.ID, `{}`}, {"DELETE", "/v1/docs/" + missing, ""},
+	}
+}
+
+// A scoped write must finish its scope audit before reserving its own
+// event, so even a queue with a single slot can serve every write method.
+func TestDocsScopedWritesSingleAuditSlot(t *testing.T) {
+	store, scoped, _ := seedScoped(t)
+	ts, _ := newServerWithAudit(t, "", func(s *Server) {
+		aw, err := audit.Open(filepath.Join(t.TempDir(), "audit.log"), 1, s.Log)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { aw.Close() })
+		s.Audit, s.Docs, s.DocsScope = aw, store, DocsScopeSchema
+		s.SetPolicy(loadRego(t, `allow if "admin" in input.roles
+docs_allow if "admin" in input.roles`))
+	})
+	for _, tc := range []struct {
+		method string
+		body   string
+		status int
+	}{
+		{http.MethodPut, sampleDoc, http.StatusOK},
+		{http.MethodPatch, `{"header":{"title":"updated notes"}}`, http.StatusOK},
+		{http.MethodDelete, "", http.StatusNoContent},
+	} {
+		t.Run(tc.method, func(t *testing.T) {
+			r := docReq(t, ts, tc.method, "admin", "/v1/docs/"+scoped.ID, tc.body)
+			if r.status != tc.status {
+				t.Fatalf("healthy audit with one slot: got %d %s, want %d", r.status, r.body, tc.status)
+			}
+		})
+	}
+}
+
+// With the audit sink failing, scoped documents are not served (as the
+// schema is not listed), with Retry-After; one about nothing still is.
+func TestDocsScopeFailClosed(t *testing.T) {
+	if _, err := os.Stat("/dev/full"); err != nil {
+		t.Skip("no /dev/full")
+	}
+	store, scoped, general := seedScoped(t)
+	ts, aw := newServerWithAudit(t, "/dev/full", func(s *Server) { s.Docs, s.DocsScope = store, DocsScopeSchema })
+	defer aw.Close()
+	// The first event fails to write and marks the sink unhealthy.
+	docReq(t, ts, "GET", "admin", "/v1/docs", "")
+	deadline := time.Now().Add(2 * time.Second)
+	for aw.Healthy() == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, c := range scopedCalls(scoped) {
+		r := docReq(t, ts, c.method, "admin", c.path, c.body)
+		if r.status != 503 || r.header.Get("Retry-After") == "" || !strings.Contains(r.body, "audit") {
+			t.Fatalf("%s %s while audit down: %d %v %s", c.method, c.path, r.status, r.header, r.body)
+		}
+	}
+	if r := docReq(t, ts, "GET", "admin", "/v1/docs/"+general.ID, ""); r.status != 200 {
+		t.Fatalf("a document in every scope needs no listing: %d %s", r.status, r.body)
+	}
+	// Under scope all a plain read needs no listing of the schema; asking
+	// for the caller's access does, and a write still needs its audit slot.
+	lastServer.DocsScope = DocsScopeAll
+	for _, path := range []string{"/v1/docs", "/v1/docs/" + scoped.ID} {
+		if r := docReq(t, ts, "GET", "admin", path, ""); r.status != 200 {
+			t.Fatalf("GET %s under scope all while audit down: %d %s", path, r.status, r.body)
+		}
+		if r := docReq(t, ts, "GET", "admin", path+"?access=true", ""); r.status != 503 || r.header.Get("Retry-After") == "" {
+			t.Fatalf("GET %s with access while audit down: %d %s", path, r.status, r.body)
+		}
+	}
+	if r := docReq(t, ts, "POST", "admin", "/v1/docs/search", `{"q":"orders"}`); r.status != 200 {
+		t.Fatalf("search under scope all while audit down: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "POST", "admin", "/v1/docs/search", `{"q":"orders","access":true}`); r.status != 503 {
+		t.Fatalf("search with access while audit down: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "PATCH", "admin", "/v1/docs/"+scoped.ID, `{}`); r.status != 503 || !strings.Contains(r.body, "audit") {
+		t.Fatalf("write under scope all while audit down: %d %s", r.status, r.body)
+	}
+}
+
+// Listed and searched documents say which of their tables the caller may
+// query, in both scopes; a document about no table has two empty lists.
+func TestDocsAccessAnnotation(t *testing.T) {
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := newServerWithAudit(t, "", func(s *Server) { s.Docs = store })
+	ids := map[string]string{}
+	for title, tables := range map[string][]string{
+		"payroll": {"sales.main.salaries", "Orders", "nope"}, "salaries": {"salaries"}, "general": nil,
+	} {
+		d, _, err := store.Create(docs.Doc{Header: docs.Header{Title: title}, Context: docs.Context{Tables: tables, Body: "about " + title}}, "poet", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[title] = d.ID
+	}
+	type annotated struct {
+		Header             struct{ Title string }
+		Context            map[string]any
+		AccessibleTables   []string `json:"accessible_tables"`
+		InaccessibleTables []string `json:"inaccessible_tables"`
+	}
+	byTitle := func(r result) map[string]annotated {
+		t.Helper()
+		if r.status != 200 {
+			t.Fatalf("%d %s", r.status, r.body)
+		}
+		var out struct {
+			Docs    []annotated
+			Results []struct{ Doc annotated }
+		}
+		json.Unmarshal([]byte(r.body), &out)
+		for _, h := range out.Results {
+			out.Docs = append(out.Docs, h.Doc)
+		}
+		m := map[string]annotated{}
+		for _, d := range out.Docs {
+			m[d.Header.Title] = d
+		}
+		return m
+	}
+	one := func(r result) annotated {
+		t.Helper()
+		if r.status != 200 {
+			t.Fatalf("%d %s", r.status, r.body)
+		}
+		var d annotated
+		json.Unmarshal([]byte(r.body), &d)
+		return d
+	}
+	check := func(name string, d annotated, accessible, inaccessible []string) {
+		t.Helper()
+		if !slices.Equal(d.AccessibleTables, accessible) || !slices.Equal(d.InaccessibleTables, inaccessible) {
+			t.Errorf("%s: %s accessible %v inaccessible %v, want %v and %v", name, d.Header.Title, d.AccessibleTables, d.InaccessibleTables, accessible, inaccessible)
+		}
+	}
+	// list, header and search, with or without asking for access.
+	requests := func(user string, access bool) map[string]result {
+		q, body := "", `{"q":"about payroll salaries general","limit":10}`
+		if access {
+			q, body = "?access=true", `{"q":"about payroll salaries general","limit":10,"access":true}`
+		}
+		return map[string]result{
+			"list":   docReq(t, ts, "GET", user, "/v1/docs"+q, ""),
+			"header": docReq(t, ts, "GET", user, "/v1/docs?fields=header"+strings.ReplaceAll(q, "?", "&"), ""),
+			"search": docReq(t, ts, "POST", user, "/v1/docs/search", body),
+		}
+	}
+	for _, scope := range []string{DocsScopeAll, DocsScopeSchema} {
+		lastServer.DocsScope = scope
+		for name, r := range requests("analyst", true) {
+			got := byTitle(r)
+			check(scope+" "+name, got["payroll"], []string{"Orders"}, []string{"sales.main.salaries", "nope"})
+			check(scope+" "+name, got["general"], []string{}, []string{})
+			if _, listed := got["salaries"]; listed != (scope == DocsScopeAll) {
+				t.Errorf("%s %s: salaries listed=%v", scope, name, listed)
+			}
+			if scope == DocsScopeAll {
+				check(scope+" "+name, got["salaries"], []string{}, []string{"salaries"})
+			}
+			if name == "header" && got["payroll"].Context["body"] != nil {
+				t.Errorf("header view has a body: %v", got["payroll"].Context)
+			}
+		}
+		got := byTitle(docReq(t, ts, "GET", "admin", "/v1/docs?access=true", ""))
+		check(scope+" admin", got["payroll"], []string{"sales.main.salaries", "Orders"}, []string{"nope"})
+		check(scope+" admin", got["salaries"], []string{"salaries"}, []string{})
+		// One document, annotated likewise.
+		check(scope+" get", one(docReq(t, ts, "GET", "analyst", "/v1/docs/"+ids["payroll"]+"?access=true", "")), []string{"Orders"}, []string{"sales.main.salaries", "nope"})
+		check(scope+" get", one(docReq(t, ts, "GET", "analyst", "/v1/docs/"+ids["general"]+"?access=true", "")), []string{}, []string{})
+	}
+	// Under scope all the annotation comes only when asked; under schema
+	// the scope is listed anyway, so it is always there.
+	lastServer.DocsScope = DocsScopeAll
+	for name, r := range requests("analyst", false) {
+		for title, d := range byTitle(r) {
+			if d.AccessibleTables != nil || d.InaccessibleTables != nil {
+				t.Errorf("all %s: %s annotated without being asked: %+v", name, title, d)
+			}
+		}
+	}
+	if d := one(docReq(t, ts, "GET", "analyst", "/v1/docs/"+ids["payroll"], "")); d.AccessibleTables != nil {
+		t.Errorf("all get: annotated without being asked: %+v", d)
+	}
+	lastServer.DocsScope = DocsScopeSchema
+	for name, r := range requests("analyst", false) {
+		check("schema "+name, byTitle(r)["payroll"], []string{"Orders"}, []string{"sales.main.salaries", "nope"})
+	}
+	check("schema get", one(docReq(t, ts, "GET", "analyst", "/v1/docs/"+ids["payroll"], "")), []string{"Orders"}, []string{"sales.main.salaries", "nope"})
+	for _, path := range []string{"/v1/docs?access=bogus", "/v1/docs/" + ids["payroll"] + "?access=bogus"} {
+		if r := docReq(t, ts, "GET", "analyst", path, ""); r.status != 400 {
+			t.Errorf("%s: %d %s", path, r.status, r.body)
+		}
+	}
+}
+
+// A policy that fails to evaluate scopes nothing: every scoped request is
+// an error, reads and writes alike.
+func TestDocsScopePolicyError(t *testing.T) {
+	store, scoped, general := seedScoped(t)
+	ts, _ := newServerWithAudit(t, "", func(s *Server) { s.Docs, s.DocsScope = store, DocsScopeSchema })
+	lastServer.SetPolicy(loadRego(t, "allow if to_number(input.user) > 0\ndocs_allow := true"))
+	for _, c := range scopedCalls(scoped) {
+		if r := docReq(t, ts, c.method, "admin", c.path, c.body); r.status != 500 || !strings.Contains(r.body, "policy") {
+			t.Fatalf("%s %s: %d %s", c.method, c.path, r.status, r.body)
+		}
+	}
+	// A document about nothing needs no listing: it is read, annotated
+	// with two empty lists, and written, while the policy cannot be
+	// evaluated.
+	if r := docReq(t, ts, "GET", "admin", "/v1/docs/"+general.ID, ""); r.status != 200 || !strings.Contains(r.body, `"accessible_tables":[]`) {
+		t.Fatalf("get a document about nothing: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "PATCH", "admin", "/v1/docs/"+general.ID, `{}`); r.status != 200 {
+		t.Fatalf("write a document about nothing: %d %s", r.status, r.body)
+	}
+}
+
+// With --docs-validate-names on, a write is refused while the catalog
+// cannot be read, and resolves nothing without an engine.
+func TestDocsCatalogUnavailable(t *testing.T) {
+	ts, _ := newDocsServer(t, t.TempDir(), filepath.Join(t.TempDir(), "audit.log"), func(s *Server) { s.DocsValidateNames = DocsNamesStrict })
+	if r := docReq(t, ts, "POST", "poet", "/v1/docs", sampleDoc); r.status != 400 || !strings.Contains(r.body, "not a table") {
+		t.Fatalf("strict without an engine: %d %s", r.status, r.body)
+	}
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _ = newServerWithAudit(t, "", func(s *Server) { s.Docs, s.DocsValidateNames = store, DocsNamesStrict })
+	lastServer.SetPolicy(loadRego(t, "allow := true\ndocs_allow := true"))
+	lastServer.Engine.Close()
+	lastServer.Engine.InvalidateSchema()
+	if r := docReq(t, ts, "POST", "admin", "/v1/docs", sampleDoc); r.status != 503 || r.header.Get("Retry-After") == "" || !strings.Contains(r.body, "catalog") {
+		t.Fatalf("catalog unavailable: %d %s", r.status, r.body)
+	}
+}
+
+// loadRego compiles rules in package curral with both decisions.
+func loadRego(t *testing.T, rules string) *policy.Policy {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "p.rego")
+	os.WriteFile(path, []byte("package curral\nimport rego.v1\n"+rules+"\n"), 0o600)
+	pol, err := policy.LoadQueries(context.Background(), []string{path},
+		policy.Queries{Allow: "data.curral.allow", Docs: "data.curral.docs_allow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pol
+}
+
+// A docs decision that fails to evaluate, or a store that cannot save,
+// refuse the write with a 500 that says which.
+func TestDocsWriteErrors(t *testing.T) {
+	ts, _ := newDocsServer(t, t.TempDir(), filepath.Join(t.TempDir(), "audit.log"), func(s *Server) {
+		s.SetPolicy(loadRego(t, "docs_allow if to_number(input.user) > 0"))
+	})
+	if r := docReq(t, ts, "POST", "poet", "/v1/docs", sampleDoc); r.status != 500 || !strings.Contains(r.body, "policy") {
+		t.Fatalf("policy error: %d %s", r.status, r.body)
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root writes anywhere")
+	}
+	dir := t.TempDir()
+	ts, _ = newDocsServer(t, dir, filepath.Join(t.TempDir(), "audit.log"))
+	os.Chmod(dir, 0o500)
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	if r := docReq(t, ts, "POST", "poet", "/v1/docs", sampleDoc); r.status != 500 || !strings.Contains(r.body, "could not save") {
+		t.Fatalf("store error: %d %s", r.status, r.body)
+	}
+}
+
+// /v1/schema counts the documents about each table, matching names as the
+// document filters do. Under --docs-scope schema only documents the caller
+// may read count, so a count never reveals a hidden document.
+func TestSchemaDocCount(t *testing.T) {
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := newServerWithAudit(t, "", func(s *Server) { s.Docs = store })
+	// A second salaries table the analyst may read makes the short name
+	// ambiguous: it fits the denied sales.main.salaries too.
+	for _, ddl := range []string{"CREATE SCHEMA sales.hr", "CREATE TABLE sales.hr.salaries(name VARCHAR)"} {
+		if r := do(t, ts, "admin", `{"sql":"`+ddl+`"}`); r.status != 200 {
+			t.Fatalf("%s: %d %s", ddl, r.status, r.body)
+		}
+	}
+	for title, tables := range map[string][]string{
+		"orders short": {"orders"}, "orders qualified": {"Sales.Main.Orders", "orders"},
+		"salaries short": {"salaries"}, "payroll": {"sales.main.salaries", "orders"}, "general": nil,
+	} {
+		if _, _, err := store.Create(docs.Doc{Header: docs.Header{Title: title}, Context: docs.Context{Tables: tables, Body: "b"}}, "poet", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	counts := func(user, query string) map[string]int {
+		t.Helper()
+		status, out := getSchema(t, ts, user, query)
+		if status != 200 {
+			t.Fatalf("%s schema: %d", user, status)
+		}
+		got := map[string]int{}
+		for _, tb := range out.Tables {
+			got[tb.Qualified()] = tb.Docs
+		}
+		return got
+	}
+	type want map[string]int
+	check := func(name string, got map[string]int, w want) {
+		t.Helper()
+		for table, n := range w {
+			if got[table] != n {
+				t.Errorf("%s: %s has %d docs, want %d (%v)", name, table, got[table], n, got)
+			}
+		}
+	}
+	// Scope all: every document counts, once per table however many of its
+	// names fit; a table no document names has no count (omitted).
+	check("admin", counts("admin", ""), want{"sales.main.orders": 3, "sales.main.salaries": 2, "sales.hr.salaries": 1, "logs.main.events": 0})
+	check("analyst", counts("analyst", ""), want{"sales.main.orders": 3, "sales.hr.salaries": 1})
+	check("filtered", counts("admin", "?table=orders"), want{"sales.main.orders": 3})
+	status, out := getSchema(t, ts, "admin", "?table=events")
+	if b, _ := json.Marshal(out.Tables); status != 200 || strings.Contains(string(b), `"docs"`) {
+		t.Errorf("a table without documents: %d %s", status, b)
+	}
+
+	// Scope schema: the analyst may not read the "salaries short" document
+	// (its only name also fits the denied table), so sales.hr.salaries
+	// counts none for them and still one for the admin.
+	lastServer.DocsScope = DocsScopeSchema
+	check("admin scoped", counts("admin", ""), want{"sales.main.orders": 3, "sales.main.salaries": 2, "sales.hr.salaries": 1})
+	check("analyst scoped", counts("analyst", ""), want{"sales.main.orders": 3, "sales.hr.salaries": 0})
+
+	// A filtered listing is not the caller's scope: that is listed on its
+	// own, and the count fails when that listing does.
+	check("analyst scoped filtered", counts("analyst", "?database=sales"), want{"sales.main.orders": 3, "sales.hr.salaries": 0})
+
+	// Without documents enabled nothing is counted.
+	lastServer.Docs = nil
+	check("disabled", counts("admin", ""), want{"sales.main.orders": 0})
+
+	lastServer.Docs = store
+	lastServer.SetPolicy(loadRego(t, `allow if { some t in input.tables; startswith(t, "sales.") }
+allow if { some t in input.tables; startswith(t, "logs."); to_number(input.user) > 0 }
+docs_allow := true`))
+	if status, _ := getSchema(t, ts, "admin", "?database=sales"); status != 500 {
+		t.Errorf("count with the scope listing failing: %d", status)
+	}
+}
+
+// With --docs-validate-names, writes resolve tables and schemas to their
+// qualified catalog names: strict refuses what fits none or several
+// objects, warn keeps it, off saves everything as written. The policy sees
+// the resolved names.
+func TestDocsValidateNames(t *testing.T) {
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := newServerWithAudit(t, "", func(s *Server) { s.Docs, s.DocsValidateNames = store, DocsNamesStrict })
+	lastServer.SetPolicy(loadRego(t, `allow if "admin" in input.roles
+docs_allow if "poet" in input.roles
+docs_allow if { "admin" in input.roles; every t in input.doc.tables { startswith(t, "sales.") } }`))
+	for _, ddl := range []string{"CREATE SCHEMA sales.hr", "CREATE TABLE sales.hr.salaries(name VARCHAR)"} {
+		if r := do(t, ts, "admin", `{"sql":"`+ddl+`"}`); r.status != 200 {
+			t.Fatalf("%s: %d %s", ddl, r.status, r.body)
+		}
+	}
+	body := func(tables, schemas string) string {
+		return `{"header":{"title":"t"},"context":{"tables":` + tables + `,"schemas":` + schemas + `,"body":"b"}}`
+	}
+	created := func(r result) docs.Doc {
+		t.Helper()
+		if r.status != 201 && r.status != 200 {
+			t.Fatalf("write: %d %s", r.status, r.body)
+		}
+		var d docs.Doc
+		json.Unmarshal([]byte(r.body), &d)
+		return d
+	}
+	// The poet, who may query nothing, still resolves names: that is the
+	// documented cost of the check.
+	d := created(docReq(t, ts, "POST", "poet", "/v1/docs", body(`["orders","Sales.Main.Orders","main.events"]`, `["sales.main","logs.MAIN"]`)))
+	if !slices.Equal(d.Context.Tables, []string{"sales.main.orders", "logs.main.events"}) || !slices.Equal(d.Context.Schemas, []string{"sales.main", "logs.main"}) {
+		t.Fatalf("resolved: %+v", d.Context)
+	}
+	for _, c := range []struct{ tables, schemas, want string }{
+		{`["nope"]`, `[]`, `"nope" is not a table`},
+		{`["salaries"]`, `[]`, `"salaries" fits several tables`},
+		{`[]`, `["main"]`, `"main" fits several schemas`},
+		{`[]`, `["sales"]`, `"sales" is not a schema`},
+	} {
+		r := docReq(t, ts, "POST", "poet", "/v1/docs", body(c.tables, c.schemas))
+		var e struct{ Error string }
+		json.Unmarshal([]byte(r.body), &e)
+		if r.status != 400 || !strings.Contains(e.Error, c.want) {
+			t.Errorf("%s %s: %d %s", c.tables, c.schemas, r.status, r.body)
+		}
+	}
+	// Updates resolve too, and the policy judges the resolved names: the
+	// admin may write about sales tables, by whatever name.
+	d = created(docReq(t, ts, "PATCH", "admin", "/v1/docs/"+d.ID, `{"context":{"tables":["hr.salaries"],"schemas":null}}`))
+	if !slices.Equal(d.Context.Tables, []string{"sales.hr.salaries"}) || d.Context.Schemas != nil {
+		t.Fatalf("patched: %+v", d.Context)
+	}
+	if r := docReq(t, ts, "PUT", "admin", "/v1/docs/"+d.ID, body(`["events"]`, `[]`)); r.status != 403 {
+		t.Fatalf("policy on resolved names: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "PUT", "admin", "/v1/docs/"+d.ID, body(`["nope"]`, `[]`)); r.status != 400 {
+		t.Fatalf("put strict: %d %s", r.status, r.body)
+	}
+
+	// Warn qualifies what resolves and keeps the rest; off touches nothing.
+	lastServer.DocsValidateNames = DocsNamesWarn
+	d = created(docReq(t, ts, "POST", "poet", "/v1/docs", body(`["orders","salaries","nope"]`, `["main"]`)))
+	if !slices.Equal(d.Context.Tables, []string{"sales.main.orders", "salaries", "nope"}) || !slices.Equal(d.Context.Schemas, []string{"main"}) {
+		t.Fatalf("warn: %+v", d.Context)
+	}
+	lastServer.DocsValidateNames = DocsNamesOff
+	d = created(docReq(t, ts, "POST", "poet", "/v1/docs", body(`["orders","nope"]`, `[]`)))
+	if !slices.Equal(d.Context.Tables, []string{"orders", "nope"}) {
+		t.Fatalf("off: %+v", d.Context)
+	}
+}
+
+// GET /v1/docs carries the collection's ETag and answers 304 to a matching
+// If-None-Match. The tag changes with every write to the listed documents,
+// with the view and filters, and when the caller's scope changes the set.
+func TestDocsListETag(t *testing.T) {
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := newServerWithAudit(t, "", func(s *Server) { s.Docs, s.DocsScope = store, DocsScopeSchema })
+	lastServer.SetPolicy(loadRego(t, `allow if "admin" in input.roles
+allow if { "analyst" in input.roles; every t in input.tables { t != "sales.main.salaries" } }
+docs_allow if "poet" in input.roles`))
+	for title, tables := range map[string][]string{"orders": {"sales.main.orders"}, "salaries": {"sales.main.salaries"}} {
+		if _, _, err := store.Create(docs.Doc{Header: docs.Header{Title: title}, Context: docs.Context{Tables: tables, Body: "b"}}, "poet", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tag := func(user, query string, hdr ...string) (string, result) {
+		t.Helper()
+		r := docReq(t, ts, "GET", user, "/v1/docs"+query, "", hdr...)
+		if r.status != 200 && r.status != 304 {
+			t.Fatalf("%s %s: %d %s", user, query, r.status, r.body)
+		}
+		if r.header.Get("ETag") == "" {
+			t.Fatalf("%s %s: no ETag", user, query)
+		}
+		return r.header.Get("ETag"), r
+	}
+	base, _ := tag("analyst", "")
+	if again, _ := tag("analyst", ""); again != base {
+		t.Fatalf("unstable: %s then %s", base, again)
+	}
+	for _, inm := range []string{base, "W/" + base, `"other", ` + base, "*"} {
+		if _, r := tag("analyst", "", "If-None-Match", inm); r.status != 304 || r.body != "" {
+			t.Errorf("If-None-Match %s: %d %q", inm, r.status, r.body)
+		}
+	}
+	if _, r := tag("analyst", "", "If-None-Match", `"stale"`); r.status != 200 {
+		t.Errorf("stale If-None-Match: %d", r.status)
+	}
+	// Another view, filter, caller or scope is another collection.
+	seen := map[string]string{"analyst full": base}
+	for name, get := range map[string]func() string{
+		"analyst header":  func() string { v, _ := tag("analyst", "?fields=header"); return v },
+		"analyst nothing": func() string { v, _ := tag("analyst", "?table=nope"); return v },
+		"admin full":      func() string { v, _ := tag("admin", ""); return v },
+		"analyst scope all": func() string {
+			lastServer.DocsScope = DocsScopeAll
+			defer func() { lastServer.DocsScope = DocsScopeSchema }()
+			v, _ := tag("analyst", "")
+			return v
+		},
+	} {
+		v := get()
+		for other, w := range seen {
+			if v == w {
+				t.Errorf("%s and %s share the tag %s", name, other, v)
+			}
+		}
+		seen[name] = v
+	}
+	// Writes move it; undoing them brings it back.
+	r := docReq(t, ts, "POST", "poet", "/v1/docs", `{"header":{"title":"new"},"context":{"body":"b"}}`)
+	if r.status != 201 {
+		t.Fatalf("create: %d %s", r.status, r.body)
+	}
+	var d docs.Doc
+	json.Unmarshal([]byte(r.body), &d)
+	created, _ := tag("analyst", "")
+	if created == base {
+		t.Error("creating a document kept the tag")
+	}
+	if r := docReq(t, ts, "PATCH", "poet", "/v1/docs/"+d.ID, `{"header":{"title":"renamed"}}`); r.status != 200 {
+		t.Fatalf("patch: %d %s", r.status, r.body)
+	}
+	if patched, _ := tag("analyst", ""); patched == created || patched == base {
+		t.Error("changing a document kept the tag")
+	}
+	if r := docReq(t, ts, "DELETE", "poet", "/v1/docs/"+d.ID, ""); r.status != 204 {
+		t.Fatalf("delete: %d %s", r.status, r.body)
+	}
+	if deleted, _ := tag("analyst", ""); deleted != base {
+		t.Errorf("the same collection again has tag %s, had %s", deleted, base)
 	}
 }

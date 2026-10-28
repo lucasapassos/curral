@@ -114,6 +114,7 @@ Input:
 | `author` | who created the document; absent on create |
 | `doc` | `{title, author, tables, schemas}` as the document will be saved; absent on delete |
 | `current` | the same fields as the document is now; absent on create |
+| `identity`, `actor` | on a [delegated write](delegation.md#semantic-documents) only: the execution context and the delegating key |
 
 So rules can, for example, let only the author delete
 (`input.author == input.user`) or limit a role to documents about some

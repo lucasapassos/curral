@@ -16,6 +16,7 @@ import (
 
 	"github.com/lucasapassos/curral/internal/auth"
 	"github.com/lucasapassos/curral/internal/config"
+	"github.com/lucasapassos/curral/internal/docs"
 	"github.com/lucasapassos/curral/internal/policy"
 	"github.com/lucasapassos/curral/internal/rls"
 )
@@ -61,7 +62,8 @@ func TestDelegationHTTP(t *testing.T) {
 	var capa map[string]any
 	json.Unmarshal([]byte(body), &capa)
 	if status != 200 || capa["execution_context_version"] != 1.0 || capa["delegation_required"] != true ||
-		capa["subject"] != "portal" || capa["attributes"].(map[string]any)["tenant"] != "tenant-a" {
+		capa["subject"] != "portal" || capa["attributes"].(map[string]any)["tenant"] != "tenant-a" ||
+		capa["docs"].(map[string]any)["enabled"] != false {
 		t.Fatalf("capabilities %d %s", status, body)
 	}
 	status, h, body := call("POST", "/v1/query", as, `{"sql":"SELECT * FROM orders"}`)
@@ -180,9 +182,13 @@ row_filters := {"sales.main.orders":"id > 0"} if input.identity.kind in {"user",
 // trail, and makes the request read-only.
 func TestCallerContext(t *testing.T) {
 	auditPath := filepath.Join(t.TempDir(), "audit.log")
-	ts, _ := newServerWithAudit(t, auditPath)
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := newServerWithAudit(t, auditPath, func(s *Server) { s.Docs = store })
 	key, hash, _ := auth.NewAPIKey()
-	lastServer.SetAuth(auth.New(&config.Users{APIKeys: []config.APIKey{{Name: "shared", KeyHash: hash, Roles: []string{"analyst"}}}}, 0))
+	lastServer.SetAuth(auth.New(&config.Users{APIKeys: []config.APIKey{{Name: "shared", KeyHash: hash, Roles: []string{"analyst", "poet"}}}}, 0))
 	call := delegatedClient(t, ts, key)
 	caller := map[string]string{callerContextHeader: contextHeader(map[string]any{"subject": "portal:user:42"})}
 	status, h, body := call("POST", "/v1/query", caller, `{"sql":"SELECT * FROM orders"}`)
@@ -191,6 +197,12 @@ func TestCallerContext(t *testing.T) {
 	}
 	if status, _, _ = call("POST", "/v1/query", caller, `{"sql":"DELETE FROM orders"}`); status != 403 {
 		t.Fatalf("caller context must be read-only: %d", status)
+	}
+	if status, _, _ = call("POST", "/v1/docs", caller, sampleDoc); status != 403 {
+		t.Fatalf("caller context never writes documents: %d", status)
+	}
+	if status, _, _ = call("GET", "/v1/docs", map[string]string{callerContextHeader: "not*base64"}, ""); status != 403 {
+		t.Fatalf("malformed caller context: %d", status)
 	}
 	if status, _, _ = call("POST", "/v1/query", map[string]string{executionContextHeader: caller[callerContextHeader]}, `{"sql":"SELECT 1"}`); status != 403 {
 		t.Fatalf("a shared key cannot delegate: %d", status)
@@ -219,9 +231,59 @@ func TestDelegatedDocs(t *testing.T) {
 	if status, h, body := call("GET", "/v1/docs", as, ""); status != 200 || h.Get(effectiveSubjectHeader) != "portal:user:42" {
 		t.Fatalf("list %d %s", status, body)
 	}
+	// Without an engine the catalog is empty: the annotation can still be
+	// asked for.
+	if status, _, body := call("GET", "/v1/docs?access=true", as, ""); status != 200 {
+		t.Fatalf("list with access %d %s", status, body)
+	}
+	status, _, body := call("GET", "/v1/capabilities", nil, "")
+	var capa map[string]any
+	json.Unmarshal([]byte(body), &capa)
+	if d := capa["docs"].(map[string]any); status != 200 || d["enabled"] != true || d["scope"] != "all" || d["delegated_writes"] != false {
+		t.Fatalf("capabilities %d %s", status, body)
+	}
 	for _, headers := range []map[string]string{as, nil} {
 		if status, _, body := call("POST", "/v1/docs", headers, `{}`); status != 403 {
-			t.Fatalf("writes are never delegated: %d %s", status, body)
+			t.Fatalf("writes are not delegated without docs_write: %d %s", status, body)
 		}
+	}
+}
+
+// A delegating key marked docs_write writes documents as the identity it
+// names, and only when the docs policy allows that identity (here, the
+// poet role mapped to it). The author is the identity, not the key.
+func TestDelegatedDocsWrite(t *testing.T) {
+	key, hash, _ := auth.NewAPIKey()
+	ts, _ := newDocsServer(t, t.TempDir(), filepath.Join(t.TempDir(), "audit.log"), func(s *Server) {
+		s.SetAuth(auth.New(&config.Users{APIKeys: []config.APIKey{{Name: "portal", KeyHash: hash, Roles: []string{"admin", "poet"}, Delegation: true, DocsWrite: true}},
+			Identities: []config.Identity{{Match: "portal:user:42", Roles: []string{"poet"}}}}, 0))
+	})
+	call := delegatedClient(t, ts, key)
+	poet := map[string]string{executionContextHeader: contextHeader(map[string]any{"subject": "portal:user:42"})}
+	reader := map[string]string{executionContextHeader: contextHeader(map[string]any{"subject": "portal:user:7"})}
+
+	status, _, body := call("GET", "/v1/capabilities", nil, "")
+	var capa map[string]any
+	json.Unmarshal([]byte(body), &capa)
+	if status != 200 || capa["docs"].(map[string]any)["delegated_writes"] != true {
+		t.Fatalf("capabilities %d %s", status, body)
+	}
+	if status, _, body := call("POST", "/v1/docs", nil, sampleDoc); status != 403 {
+		t.Fatalf("the key itself never writes: %d %s", status, body)
+	}
+	if status, _, body := call("POST", "/v1/docs", reader, sampleDoc); status != 403 {
+		t.Fatalf("an identity the policy refuses: %d %s", status, body)
+	}
+	status, h, body := call("POST", "/v1/docs", poet, sampleDoc)
+	var d docs.Doc
+	json.Unmarshal([]byte(body), &d)
+	if status != 201 || d.Header.Author != "portal:user:42" || h.Get(effectiveSubjectHeader) != "portal:user:42" {
+		t.Fatalf("delegated create: %d %s", status, body)
+	}
+	if status, _, body := call("DELETE", "/v1/docs/"+d.ID, reader, ""); status != 403 {
+		t.Fatalf("delegated delete by another identity: %d %s", status, body)
+	}
+	if status, _, body := call("DELETE", "/v1/docs/"+d.ID, poet, ""); status != 204 {
+		t.Fatalf("delegated delete: %d %s", status, body)
 	}
 }

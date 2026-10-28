@@ -27,6 +27,9 @@ type TableSchema struct {
 	Columns  []SchemaColumn `json:"columns"`
 	// Set by the caller from its own protections, not by the engine.
 	RowFiltered bool `json:"row_filtered,omitempty"`
+	// Docs is how many semantic documents are about this object; set by
+	// the caller, 0 when it serves none.
+	Docs int `json:"docs,omitempty"`
 }
 
 // Qualified is catalog.schema.name, as in Inspection.Tables.

@@ -60,7 +60,7 @@ curl -u admin 'https://curral.example.com/v1/schema?database=lake&schema=analyti
  "tables":[{"database":"lake","schema":"analytics","name":"monthly_revenue","kind":"table",
             "columns":[{"name":"customer","type":"VARCHAR","nullable":true},
                        {"name":"ssn","type":"VARCHAR","nullable":true,"masked":true}],
-            "row_filtered":true}]}
+            "row_filtered":true,"docs":2}]}
 ```
 
 - **Filters:** `database`, `schema` and `table`, case-insensitive.
@@ -70,8 +70,18 @@ curl -u admin 'https://curral.example.com/v1/schema?database=lake&schema=analyti
   is filtered, and columns are flagged when they share a name with a masked
   column.
 - **`comment`:** table and column comments (`COMMENT ON`), when present.
+- **`docs`:** with `--docs-dir`, how many [semantic documents](#semantic-documents-v1docs)
+  are about the table, by the rule of the document filters: `GET
+  /v1/docs?table=` with the qualified name lists exactly the documents
+  counted; omitted when none. With `--docs-scope schema` only the
+  documents the caller may read count, so a count never reveals a document
+  the listing would hide. Clients can skip `GET /v1/docs` for tables
+  without a count.
 - **`schema` in `databases`:** the schema used for unqualified names.
-- **Audit:** each call produces a `schema` event listing the tables returned.
+- **Audit:** each call produces a `schema` event listing the tables returned
+  (and, when counting documents under `--docs-scope schema` for a filtered
+  listing, a `docs_scope` event for the caller's whole scope; an unfiltered
+  listing is the scope and needs no second one).
 
 ### Cache
 
@@ -114,15 +124,45 @@ people) to read before writing queries. Each one is a JSON file,
 
 - **Required:** `header.title` (up to 200 characters) and `context.body`; each
   `sqls[]` item needs `sql`. Everything else is optional. `tables` and
-  `schemas` are free text, not checked against the catalog.
+  `schemas` are free text, not checked against the catalog unless
+  `--docs-validate-names` says so (below).
 - **Server-set:** `id`, `author` (who created it), `created_at`, `updated_at`
   and `updated_by` (who changed it last). Values sent for them are ignored, so
   a document from a `GET` can be sent back as is. Unknown fields are a 400.
 - **Reading:** every authenticated user. `GET /v1/docs` lists full documents,
-  most recently updated first; `?table=`, `?schema=` (exact name or its last
-  parts, so `orders` finds `sales.main.orders`) and `?q=` (text in title,
-  description or `used_for`) narrow it, all case-insensitive.
-  `?fields=header` leaves out `body` and `sqls`.
+  most recently updated first; `?table=`, `?schema=` (the same name, or
+  either the last parts of the other, so `orders` finds a document about
+  `sales.main.orders` and `sales.main.orders` one about `orders`) and `?q=`
+  (text in title, description or `used_for`) narrow it, all
+  case-insensitive. `?tables=`
+  and `?schemas=` take several names (repeated or comma-separated, up to
+  100 each) and keep a document about any of them; `table` with `tables`,
+  or `schema` with `schemas`, is a 400. `?fields=header` leaves out `body`
+  and `sqls`.
+- **Access:** a document can carry `accessible_tables` and
+  `inaccessible_tables`: the entries of its `tables` the caller may query
+  and the rest (a name counts as accessible when every object it fits is
+  readable; one fitting nothing in the catalog is not). A document naming
+  no table has two empty lists. The split uses the caller's `/v1/schema`
+  listing, made once per request and audited as a `docs_scope` event, so
+  the request is refused (503, 429 or 500) when that listing is. Under
+  `--docs-scope schema` every document served (listed, fetched, searched)
+  carries it, since the scope is listed anyway. Under `all` a request
+  asks for it with `?access=true` (`"access": true` in a search), and
+  without it reads need no listing, no audit slot and no engine.
+- **Scope:** with `--docs-scope schema`, a document that names `tables` is
+  served (listed, fetched, searched) only to a caller who may query at least
+  one of them; one that names only `schemas`, to a caller who may query a
+  table in one of them. Names match as in the filters (a qualified name
+  exactly, a shorter one by its last parts); a short name that fits several
+  objects counts only when the caller may query all of them, and one that
+  fits nothing in the catalog never counts. The decision is the one of
+  `/v1/schema`, audited as a `docs_scope` event. An out-of-scope id answers
+  404 on `GET`, `PUT`, `PATCH` and `DELETE` alike, so a write never reads
+  the document back. Documents naming no table or schema reach everyone.
+  The default, `all`, serves every document to every authenticated user.
+  `GET /v1/capabilities` reports the mode in `docs.scope` (and the search
+  ranker in `docs.ranker`).
 - **Searching:** `POST /v1/docs/search` returns the documents that best fit a
   question; see [below](#searching-documents).
 - **Writing:** `POST /v1/docs` creates (201, `Location` and `ETag`), `PUT
@@ -130,9 +170,29 @@ people) to read before writing queries. Each one is a JSON file,
   merge patch](https://www.rfc-editor.org/rfc/rfc7396) (`null` removes a
   field) and `DELETE /v1/docs/{id}` removes it (204). Who may write is decided
   by the policy; see [Authorization](authorization.md#semantic-documents).
+  A delegating key writes only when marked `docs_write`, and then as the
+  identity it names; see [delegation](delegation.md#semantic-documents).
+- **Names:** with `--docs-validate-names strict`, a write resolves each
+  entry of `context.tables` and `context.schemas` to one catalog object
+  (by its qualified name, or by its last parts when only one object fits)
+  and saves the qualified name, so scopes, filters and clients match it
+  exactly; a name fitting nothing or several objects is a 400 naming it
+  (not the objects it fits).
+  `warn` qualifies what resolves and keeps the rest as written, logging it;
+  `off`, the default, saves names as written. The policy sees the resolved
+  names. The catalog is read whole for this, not through the writer's
+  policy: a writer learns whether a name exists, never what the object
+  holds. While the catalog cannot be read the write is refused (503,
+  `Retry-After`).
 - **Concurrent edits:** `GET` returns an `ETag`; send it back in `If-Match` on
   `PUT`, `PATCH` or `DELETE` and the write fails with 412 if someone else
   changed the document in between.
+- **Cached listings:** `GET /v1/docs` returns an `ETag` for the collection it
+  shows (the documents passing the filters and the caller's scope, their
+  versions, their accessible tables when annotated, and the view) and
+  answers 304 to a matching `If-None-Match`. It changes when one of them is
+  created, changed or removed, and when the caller's scope changes the set
+  or the split.
 - **Size:** request bodies are capped by `--max-body`.
 - **Audit:** writes produce `doc_create`, `doc_update` and `doc_delete` events
   with the document id in `doc`; like queries, they are refused (503) while
@@ -158,17 +218,29 @@ curl -u analyst:analyst-pw -d '{"q":"monthly revenue per customer","limit":3}' l
 ```
 ```json
 {"ranker": "jev",
- "results": [{"score": 0.93, "judged": true, "doc": {"id": "...", "header": {...}, "context": {...}}}]}
+ "results": [{"score": 0.93, "judged": true,
+              "matched": {"revenue": ["title", "description", "sql"], "customer": ["sql"]},
+              "doc": {"id": "...", "header": {...}, "context": {...},
+                      "accessible_tables": ["lake.analytics.monthly_revenue"], "inaccessible_tables": []}}]}
 ```
 
 - **Request:** `q` (required), optional `table` and `schema` filters (as in
-  the listing), `limit` (default 5, at most 50) and `fields` (`full`, the
-  default, or `header`).
+  the listing) or their list forms `tables` and `schemas` (any of up to 100
+  names; not together with the single form), `limit` (default 5, at most
+  50), `fields` (`full`, the default, or `header`) and `access` (annotate
+  each `doc` with `accessible_tables` and `inaccessible_tables` as in the
+  listing; always on under `--docs-scope schema`). The filters apply
+  before ranking, so documents outside them take no place in the Jev
+  shortlist or the limit.
 - **Ranking:** words are matched without case or accents, identifiers split
   on `_` and `.`, and a plural `s` is ignored. Matches in the title count
   most, then `used_for`, `tables`/`schemas`, the description, and the body and
   SQL ([BM25](https://en.wikipedia.org/wiki/Okapi_BM25)). Documents with
   no word of the question are left out.
+- **`matched`:** for each result, the question's terms found in the document
+  (as tokenized, so `orders` shows as `order`) and the fields holding them:
+  `title`, `used_for`, `tables`, `schemas`, `description`, `body`, `sql`.
+  It explains a BM25 match; a judged document may have none.
 - **With Jev** (`--jev-key`): the best BM25 candidates (`--search-shortlist`,
   at least `limit`) are each sent to [TypeSafe](https://typesafe.ai)'s Jev
   model, which judges whether the document is needed to write the SQL. Only
@@ -180,7 +252,8 @@ curl -u analyst:analyst-pw -d '{"q":"monthly revenue per customer","limit":3}' l
   document Jev could not rate in time keeps its BM25 place after
   the judged ones, with `"judged": false`.
 - **Without Jev:** `"ranker": "bm25"` and `score` is the BM25 score, useful only
-  for ordering.
+  for ordering. `GET /v1/capabilities` says which in `docs.ranker`, before
+  any search.
 
 ## Dry run
 

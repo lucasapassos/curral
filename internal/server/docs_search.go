@@ -25,19 +25,25 @@ const (
 )
 
 type searchRequest struct {
-	Q      string `json:"q"`
-	Table  string `json:"table"`
-	Schema string `json:"schema"`
-	Limit  int    `json:"limit"`
-	Fields string `json:"fields"`
+	Q       string   `json:"q"`
+	Table   string   `json:"table"`
+	Tables  []string `json:"tables"` // any of them; not with Table
+	Schema  string   `json:"schema"`
+	Schemas []string `json:"schemas"` // any of them; not with Schema
+	Limit   int      `json:"limit"`
+	Fields  string   `json:"fields"`
+	Access  bool     `json:"access"` // annotate results with the caller's access under --docs-scope all
 }
 
 // searchHit is one result. Score is the Judge's probability when Judged,
-// otherwise the BM25 score (not comparable between the two).
+// otherwise the BM25 score (not comparable between the two). Matched says
+// which question terms the document holds and in which fields: a reason
+// for the match when the ranker is BM25 alone.
 type searchHit struct {
-	Score  float64 `json:"score"`
-	Judged bool    `json:"judged"`
-	Doc    any     `json:"doc"`
+	Score   float64             `json:"score"`
+	Judged  bool                `json:"judged"`
+	Matched map[string][]string `json:"matched"`
+	Doc     any                 `json:"doc"`
 }
 
 type searchResponse struct {
@@ -49,7 +55,7 @@ type searchResponse struct {
 	Results        []searchHit `json:"results"`
 }
 
-func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, _ *auth.Principal) {
+func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
 	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.MaxBody))
 	if err != nil {
 		status := http.StatusBadRequest
@@ -81,19 +87,32 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, _ *auth.Prin
 	if in.Limit == 0 {
 		in.Limit = defaultSearchLimit
 	}
-	view := func(d docs.Doc) any {
-		if in.Fields == "header" {
-			return summary(d)
-		}
-		return d
-	}
+	// The filters apply before ranking, so documents outside them take no
+	// place in the shortlist or the limit.
 	f := docs.Filter{Table: in.Table, Schema: in.Schema}
+	if f.Tables, err = nameFilter("table", in.Table, in.Tables); err == nil {
+		f.Schemas, err = nameFilter("schema", in.Schema, in.Schemas)
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	a, status, msg := s.docAccess(r, p, in.Access)
+	if status != http.StatusOK {
+		writeSchemaError(w, status, msg)
+		return
+	}
+	hit := func(score float64, judged bool, d docs.Doc) searchHit {
+		v, _ := a.view(d, in.Fields == "header")
+		return searchHit{score, judged, d.MatchedTerms(in.Q), v}
+	}
+	f.Allow = a.allow
 
 	if s.Judge == nil {
 		out := searchResponse{Ranker: "bm25", Results: []searchHit{}}
 		for _, h := range s.Docs.Search(in.Q, f, in.Limit) {
 			if h.Score > 0 {
-				out.Results = append(out.Results, searchHit{h.Score, false, view(h.Doc)})
+				out.Results = append(out.Results, hit(h.Score, false, h.Doc))
 			}
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -125,12 +144,12 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, _ *auth.Prin
 				s.Log.Warn("document search: judge failed", "doc", h.Doc.ID, "err", j.Err)
 			}
 			if h.Score > 0 {
-				unjudged = append(unjudged, searchHit{h.Score, false, view(h.Doc)})
+				unjudged = append(unjudged, hit(h.Score, false, h.Doc))
 			}
 		case j.P >= threshold:
-			matched = append(matched, searchHit{j.P, true, view(h.Doc)})
+			matched = append(matched, hit(j.P, true, h.Doc))
 		case j.P >= s.SearchFloor:
-			weak = append(weak, searchHit{j.P, true, view(h.Doc)})
+			weak = append(weak, hit(j.P, true, h.Doc))
 		}
 	}
 	if failed > 1 {

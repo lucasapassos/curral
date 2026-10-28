@@ -41,8 +41,8 @@ func newServer(t testing.TB) *httptest.Server {
 }
 
 // newServerWithAudit starts a server; with auditPath set it also writes
-// audit events there.
-func newServerWithAudit(t testing.TB, auditPath string) (*httptest.Server, *audit.Writer) {
+// audit events there. setup, if given, adjusts the server before it starts.
+func newServerWithAudit(t testing.TB, auditPath string, setup ...func(*Server)) (*httptest.Server, *audit.Writer) {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("CURRAL_DATA", dir)
@@ -106,6 +106,9 @@ func newServerWithAudit(t testing.TB, auditPath string) (*httptest.Server, *audi
 			t.Fatal(err)
 		}
 		s.Audit = aw
+	}
+	for _, f := range setup {
+		f(s)
 	}
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
