@@ -439,6 +439,38 @@ func scopedCalls(scoped docs.Doc) []struct{ method, path, body string } {
 	}
 }
 
+// A scoped write must finish its scope audit before reserving its own
+// event, so even a queue with a single slot can serve every write method.
+func TestDocsScopedWritesSingleAuditSlot(t *testing.T) {
+	store, scoped, _ := seedScoped(t)
+	ts, _ := newServerWithAudit(t, "", func(s *Server) {
+		aw, err := audit.Open(filepath.Join(t.TempDir(), "audit.log"), 1, s.Log)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { aw.Close() })
+		s.Audit, s.Docs, s.DocsScope = aw, store, DocsScopeSchema
+		s.SetPolicy(loadRego(t, `allow if "admin" in input.roles
+docs_allow if "admin" in input.roles`))
+	})
+	for _, tc := range []struct {
+		method string
+		body   string
+		status int
+	}{
+		{http.MethodPut, sampleDoc, http.StatusOK},
+		{http.MethodPatch, `{"header":{"title":"updated notes"}}`, http.StatusOK},
+		{http.MethodDelete, "", http.StatusNoContent},
+	} {
+		t.Run(tc.method, func(t *testing.T) {
+			r := docReq(t, ts, tc.method, "admin", "/v1/docs/"+scoped.ID, tc.body)
+			if r.status != tc.status {
+				t.Fatalf("healthy audit with one slot: got %d %s, want %d", r.status, r.body, tc.status)
+			}
+		})
+	}
+}
+
 // With the audit sink failing, scoped documents are not served (as the
 // schema is not listed), with Retry-After; one about nothing still is.
 func TestDocsScopeFailClosed(t *testing.T) {

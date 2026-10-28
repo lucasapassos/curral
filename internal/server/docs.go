@@ -407,15 +407,6 @@ func (s *Server) docWriter(action string) handler {
 				return
 			}
 		}
-		if s.Audit != nil {
-			var err error
-			if reservation, err = s.Audit.Reserve(time.Second); err != nil {
-				s.Log.Error("document write refused: audit unavailable", "request_id", ev.RequestID, "err", err)
-				w.Header().Set("Retry-After", "1")
-				finish(http.StatusServiceUnavailable, "error", "audit", "audit log unavailable: write refused")
-				return
-			}
-		}
 
 		// Under --docs-scope schema a document out of the caller's scope is
 		// as good as missing on writes too: a write would otherwise read it
@@ -443,6 +434,18 @@ func (s *Server) docWriter(action string) handler {
 					return
 				}
 				ifMatch = tag
+			}
+		}
+
+		// Scope lookup reserves its own audit event. Finish it before holding
+		// a slot for the write, so neither reservation waits on the other.
+		if s.Audit != nil {
+			var err error
+			if reservation, err = s.Audit.Reserve(time.Second); err != nil {
+				s.Log.Error("document write refused: audit unavailable", "request_id", ev.RequestID, "err", err)
+				w.Header().Set("Retry-After", "1")
+				finish(http.StatusServiceUnavailable, "error", "audit", "audit log unavailable: write refused")
+				return
 			}
 		}
 
