@@ -7,14 +7,15 @@ notes are taken from its section here.
 
 ### Added
 - `GET /v1/schema` reports `docs` on each table: how many semantic
-  documents are about it, matched as the document filters match names;
-  omitted when none. Under `--docs-scope schema` only documents the caller
-  may read count. A client can skip listing documents for tables without
-  any.
-- Documents listed by `GET /v1/docs` or returned by `POST /v1/docs/search`
-  carry `accessible_tables` and `inaccessible_tables`: which of their
-  `tables` the caller may query, by the caller's `/v1/schema` listing, in
-  both `--docs-scope` modes.
+  documents are about it, by the rule of the document filters, so a
+  listing filtered by the table's name shows exactly them; omitted when
+  none. Under `--docs-scope schema` only documents the caller may read
+  count. A client can skip listing documents for tables without any.
+- Documents served by `GET /v1/docs`, `GET /v1/docs/{id}` and `POST
+  /v1/docs/search` can carry `accessible_tables` and `inaccessible_tables`:
+  which of their `tables` the caller may query, by the caller's
+  `/v1/schema` listing. Always under `--docs-scope schema`; under `all`
+  when asked with `?access=true` (`"access": true` in a search).
 - `GET /v1/docs` and `POST /v1/docs/search` take `tables` and `schemas`
   (lists of up to 100 names, any of which matches) besides `table` and
   `schema`; the filters apply before ranking, so documents outside them
@@ -34,11 +35,9 @@ notes are taken from its section here.
   terms found in the document and the fields holding them.
 
 ### Changed
-- `GET /v1/docs` and `POST /v1/docs/search` list the caller's schema (one
-  `docs_scope` audit event per request) under `--docs-scope all` too, to
-  annotate the documents; like queries, they are refused while the audit
-  log cannot record it. `GET /v1/docs/{id}` under `all` still needs no
-  listing.
+- Document filters match names both ways: `?table=sales.main.orders` finds
+  a document about `orders` as `?table=orders` already found one about
+  `sales.main.orders`.
 - `--docs-scope schema`: a semantic document that names tables or schemas
   is served only to callers who may query at least one of them, as listed
   by `/v1/schema` and audited as `docs_scope`. Reads and writes alike

@@ -1160,13 +1160,24 @@ type schemaResponse struct {
 // schema lists tables and views with their columns, keeping only those the
 // caller could read; see listSchema. ?database=, ?schema= and ?table=
 // narrow the listing. With semantic documents, each table says how many
-// are about it.
+// are about it; under --docs-scope schema that needs the caller's scope,
+// which an unfiltered listing is, so it is listed once.
 func (s *Server) schema(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
 	q := r.URL.Query()
 	f := engine.SchemaFilter{Database: q.Get("database"), Schema: q.Get("schema"), Table: q.Get("table")}
-	tables, status, msg := s.listSchema(r.Context(), p, s.newEvent(r, "schema", p), f, nil)
+	var all []string
+	var match func(engine.TableSchema) bool
+	whole := s.Docs != nil && s.docsScope() == DocsScopeSchema && f == (engine.SchemaFilter{})
+	if whole {
+		match = func(t engine.TableSchema) bool { all = append(all, t.Qualified()); return true }
+	}
+	tables, status, msg := s.listSchema(r.Context(), p, s.newEvent(r, "schema", p), f, match)
 	if status == http.StatusOK && s.Docs != nil {
-		status, msg = s.countDocs(r, p, tables)
+		var scope *docs.Scope
+		if whole {
+			scope = docs.NewScope(all, qualifiedNames(tables))
+		}
+		status, msg = s.countDocs(r, p, tables, scope)
 	}
 	if status != http.StatusOK {
 		writeSchemaError(w, status, msg)

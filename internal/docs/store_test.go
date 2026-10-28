@@ -133,6 +133,9 @@ func TestListFilters(t *testing.T) {
 	other.Context.Tables, other.Context.Schemas = []string{"crm.main.customers"}, []string{"crm.main"}
 	other.Header.Description, other.Header.UsedFor = "", nil
 	b, _, _ := s.Create(other, "ana", nil)
+	short := sample("Short names")
+	short.Context.Tables, short.Context.Schemas = []string{"orders"}, []string{"main"}
+	c, _, _ := s.Create(short, "ana", nil)
 
 	ids := func(ds []Doc) (out []string) {
 		for _, d := range ds {
@@ -144,19 +147,25 @@ func TestListFilters(t *testing.T) {
 		f    Filter
 		want []string
 	}{
-		{Filter{}, []string{b.ID, a.ID}},
-		{Filter{Table: "orders"}, []string{a.ID}},
-		{Filter{Table: "MAIN.ORDERS"}, []string{a.ID}},
+		{Filter{}, []string{c.ID, b.ID, a.ID}},
+		{Filter{Table: "orders"}, []string{c.ID, a.ID}},
+		{Filter{Table: "MAIN.ORDERS"}, []string{c.ID, a.ID}},
+		// A name fits the other way round too: the qualified name finds a
+		// document about its last parts, so a count by that name and this
+		// filter agree.
+		{Filter{Table: "sales.main.orders"}, []string{c.ID, a.ID}},
+		{Filter{Table: "x.sales.main.orders"}, []string{c.ID, a.ID}},
 		{Filter{Table: "ders"}, nil},
-		{Filter{Schema: "main"}, []string{b.ID}},
+		{Filter{Schema: "main"}, []string{c.ID, b.ID}},
+		{Filter{Schema: "crm.main"}, []string{c.ID, b.ID}},
 		{Filter{Q: "CHURN"}, []string{b.ID}},
-		{Filter{Q: "finance"}, []string{a.ID}},
+		{Filter{Q: "finance"}, []string{c.ID, a.ID}},
 		// Lists match any of their names, alone or with the single form.
-		{Filter{Tables: []string{"nope", "orders"}}, []string{a.ID}},
+		{Filter{Tables: []string{"nope", "orders"}}, []string{c.ID, a.ID}},
 		{Filter{Tables: []string{"nope"}}, nil},
-		{Filter{Table: "nope", Tables: []string{"orders"}}, []string{a.ID}},
-		{Filter{Schemas: []string{"other", "MAIN"}}, []string{b.ID}},
-		{Filter{Tables: []string{"orders"}, Schemas: []string{"main"}}, nil},
+		{Filter{Table: "nope", Tables: []string{"orders"}}, []string{c.ID, a.ID}},
+		{Filter{Schemas: []string{"other", "MAIN"}}, []string{c.ID, b.ID}},
+		{Filter{Tables: []string{"orders"}, Schemas: []string{"main"}}, []string{c.ID}},
 	} {
 		if got := ids(s.List(c.f)); strings.Join(got, ",") != strings.Join(c.want, ",") {
 			t.Errorf("%+v: got %v want %v", c.f, got, c.want)
@@ -243,6 +252,7 @@ func TestStoreCount(t *testing.T) {
 	}
 	for title, tables := range map[string][]string{
 		"a": {"orders"}, "b": {"SALES.main.orders", " orders "}, "c": {"salaries"}, "d": {"main.salaries", "nope"}, "e": nil,
+		"f": {"x.sales.main.orders"}, // fits the other way round, as the filter would
 	} {
 		if _, _, err := s.Create(Doc{Header: Header{Title: title}, Context: Context{Tables: tables, Body: "b"}}, "u", nil); err != nil {
 			t.Fatal(err)
@@ -250,7 +260,7 @@ func TestStoreCount(t *testing.T) {
 	}
 	tables := []string{"sales.main.orders", "hr.main.salaries", "Sales.Main.Salaries", "logs.main.events"}
 	got := s.Count(tables, nil)
-	want := map[string]int{"sales.main.orders": 2, "hr.main.salaries": 2, "Sales.Main.Salaries": 2}
+	want := map[string]int{"sales.main.orders": 3, "hr.main.salaries": 2, "Sales.Main.Salaries": 2}
 	if len(got) != len(want) {
 		t.Fatalf("count: %v, want %v", got, want)
 	}
@@ -266,5 +276,74 @@ func TestStoreCount(t *testing.T) {
 	}
 	if got := s.Count(tables, func(Doc) bool { return false }); len(got) != 0 {
 		t.Errorf("empty count: %v", got)
+	}
+}
+
+// TestStoreEdges covers the store's refusals and tie-breaks: a directory
+// it cannot open or load, writes it cannot apply, and documents equal in
+// time or score listed by id.
+func TestStoreEdges(t *testing.T) {
+	if _, err := Open(""); err == nil {
+		t.Error("no directory accepted")
+	}
+	file := filepath.Join(t.TempDir(), "file")
+	os.WriteFile(file, nil, 0o600)
+	if _, err := Open(file); err == nil {
+		t.Error("a file as the directory accepted")
+	}
+	for name, content := range map[string]string{"BAD-NAME.json": "{}", "aaaaaaaa.json": "{", "bbbbbbbb.json": `{"header":{"title":""}}`} {
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600)
+		if _, err := Open(dir); err == nil {
+			t.Errorf("%s: loaded", name)
+		}
+	}
+	if os.Geteuid() != 0 {
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, "cccccccc.json"), []byte("{}"), 0o000)
+		if _, err := Open(dir); err == nil {
+			t.Error("an unreadable file loaded")
+		}
+	}
+
+	s, _ := Open(t.TempDir())
+	clock := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return clock }
+	a, _, _ := s.Create(sample("Same"), "ana", nil)
+	b, _, _ := s.Create(sample("Same"), "ana", nil)
+	first, second := min(a.ID, b.ID), max(a.ID, b.ID)
+	if ds, tags := s.ListTagged(Filter{}); len(ds) != 2 || ds[0].ID != first || ds[1].ID != second || tags[0] == "" {
+		t.Errorf("same time: %v %v", ds, tags)
+	}
+	if hits := s.Search("revenue", Filter{}, 10); len(hits) != 2 || hits[0].Doc.ID != first || hits[0].Score != hits[1].Score {
+		t.Errorf("same score: %v", hits)
+	}
+	// A document with nothing to search still comes back, with no score.
+	empty, _ := Open(t.TempDir())
+	if _, _, err := empty.Create(Doc{Header: Header{Title: "!!!"}, Context: Context{Body: "..."}}, "ana", nil); err != nil {
+		t.Fatal(err)
+	}
+	if hits := empty.Search("anything", Filter{}, 1); len(hits) != 1 || hits[0].Score != 0 {
+		t.Errorf("no terms: %v", hits)
+	}
+
+	if _, _, err := s.Patch(a.ID, []byte("{"), "ana", "", nil); err == nil {
+		t.Error("malformed patch accepted")
+	}
+	if _, _, err := s.Patch("nope1234", []byte("{}"), "ana", "", nil); !errors.Is(err, ErrNotFound) {
+		t.Errorf("patch of an unknown id: %v", err)
+	}
+	if err := s.Delete(a.ID, `"stale"`, nil); !errors.Is(err, ErrPrecondition) {
+		t.Errorf("delete with a stale tag: %v", err)
+	}
+	if os.Geteuid() != 0 {
+		os.Chmod(s.Dir(), 0o500)
+		t.Cleanup(func() { os.Chmod(s.Dir(), 0o700) })
+		if err := s.Delete(a.ID, "", nil); err == nil || errors.Is(err, ErrNotFound) {
+			t.Errorf("delete in a read-only directory: %v", err)
+		}
+		if _, _, err := s.Get(a.ID); err != nil {
+			t.Error("a document the store could not remove is gone")
+		}
 	}
 }

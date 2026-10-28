@@ -231,6 +231,11 @@ func TestDelegatedDocs(t *testing.T) {
 	if status, h, body := call("GET", "/v1/docs", as, ""); status != 200 || h.Get(effectiveSubjectHeader) != "portal:user:42" {
 		t.Fatalf("list %d %s", status, body)
 	}
+	// Without an engine the catalog is empty: the annotation can still be
+	// asked for.
+	if status, _, body := call("GET", "/v1/docs?access=true", as, ""); status != 200 {
+		t.Fatalf("list with access %d %s", status, body)
+	}
 	status, _, body := call("GET", "/v1/capabilities", nil, "")
 	var capa map[string]any
 	json.Unmarshal([]byte(body), &capa)

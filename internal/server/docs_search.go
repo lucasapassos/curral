@@ -32,6 +32,7 @@ type searchRequest struct {
 	Schemas []string `json:"schemas"` // any of them; not with Schema
 	Limit   int      `json:"limit"`
 	Fields  string   `json:"fields"`
+	Access  bool     `json:"access"` // annotate results with the caller's access under --docs-scope all
 }
 
 // searchHit is one result. Score is the Judge's probability when Judged,
@@ -96,13 +97,14 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, p *auth.Prin
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	a, status, msg := s.docAccess(r, p)
+	a, status, msg := s.docAccess(r, p, in.Access)
 	if status != http.StatusOK {
 		writeSchemaError(w, status, msg)
 		return
 	}
 	hit := func(score float64, judged bool, d docs.Doc) searchHit {
-		return searchHit{score, judged, d.MatchedTerms(in.Q), a.view(d, in.Fields == "header")}
+		v, _ := a.view(d, in.Fields == "header")
+		return searchHit{score, judged, d.MatchedTerms(in.Q), v}
 	}
 	f.Allow = a.allow
 

@@ -69,15 +69,17 @@ curl -u admin 'https://curral.example.com/v1/schema?database=lake&schema=analyti
   column.
 - **`comment`:** table and column comments (`COMMENT ON`), when present.
 - **`docs`:** with `--docs-dir`, how many [semantic documents](#semantic-documents-v1docs)
-  are about the table (naming it exactly or by its last parts, as the
-  document filters match); omitted when none. With `--docs-scope schema`
-  only the documents the caller may read count, so a count never reveals a
-  document the listing would hide. Clients can skip `GET /v1/docs` for
-  tables without a count.
+  are about the table, by the rule of the document filters: `GET
+  /v1/docs?table=` with the qualified name lists exactly the documents
+  counted; omitted when none. With `--docs-scope schema` only the
+  documents the caller may read count, so a count never reveals a document
+  the listing would hide. Clients can skip `GET /v1/docs` for tables
+  without a count.
 - **`schema` in `databases`:** the schema used for unqualified names.
 - **Audit:** each call produces a `schema` event listing the tables returned
-  (and, when counting documents under `--docs-scope schema`, a `docs_scope`
-  event for the caller's scope).
+  (and, when counting documents under `--docs-scope schema` for a filtered
+  listing, a `docs_scope` event for the caller's whole scope; an unfiltered
+  listing is the scope and needs no second one).
 
 ### Cache
 
@@ -126,22 +128,26 @@ people) to read before writing queries. Each one is a JSON file,
   and `updated_by` (who changed it last). Values sent for them are ignored, so
   a document from a `GET` can be sent back as is. Unknown fields are a 400.
 - **Reading:** every authenticated user. `GET /v1/docs` lists full documents,
-  most recently updated first; `?table=`, `?schema=` (exact name or its last
-  parts, so `orders` finds `sales.main.orders`) and `?q=` (text in title,
-  description or `used_for`) narrow it, all case-insensitive. `?tables=`
+  most recently updated first; `?table=`, `?schema=` (the same name, or
+  either the last parts of the other, so `orders` finds a document about
+  `sales.main.orders` and `sales.main.orders` one about `orders`) and `?q=`
+  (text in title, description or `used_for`) narrow it, all
+  case-insensitive. `?tables=`
   and `?schemas=` take several names (repeated or comma-separated, up to
   100 each) and keep a document about any of them; `table` with `tables`,
   or `schema` with `schemas`, is a 400. `?fields=header` leaves out `body`
   and `sqls`.
-- **Access:** each document listed or searched carries `accessible_tables`
-  and `inaccessible_tables`: the entries of its `tables` the caller may
-  query and the rest (a name counts as accessible when every object it
-  fits is readable; one fitting nothing in the catalog is not). A document
-  naming no table has two empty lists. The split uses the caller's
-  `/v1/schema` listing, made once per request in both scopes and audited
-  as a `docs_scope` event, so listing and search are refused (503, 429 or
-  500) when that listing is; `GET /v1/docs/{id}` under `--docs-scope all`
-  needs none.
+- **Access:** a document can carry `accessible_tables` and
+  `inaccessible_tables`: the entries of its `tables` the caller may query
+  and the rest (a name counts as accessible when every object it fits is
+  readable; one fitting nothing in the catalog is not). A document naming
+  no table has two empty lists. The split uses the caller's `/v1/schema`
+  listing, made once per request and audited as a `docs_scope` event, so
+  the request is refused (503, 429 or 500) when that listing is. Under
+  `--docs-scope schema` every document served (listed, fetched, searched)
+  carries it, since the scope is listed anyway. Under `all` a request
+  asks for it with `?access=true` (`"access": true` in a search), and
+  without it reads need no listing, no audit slot and no engine.
 - **Scope:** with `--docs-scope schema`, a document that names `tables` is
   served (listed, fetched, searched) only to a caller who may query at least
   one of them; one that names only `schemas`, to a caller who may query a
@@ -181,9 +187,10 @@ people) to read before writing queries. Each one is a JSON file,
   changed the document in between.
 - **Cached listings:** `GET /v1/docs` returns an `ETag` for the collection it
   shows (the documents passing the filters and the caller's scope, their
-  versions, their accessible tables and the view) and answers 304 to a
-  matching `If-None-Match`. It changes when one of them is created,
-  changed or removed, and when the caller's scope changes the set.
+  versions, their accessible tables when annotated, and the view) and
+  answers 304 to a matching `If-None-Match`. It changes when one of them is
+  created, changed or removed, and when the caller's scope changes the set
+  or the split.
 - **Size:** request bodies are capped by `--max-body`.
 - **Audit:** writes produce `doc_create`, `doc_update` and `doc_delete` events
   with the document id in `doc`; like queries, they are refused (503) while
@@ -218,10 +225,11 @@ curl -u analyst:analyst-pw -d '{"q":"monthly revenue per customer","limit":3}' l
 - **Request:** `q` (required), optional `table` and `schema` filters (as in
   the listing) or their list forms `tables` and `schemas` (any of up to 100
   names; not together with the single form), `limit` (default 5, at most
-  50) and `fields` (`full`, the default, or `header`). The filters apply
+  50), `fields` (`full`, the default, or `header`) and `access` (annotate
+  each `doc` with `accessible_tables` and `inaccessible_tables` as in the
+  listing; always on under `--docs-scope schema`). The filters apply
   before ranking, so documents outside them take no place in the Jev
-  shortlist or the limit. Each `doc` carries `accessible_tables` and
-  `inaccessible_tables`, as in the listing.
+  shortlist or the limit.
 - **Ranking:** words are matched without case or accents, identifiers split
   on `_` and `.`, and a plural `s` is ignored. Matches in the title count
   most, then `used_for`, `tables`/`schemas`, the description, and the body and

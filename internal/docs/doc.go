@@ -167,17 +167,25 @@ func (d Doc) Matches(f Filter) bool {
 // so every Scope shows it.
 func (d Doc) Unscoped() bool { return len(d.Context.Tables) == 0 && len(d.Context.Schemas) == 0 }
 
-// nameIn matches a name exactly or as the last parts of a qualified one, so
-// "orders" and "main.orders" both find "sales.main.orders".
+// nameIn reports whether name fits an entry of list: the same name, or
+// either the last parts of the other, so "orders" and "sales.main.orders"
+// find each other and "main.orders" finds both. Case is ignored. The same
+// rule counts documents per table (Store.Count), so a count and a filter
+// by the same name agree.
 func nameIn(name string, list []string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
 	for _, s := range list {
-		s = strings.ToLower(s)
-		if s == name || strings.HasSuffix(s, "."+name) {
+		if namesFit(strings.ToLower(s), name) {
 			return true
 		}
 	}
 	return false
+}
+
+// namesFit reports whether two lowercase names fit each other: equal, or
+// one ending with "." and the other.
+func namesFit(a, b string) bool {
+	return a == b || strings.HasSuffix(a, "."+b) || strings.HasSuffix(b, "."+a)
 }
 
 // anyNameIn reports whether list names one (or Tables, if given) or more

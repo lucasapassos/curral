@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,14 +50,19 @@ func ValidDocsNames(v string) bool {
 }
 
 // docCatalog loads the catalog a write resolves its tables and schemas
-// against, as --docs-validate-names asks; nil when off. It is loaded
-// before the store is locked: a cold schema snapshot can take seconds and
-// must not hold up every document read. The catalog is read whole, not
-// through the writer's policy: a writer thus learns whether a name exists,
-// which is documented, but never what the object holds.
+// against, as --docs-validate-names asks; nil when off, empty without an
+// engine (nothing resolves). It is loaded before the store is locked and
+// before the write's audit slot is taken: a cold schema snapshot can take
+// seconds and must hold up neither document reads nor other audited
+// requests. The catalog is read whole, not through the writer's policy: a
+// writer thus learns whether a name exists, which is documented, but never
+// what the object holds.
 func (s *Server) docCatalog(ctx context.Context, ev *audit.Event) (*docs.Catalog, error) {
-	if mode := s.DocsValidateNames; mode == "" || mode == DocsNamesOff || s.Engine == nil {
+	if mode := s.DocsValidateNames; mode == "" || mode == DocsNamesOff {
 		return nil, nil
+	}
+	if s.Engine == nil {
+		return docs.NewCatalog(nil), nil
 	}
 	var names []string
 	_, err := s.Engine.Schema(ctx, engine.SchemaFilter{}, func(_ context.Context, t engine.TableSchema, _ engine.Inspection) (bool, error) {
@@ -110,47 +116,56 @@ func (s *Server) catalogScope(r *http.Request, p *auth.Principal) (*docs.Scope, 
 	if status != http.StatusOK {
 		return nil, status, msg
 	}
-	visible := make([]string, len(tables))
-	for i, t := range tables {
-		visible[i] = t.Qualified()
-	}
-	return docs.NewScope(all, visible), http.StatusOK, ""
+	return docs.NewScope(all, qualifiedNames(tables)), http.StatusOK, ""
 }
 
-// docScope returns the condition documents must pass to be shown to p, nil
-// when every document is. Under DocsScopeSchema a document naming tables
-// or schemas must name a readable one, by the caller's catalogScope.
-func (s *Server) docScope(r *http.Request, p *auth.Principal) (func(docs.Doc) bool, int, string) {
-	if s.docsScope() != DocsScopeSchema {
-		return nil, http.StatusOK, ""
+// qualifiedNames are the database.schema.table names of tables.
+func qualifiedNames(tables []engine.TableSchema) []string {
+	out := make([]string, len(tables))
+	for i, t := range tables {
+		out[i] = t.Qualified()
 	}
-	scope, status, msg := s.catalogScope(r, p)
-	if status != http.StatusOK {
-		return nil, status, msg
-	}
-	return scope.Readable, http.StatusOK, ""
+	return out
 }
 
 // docAccess is what a listing or search knows of the caller's catalog: the
 // scope, to tell which of a document's tables the caller may query, and
-// under DocsScopeSchema the condition documents must pass. The scope is
-// listed in every mode, once per request, so the annotation is always
-// there and a failed listing fails the request in both modes.
+// under DocsScopeSchema the condition documents must pass. Under
+// DocsScopeSchema the scope is listed anyway, so the annotation is always
+// there; under DocsScopeAll it is listed only when the caller asks for the
+// annotation (access), so a plain listing stays an in-memory read that
+// needs no policy, no audit slot and no engine.
 type docAccess struct {
-	scope *docs.Scope
+	scope *docs.Scope         // nil: no annotation
 	allow func(docs.Doc) bool // nil: every document is shown
 }
 
-func (s *Server) docAccess(r *http.Request, p *auth.Principal) (docAccess, int, string) {
+func (s *Server) docAccess(r *http.Request, p *auth.Principal, access bool) (docAccess, int, string) {
+	schema := s.docsScope() == DocsScopeSchema
+	if !schema && !access {
+		return docAccess{}, http.StatusOK, ""
+	}
 	scope, status, msg := s.catalogScope(r, p)
 	if status != http.StatusOK {
 		return docAccess{}, status, msg
 	}
 	a := docAccess{scope: scope}
-	if s.docsScope() == DocsScopeSchema {
+	if schema {
 		a.allow = scope.Readable
 	}
 	return a, http.StatusOK, ""
+}
+
+// accessParam reads the access query parameter: empty or a boolean.
+func accessParam(v string) (bool, error) {
+	if v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, errors.New("access must be true or false")
+	}
+	return b, nil
 }
 
 // access says which of the tables a document names the caller may query
@@ -161,44 +176,59 @@ type access struct {
 	InaccessibleTables []string `json:"inaccessible_tables"`
 }
 
-// A document as listed or searched: whole, or its header, plus access.
+// A document as served: whole, or its header, plus access when annotated.
 type (
 	fullDoc struct {
 		docs.Doc
-		access
+		*access
 	}
 	headerDoc struct {
 		docSummary
-		access
+		*access
 	}
 )
 
-// view renders d for the caller: the whole document or, with header, its
-// summary, annotated with the tables the caller may query.
-func (a docAccess) view(d docs.Doc, header bool) any {
+// split is the access of d within scope.
+func split(scope *docs.Scope, d docs.Doc) *access {
 	var x access
-	x.AccessibleTables, x.InaccessibleTables = a.scope.Split(d)
-	if header {
-		return headerDoc{summary(d), x}
+	x.AccessibleTables, x.InaccessibleTables = scope.Split(d)
+	return &x
+}
+
+// view renders d for the caller: the whole document or, with header, its
+// summary, annotated with the tables the caller may query when the scope
+// is known. The annotation is also returned, nil when there is none.
+func (a docAccess) view(d docs.Doc, header bool) (any, *access) {
+	var x *access
+	if a.scope != nil {
+		x = split(a.scope, d)
 	}
-	return fullDoc{d, x}
+	if header {
+		return headerDoc{summary(d), x}, x
+	}
+	return fullDoc{d, x}, x
 }
 
 // countDocs sets Docs on each listed table: how many documents are about
-// it (naming it exactly or by its last parts). Under DocsScopeSchema only
-// the documents the caller may read count, so a count never reveals a
-// document the listing would hide; deciding that takes the caller's scope,
-// listed and audited as for the documents themselves. A status other than
-// 200 comes with the message the client may see.
-func (s *Server) countDocs(r *http.Request, p *auth.Principal, tables []engine.TableSchema) (int, string) {
-	allow, status, msg := s.docScope(r, p)
-	if status != http.StatusOK {
-		return status, msg
+// it, by the rule of the document filters. Under DocsScopeSchema only the
+// documents the caller may read count, so a count never reveals a document
+// the listing would hide; deciding that takes the caller's scope, given
+// when the listing already made it (an unfiltered one is the scope) and
+// otherwise listed and audited as for the documents themselves. A status
+// other than 200 comes with the message the client may see.
+func (s *Server) countDocs(r *http.Request, p *auth.Principal, tables []engine.TableSchema, scope *docs.Scope) (int, string) {
+	var allow func(docs.Doc) bool
+	if s.docsScope() == DocsScopeSchema {
+		if scope == nil {
+			var status int
+			var msg string
+			if scope, status, msg = s.catalogScope(r, p); status != http.StatusOK {
+				return status, msg
+			}
+		}
+		allow = scope.Readable
 	}
-	names := make([]string, len(tables))
-	for i, t := range tables {
-		names[i] = t.Qualified()
-	}
+	names := qualifiedNames(tables)
 	counts := s.Docs.Count(names, allow)
 	for i := range tables {
 		tables[i].Docs = counts[names[i]]
@@ -281,7 +311,8 @@ func summary(d docs.Doc) docSummary {
 // listDocs lists documents, most recently updated first. ?table= (or
 // ?tables=, a list), ?schema= (or ?schemas=) and ?q= narrow the list;
 // ?fields=header leaves out bodies and SQL. Each document says which of
-// its tables the caller may query.
+// its tables the caller may query under --docs-scope schema, or when
+// ?access=true asks for it.
 func (s *Server) listDocs(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
 	q := r.URL.Query()
 	header := q.Get("fields") == "header"
@@ -289,16 +320,19 @@ func (s *Server) listDocs(w http.ResponseWriter, r *http.Request, p *auth.Princi
 		writeError(w, http.StatusBadRequest, "fields must be header or empty")
 		return
 	}
+	access, err := accessParam(q.Get("access"))
 	f := docs.Filter{Table: q.Get("table"), Schema: q.Get("schema"), Q: q.Get("q")}
-	var err error
-	if f.Tables, err = nameFilter("table", f.Table, listedNames(q["tables"])); err == nil {
+	if err == nil {
+		f.Tables, err = nameFilter("table", f.Table, listedNames(q["tables"]))
+	}
+	if err == nil {
 		f.Schemas, err = nameFilter("schema", f.Schema, listedNames(q["schemas"]))
 	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	a, status, msg := s.docAccess(r, p)
+	a, status, msg := s.docAccess(r, p, access)
 	if status != http.StatusOK {
 		writeSchemaError(w, status, msg)
 		return
@@ -308,14 +342,18 @@ func (s *Server) listDocs(w http.ResponseWriter, r *http.Request, p *auth.Princi
 	out := make([]any, len(list))
 	// The collection's ETag covers what the response shows: which
 	// documents, in which version, with which tables accessible to this
-	// caller, in which view. It changes with any write to them and when
-	// the caller's scope changes the set or the split.
+	// caller (when annotated), in which view. It changes with any write to
+	// them and when the caller's scope changes the set or the split.
 	sum := sha256.New()
-	fmt.Fprintf(sum, "%v\n", header)
+	fmt.Fprintf(sum, "%v %v\n", header, a.scope != nil)
 	for i, d := range list {
-		v := a.view(d, header)
+		v, x := a.view(d, header)
 		out[i] = v
-		fmt.Fprintf(sum, "%s %s %q\n", d.ID, tags[i], accessibleOf(v))
+		fmt.Fprintf(sum, "%s %s", d.ID, tags[i])
+		if x != nil {
+			fmt.Fprintf(sum, " %q", x.AccessibleTables)
+		}
+		fmt.Fprintln(sum)
 	}
 	tag := `"` + hex.EncodeToString(sum.Sum(nil)[:16]) + `"`
 	w.Header().Set("ETag", tag)
@@ -326,42 +364,48 @@ func (s *Server) listDocs(w http.ResponseWriter, r *http.Request, p *auth.Princi
 	writeJSON(w, http.StatusOK, map[string]any{"docs": out})
 }
 
-// accessibleOf is the accessible_tables of a rendered document.
-func accessibleOf(v any) []string {
-	switch v := v.(type) {
-	case fullDoc:
-		return v.AccessibleTables
-	case headerDoc:
-		return v.AccessibleTables
-	}
-	return nil
-}
-
+// getDoc serves one document, annotated with the tables the caller may
+// query under --docs-scope schema or when ?access=true asks for it.
 func (s *Server) getDoc(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
 	id := r.PathValue("id")
 	if !docs.ValidID(id) {
 		writeError(w, http.StatusNotFound, docs.ErrNotFound.Error())
 		return
 	}
+	access, err := accessParam(r.URL.Query().Get("access"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	d, tag, err := s.Docs.Get(id)
-	// A document about nothing in particular is in every scope and needs
-	// no schema listing. Any other id, missing or not, settles the scope
-	// first, so an unknown id and an out-of-scope one answer alike (404,
-	// or both 503 while the audit log is down): the id must not reveal the
-	// document.
-	if err != nil || !d.Unscoped() {
-		allow, status, msg := s.docScope(r, p)
-		if status != http.StatusOK {
+	schema := s.docsScope() == DocsScopeSchema
+	var scope *docs.Scope
+	switch {
+	case schema && err == nil && d.Unscoped():
+		// In every scope, and about no table: nothing to list.
+		scope = docs.NewScope(nil, nil)
+	case schema || (err == nil && access):
+		// Under DocsScopeSchema any other id, missing or not, settles the
+		// scope first, so an unknown id and an out-of-scope one answer
+		// alike (404, or both 503 while the audit log is down): the id
+		// must not reveal the document.
+		var status int
+		var msg string
+		if scope, status, msg = s.catalogScope(r, p); status != http.StatusOK {
 			writeSchemaError(w, status, msg)
 			return
 		}
-		if err != nil || (allow != nil && !allow(d)) {
-			writeError(w, http.StatusNotFound, docs.ErrNotFound.Error())
-			return
-		}
+	}
+	if err != nil || (schema && !scope.Readable(d)) {
+		writeError(w, http.StatusNotFound, docs.ErrNotFound.Error())
+		return
 	}
 	w.Header().Set("ETag", tag)
-	writeJSON(w, http.StatusOK, d)
+	if scope == nil {
+		writeJSON(w, http.StatusOK, d)
+		return
+	}
+	writeJSON(w, http.StatusOK, fullDoc{d, split(scope, d)})
 }
 
 // docWriter handles POST, PUT, PATCH (RFC 7396 merge patch) and DELETE.
@@ -410,43 +454,33 @@ func (s *Server) docWriter(action string) handler {
 
 		// Under --docs-scope schema a document out of the caller's scope is
 		// as good as missing on writes too: a write would otherwise read it
-		// back (PATCH returns the document) or reveal it by its status. The
-		// version checked here is the one written: the client's If-Match
-		// (none and "*" included) is settled against it now, and the store
-		// then insists on exactly this version, so a document changed in
-		// between is never written, or read back, unchecked.
+		// back (PATCH returns the document) or reveal it by its status. As
+		// for a read, a document about nothing in particular needs no
+		// listing; any other id, missing or not, settles the scope first.
+		// The version checked here is the one written: the client's
+		// If-Match (none and "*" included) is settled against it now, and
+		// the store then insists on exactly this version, so a document
+		// changed in between is never written, or read back, unchecked.
 		ifMatch := r.Header.Get("If-Match")
-		if r.Method != http.MethodPost {
-			allow, status, msg := s.docScope(r, p)
-			if status != http.StatusOK {
-				retryAfter(w, status)
-				finish(status, "error", "scope", msg)
-				return
-			}
-			if allow != nil {
-				cur, tag, err := s.Docs.Get(ev.Doc)
-				if err != nil || !allow(cur) {
+		if r.Method != http.MethodPost && s.docsScope() == DocsScopeSchema {
+			cur, tag, err := s.Docs.Get(ev.Doc)
+			if err != nil || !cur.Unscoped() {
+				scope, status, msg := s.catalogScope(r, p)
+				if status != http.StatusOK {
+					retryAfter(w, status)
+					finish(status, "error", "scope", msg)
+					return
+				}
+				if err != nil || !scope.Readable(cur) {
 					finish(http.StatusNotFound, "error", "scope", docs.ErrNotFound.Error())
 					return
 				}
-				if !docs.ETagMatches(ifMatch, tag) {
-					finish(http.StatusPreconditionFailed, "error", "request", docs.ErrPrecondition.Error())
-					return
-				}
-				ifMatch = tag
 			}
-		}
-
-		// Scope lookup reserves its own audit event. Finish it before holding
-		// a slot for the write, so neither reservation waits on the other.
-		if s.Audit != nil {
-			var err error
-			if reservation, err = s.Audit.Reserve(time.Second); err != nil {
-				s.Log.Error("document write refused: audit unavailable", "request_id", ev.RequestID, "err", err)
-				w.Header().Set("Retry-After", "1")
-				finish(http.StatusServiceUnavailable, "error", "audit", "audit log unavailable: write refused")
+			if !docs.ETagMatches(ifMatch, tag) {
+				finish(http.StatusPreconditionFailed, "error", "request", docs.ErrPrecondition.Error())
 				return
 			}
+			ifMatch = tag
 		}
 
 		var catalog *docs.Catalog
@@ -455,6 +489,19 @@ func (s *Server) docWriter(action string) handler {
 			if catalog, err = s.docCatalog(r.Context(), ev); err != nil {
 				w.Header().Set("Retry-After", "1")
 				finish(http.StatusServiceUnavailable, "error", "catalog", err.Error())
+				return
+			}
+		}
+
+		// The scope lookup reserves its own audit event and the catalog may
+		// take a while to load: both are done before holding a slot for the
+		// write, so no reservation waits on another or on the engine.
+		if s.Audit != nil {
+			var err error
+			if reservation, err = s.Audit.Reserve(time.Second); err != nil {
+				s.Log.Error("document write refused: audit unavailable", "request_id", ev.RequestID, "err", err)
+				w.Header().Set("Retry-After", "1")
+				finish(http.StatusServiceUnavailable, "error", "audit", "audit log unavailable: write refused")
 				return
 			}
 		}

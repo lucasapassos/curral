@@ -145,15 +145,20 @@ func (s *Store) ListTagged(f Filter) ([]Doc, []string) {
 
 // Count returns, for each qualified table name in tables, how many
 // documents passing allow (every one when nil) are about it: a document
-// counts when one of its tables names it exactly or by its last parts, as
-// in Filter, and once however many of its names fit. Keys are the names as
+// counts when one of its tables fits the name as a Filter by that name
+// would find the document (the same name, or either the last parts of the
+// other), and once however many of its names fit. Keys are the names as
 // given.
 func (s *Store) Count(tables []string, allow func(Doc) bool) map[string]int {
-	bySuffix := map[string][]string{}
+	// A document name fits a given name by being its last parts (bySuffix)
+	// or by ending with it (given).
+	bySuffix, given := map[string][]string{}, map[string]bool{}
 	for _, t := range tables {
-		index(bySuffix, strings.ToLower(t))
+		t = strings.ToLower(t)
+		given[t] = true
+		indexAs(bySuffix, t)
 	}
-	out := make(map[string]int, len(tables))
+	counts := make(map[string]int, len(tables))
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, e := range s.ids {
@@ -162,23 +167,27 @@ func (s *Store) Count(tables []string, allow func(Doc) bool) map[string]int {
 		}
 		seen := map[string]bool{}
 		for _, n := range e.doc.Context.Tables {
-			for _, t := range bySuffix[strings.ToLower(strings.TrimSpace(n))] {
+			n = strings.ToLower(strings.TrimSpace(n))
+			fits := bySuffix[n]
+			for _, k := range suffixes(n)[1:] {
+				if given[k] {
+					fits = append(fits, k)
+				}
+			}
+			for _, t := range fits {
 				if !seen[t] {
 					seen[t] = true
-					out[t]++
+					counts[t]++
 				}
 			}
 		}
 	}
-	// Keys as given: index lowercased them.
-	if len(out) > 0 {
-		named := make(map[string]int, len(out))
-		for _, t := range tables {
-			if n := out[strings.ToLower(t)]; n > 0 {
-				named[t] = n
-			}
+	// Keys as given: the index lowercased them.
+	out := make(map[string]int, len(counts))
+	for _, t := range tables {
+		if n := counts[strings.ToLower(t)]; n > 0 {
+			out[t] = n
 		}
-		out = named
 	}
 	return out
 }

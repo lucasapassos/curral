@@ -6,28 +6,14 @@ import "strings"
 // ones the reader may query, fully qualified as database.schema.table. It
 // decides which documents the reader is shown.
 type Scope struct {
-	tables  map[string][]string // the tables a name fits, by each suffix of their names
-	schemas map[string][]string // the schemas a name fits, likewise
-	visible map[string]bool     // the readable tables and their schemas
+	*Catalog
+	visible map[string]bool // the readable tables and their schemas, lowercase
 }
 
 // NewScope indexes the catalog (all) for a reader who may query visible.
 // Names are compared ignoring case.
 func NewScope(all, visible []string) *Scope {
-	s := &Scope{tables: map[string][]string{}, schemas: map[string][]string{}, visible: map[string]bool{}}
-	tables, schemas := map[string]bool{}, map[string]bool{}
-	for _, t := range all {
-		t = strings.ToLower(t)
-		if tables[t] {
-			continue
-		}
-		tables[t] = true
-		index(s.tables, t)
-		if sc := schemaOf(t); sc != "" && !schemas[sc] {
-			schemas[sc] = true
-			index(s.schemas, sc)
-		}
-	}
+	s := &Scope{Catalog: NewCatalog(all), visible: map[string]bool{}}
 	for _, t := range visible {
 		t = strings.ToLower(t)
 		s.visible[t] = true
@@ -36,25 +22,6 @@ func NewScope(all, visible []string) *Scope {
 		}
 	}
 	return s
-}
-
-// index records name under each of its dot-separated suffixes, so
-// "sales.main.orders" is found by "orders", "main.orders" and itself.
-func index(m map[string][]string, name string) {
-	parts := strings.Split(name, ".")
-	for i := range parts {
-		k := strings.Join(parts[i:], ".")
-		m[k] = append(m[k], name)
-	}
-}
-
-// schemaOf is the schema part of a qualified table name, empty when the
-// name has none.
-func schemaOf(table string) string {
-	if i := strings.LastIndex(table, "."); i > 0 {
-		return table[:i]
-	}
-	return ""
 }
 
 // Readable reports whether d may be shown to the reader: a document about
@@ -93,7 +60,7 @@ func (s *Scope) readable(idx map[string][]string, name string) bool {
 		return false
 	}
 	for _, o := range objs {
-		if !s.visible[o] {
+		if !s.visible[strings.ToLower(o)] {
 			return false
 		}
 	}
