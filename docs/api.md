@@ -153,7 +153,8 @@ people) to read before writing queries. Each one is a JSON file,
   404 on `GET`, `PUT`, `PATCH` and `DELETE` alike, so a write never reads
   the document back. Documents naming no table or schema reach everyone.
   The default, `all`, serves every document to every authenticated user.
-  `GET /v1/capabilities` reports the mode in `docs.scope`.
+  `GET /v1/capabilities` reports the mode in `docs.scope` (and the search
+  ranker in `docs.ranker`).
 - **Searching:** `POST /v1/docs/search` returns the documents that best fit a
   question; see [below](#searching-documents).
 - **Writing:** `POST /v1/docs` creates (201, `Location` and `ETag`), `PUT
@@ -236,7 +237,8 @@ curl -u analyst:analyst-pw -d '{"q":"monthly revenue per customer","limit":3}' l
   document Jev could not rate in time keeps its BM25 place after
   the judged ones, with `"judged": false`.
 - **Without Jev:** `"ranker": "bm25"` and `score` is the BM25 score, useful only
-  for ordering.
+  for ordering. `GET /v1/capabilities` says which in `docs.ranker`, before
+  any search.
 
 ## Dry run
 

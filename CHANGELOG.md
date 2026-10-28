@@ -28,6 +28,8 @@ notes are taken from its section here.
 - `GET /v1/docs` returns the collection's `ETag` (the documents shown, their
   versions and the caller's access to their tables) and answers 304 to a
   matching `If-None-Match`.
+- `GET /v1/capabilities` reports `docs.ranker`: `jev` with `--jev-key`,
+  `bm25` otherwise.
 
 ### Changed
 - `GET /v1/docs` and `POST /v1/docs/search` list the caller's schema (one

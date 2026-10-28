@@ -38,12 +38,13 @@ no data access and returns:
 ```json
 {"execution_context_version": 1, "delegation_required": true, "subject": "portal",
  "attributes": {"tenant": "tenant-a"}, "formats": ["json","csv","ndjson","arrow"],
- "docs": {"enabled": true, "scope": "schema", "delegated_writes": false}, "version": "..."}
+ "docs": {"enabled": true, "scope": "schema", "ranker": "jev", "delegated_writes": false}, "version": "..."}
 ```
 
 A client should check it before sending identities and refuse servers that do
 not advertise the version it implements. `docs` says whether `/v1/docs` is
-served, under which `--docs-scope`, and whether this key may write documents
+served, under which `--docs-scope`, what ranks a search (`ranker`: `jev`
+with `--jev-key`, `bm25` otherwise) and whether this key may write documents
 on behalf of its identities (`delegated_writes`).
 
 ## The execution context

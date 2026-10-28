@@ -111,11 +111,16 @@ func (s *Server) capabilities(w http.ResponseWriter, r *http.Request, p *auth.Pr
 }
 
 // docsCapability tells a client whether /v1/docs is served, whether documents
-// are scoped to the tables the identity may read, and whether this key may
+// are scoped to the tables the identity may read, what ranks a search (jev
+// when a Judge is configured, bm25 otherwise) and whether this key may
 // write documents on behalf of the identities it names.
 func (s *Server) docsCapability(p *auth.Principal) map[string]any {
 	if s.Docs == nil {
 		return map[string]any{"enabled": false}
 	}
-	return map[string]any{"enabled": true, "scope": s.docsScope(), "delegated_writes": p.Delegation && p.DocsWrite}
+	ranker := "bm25"
+	if s.Judge != nil {
+		ranker = "jev"
+	}
+	return map[string]any{"enabled": true, "scope": s.docsScope(), "ranker": ranker, "delegated_writes": p.Delegation && p.DocsWrite}
 }

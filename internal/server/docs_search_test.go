@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http/httptest"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -84,10 +85,25 @@ func search(t *testing.T, r result) searchResult {
 	return out
 }
 
+// ranker is what /v1/capabilities says ranks a search.
+func ranker(t *testing.T, ts *httptest.Server) string {
+	t.Helper()
+	r := docReq(t, ts, "GET", "analyst", "/v1/capabilities", "")
+	var capa struct{ Docs map[string]any }
+	if json.Unmarshal([]byte(r.body), &capa); r.status != 200 || capa.Docs["enabled"] != true {
+		t.Fatalf("capabilities: %d %s", r.status, r.body)
+	}
+	s, _ := capa.Docs["ranker"].(string)
+	return s
+}
+
 func TestDocsSearchBM25(t *testing.T) {
 	dir := t.TempDir()
 	seedDocs(t, dir)
 	ts, _ := newDocsServer(t, dir, filepath.Join(t.TempDir(), "audit.jsonl"))
+	if got := ranker(t, ts); got != "bm25" {
+		t.Fatalf("ranker: %q", got)
+	}
 
 	if r := docReq(t, ts, "POST", "", "/v1/docs/search", `{"q":"revenue"}`); r.status != 401 {
 		t.Fatalf("anonymous: %d", r.status)
@@ -144,6 +160,9 @@ func TestDocsSearchJudged(t *testing.T) {
 	ts, _ := newDocsServer(t, dir, filepath.Join(t.TempDir(), "audit.jsonl"), func(s *Server) {
 		s.Judge, s.SearchShortlist = judge, 2
 	})
+	if got := ranker(t, ts); got != "jev" {
+		t.Fatalf("ranker: %q", got)
+	}
 
 	// Every candidate is judged, ranked by probability; churn is below the threshold.
 	got := search(t, docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"orders","limit":3}`))
