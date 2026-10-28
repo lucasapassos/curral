@@ -125,6 +125,42 @@ func (s *Store) Search(q string, f Filter, k int) []Hit {
 	return hits
 }
 
+// MatchedTerms says which terms of question q occur in d and where: each
+// term found maps to the fields holding it, in the order title, used_for,
+// tables, schemas, description, body, sql (SQL text and descriptions). The
+// terms are tokenized as for Search, so "orders" is reported as "order".
+// A document with none has an empty, non-nil map.
+func (d Doc) MatchedTerms(q string) map[string][]string {
+	h, c := d.Header, d.Context
+	var sqls []string
+	for _, s := range c.SQLs {
+		sqls = append(sqls, s.SQL, s.Description)
+	}
+	fields := []struct {
+		name  string
+		texts []string
+	}{
+		{"title", []string{h.Title}}, {"used_for", h.UsedFor}, {"tables", c.Tables}, {"schemas", c.Schemas},
+		{"description", []string{h.Description}}, {"body", []string{c.Body}}, {"sql", sqls},
+	}
+	out := map[string][]string{}
+	qt := uniq(Tokenize(q))
+	for _, f := range fields {
+		present := map[string]bool{}
+		for _, text := range f.texts {
+			for _, tok := range Tokenize(text) {
+				present[tok] = true
+			}
+		}
+		for _, tok := range qt {
+			if present[tok] {
+				out[tok] = append(out[tok], f.name)
+			}
+		}
+	}
+	return out
+}
+
 // Tokenize splits text into lowercase, accent-free words. Identifiers split
 // on "_" and "." as well, so "sales.main.order_items" yields "sale",
 // "main", "order" and "item". Stopwords are dropped and a plural "s" is

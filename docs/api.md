@@ -210,6 +210,7 @@ curl -u analyst:analyst-pw -d '{"q":"monthly revenue per customer","limit":3}' l
 ```json
 {"ranker": "jev",
  "results": [{"score": 0.93, "judged": true,
+              "matched": {"revenue": ["title", "description", "sql"], "customer": ["sql"]},
               "doc": {"id": "...", "header": {...}, "context": {...},
                       "accessible_tables": ["lake.analytics.monthly_revenue"], "inaccessible_tables": []}}]}
 ```
@@ -226,6 +227,10 @@ curl -u analyst:analyst-pw -d '{"q":"monthly revenue per customer","limit":3}' l
   most, then `used_for`, `tables`/`schemas`, the description, and the body and
   SQL ([BM25](https://en.wikipedia.org/wiki/Okapi_BM25)). Documents with
   no word of the question are left out.
+- **`matched`:** for each result, the question's terms found in the document
+  (as tokenized, so `orders` shows as `order`) and the fields holding them:
+  `title`, `used_for`, `tables`, `schemas`, `description`, `body`, `sql`.
+  It explains a BM25 match; a judged document may have none.
 - **With Jev** (`--jev-key`): the best BM25 candidates (`--search-shortlist`,
   at least `limit`) are each sent to [TypeSafe](https://typesafe.ai)'s Jev
   model, which judges whether the document is needed to write the SQL. Only

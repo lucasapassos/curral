@@ -38,9 +38,10 @@ type searchResult struct {
 	Ranker         string
 	BelowThreshold bool `json:"below_threshold"`
 	Results        []struct {
-		Score  float64
-		Judged bool
-		Doc    map[string]any
+		Score   float64
+		Judged  bool
+		Matched map[string][]string
+		Doc     map[string]any
 	}
 }
 
@@ -118,6 +119,16 @@ func TestDocsSearchBM25(t *testing.T) {
 	if got.Ranker != "bm25" || !slices.Equal(got.titles(), []string{"Monthly revenue"}) || got.Results[0].Judged {
 		t.Fatalf("revenue: %+v", got)
 	}
+	// Each result says which question terms it holds, and where.
+	if m := got.Results[0].Matched; len(m) != 2 || !slices.Equal(m["monthly"], []string{"title"}) || !slices.Equal(m["revenue"], []string{"title"}) {
+		t.Fatalf("matched: %v", m)
+	}
+	got = search(t, docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"orders"}`))
+	for _, h := range got.Results {
+		if fields := h.Matched["order"]; !slices.Contains(fields, "tables") && !slices.Contains(fields, "body") {
+			t.Errorf("%s matched %v", h.Doc["header"].(map[string]any)["title"], h.Matched)
+		}
+	}
 	// Documents without any question word are left out.
 	got = search(t, docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"inventory"}`))
 	if len(got.Results) != 0 {
@@ -168,6 +179,9 @@ func TestDocsSearchJudged(t *testing.T) {
 	got := search(t, docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"orders","limit":3}`))
 	if got.Ranker != "jev" || got.BelowThreshold || !slices.Equal(got.titles(), []string{"Refunds", "Monthly revenue"}) || !got.Results[0].Judged || got.Results[0].Score != 0.95 {
 		t.Fatalf("orders: %+v", got)
+	}
+	if m := got.Results[0].Matched; !slices.Equal(m["order"], []string{"body"}) {
+		t.Fatalf("judged match terms: %v", m)
 	}
 	// The judge sees max(shortlist, limit) candidates.
 	if len(judge.seen) != 3 {

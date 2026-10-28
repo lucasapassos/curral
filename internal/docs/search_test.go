@@ -98,3 +98,29 @@ func TestSearchAfterReload(t *testing.T) {
 		t.Fatalf("reload did not reindex: %+v", h)
 	}
 }
+
+func TestMatchedTerms(t *testing.T) {
+	d := Doc{
+		Header: Header{Title: "Monthly revenue", Description: "Gross revenue per order", UsedFor: []string{"finance reports"}},
+		Context: Context{Tables: []string{"sales.main.orders"}, Schemas: []string{"sales.main"}, Body: "Refunded orders are excluded.",
+			SQLs: []SQL{{SQL: "SELECT sum(amount) FROM sales.main.orders", Description: "total revenue"}}},
+	}
+	got := d.MatchedTerms("What were the monthly revenues from refunded orders? inventory")
+	want := map[string][]string{
+		"monthly":  {"title"},
+		"revenue":  {"title", "description", "sql"},
+		"refunded": {"body"},
+		"order":    {"tables", "description", "body", "sql"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("matched %v, want %v", got, want)
+	}
+	for term, fields := range want {
+		if !slices.Equal(got[term], fields) {
+			t.Errorf("%s: %v, want %v", term, got[term], fields)
+		}
+	}
+	if got := d.MatchedTerms("inventory"); got == nil || len(got) != 0 {
+		t.Errorf("no match: %v", got)
+	}
+}

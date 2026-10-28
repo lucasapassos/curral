@@ -30,6 +30,8 @@ notes are taken from its section here.
   matching `If-None-Match`.
 - `GET /v1/capabilities` reports `docs.ranker`: `jev` with `--jev-key`,
   `bm25` otherwise.
+- Each `POST /v1/docs/search` result carries `matched`: the question's
+  terms found in the document and the fields holding them.
 
 ### Changed
 - `GET /v1/docs` and `POST /v1/docs/search` list the caller's schema (one
