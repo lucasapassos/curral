@@ -81,18 +81,13 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, p *auth.Prin
 	if in.Limit == 0 {
 		in.Limit = defaultSearchLimit
 	}
-	view := func(d docs.Doc) any {
-		if in.Fields == "header" {
-			return summary(d)
-		}
-		return d
-	}
-	allow, status, msg := s.docScope(r, p)
+	a, status, msg := s.docAccess(r, p)
 	if status != http.StatusOK {
 		writeSchemaError(w, status, msg)
 		return
 	}
-	f := docs.Filter{Table: in.Table, Schema: in.Schema, Allow: allow}
+	view := func(d docs.Doc) any { return a.view(d, in.Fields == "header") }
+	f := docs.Filter{Table: in.Table, Schema: in.Schema, Allow: a.allow}
 
 	if s.Judge == nil {
 		out := searchResponse{Ranker: "bm25", Results: []searchHit{}}

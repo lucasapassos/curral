@@ -129,6 +129,15 @@ people) to read before writing queries. Each one is a JSON file,
   parts, so `orders` finds `sales.main.orders`) and `?q=` (text in title,
   description or `used_for`) narrow it, all case-insensitive.
   `?fields=header` leaves out `body` and `sqls`.
+- **Access:** each document listed or searched carries `accessible_tables`
+  and `inaccessible_tables`: the entries of its `tables` the caller may
+  query and the rest (a name counts as accessible when every object it
+  fits is readable; one fitting nothing in the catalog is not). A document
+  naming no table has two empty lists. The split uses the caller's
+  `/v1/schema` listing, made once per request in both scopes and audited
+  as a `docs_scope` event, so listing and search are refused (503, 429 or
+  500) when that listing is; `GET /v1/docs/{id}` under `--docs-scope all`
+  needs none.
 - **Scope:** with `--docs-scope schema`, a document that names `tables` is
   served (listed, fetched, searched) only to a caller who may query at least
   one of them; one that names only `schemas`, to a caller who may query a
@@ -178,12 +187,15 @@ curl -u analyst:analyst-pw -d '{"q":"monthly revenue per customer","limit":3}' l
 ```
 ```json
 {"ranker": "jev",
- "results": [{"score": 0.93, "judged": true, "doc": {"id": "...", "header": {...}, "context": {...}}}]}
+ "results": [{"score": 0.93, "judged": true,
+              "doc": {"id": "...", "header": {...}, "context": {...},
+                      "accessible_tables": ["lake.analytics.monthly_revenue"], "inaccessible_tables": []}}]}
 ```
 
 - **Request:** `q` (required), optional `table` and `schema` filters (as in
   the listing), `limit` (default 5, at most 50) and `fields` (`full`, the
-  default, or `header`).
+  default, or `header`). Each `doc` carries `accessible_tables` and
+  `inaccessible_tables`, as in the listing.
 - **Ranking:** words are matched without case or accents, identifiers split
   on `_` and `.`, and a plural `s` is ignored. Matches in the title count
   most, then `used_for`, `tables`/`schemas`, the description, and the body and

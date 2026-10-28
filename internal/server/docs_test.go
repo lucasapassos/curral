@@ -446,6 +446,97 @@ func TestDocsScopeFailClosed(t *testing.T) {
 	if r := docReq(t, ts, "GET", "admin", "/v1/docs/"+general.ID, ""); r.status != 200 {
 		t.Fatalf("a document in every scope needs no listing: %d %s", r.status, r.body)
 	}
+	// Under scope all, listing and search still annotate each document with
+	// the caller's tables, so they need the listing too; a single document
+	// does not.
+	lastServer.DocsScope = DocsScopeAll
+	for _, c := range scopedCalls(scoped)[:1] {
+		if r := docReq(t, ts, c.method, "admin", c.path, c.body); r.status != 503 {
+			t.Fatalf("%s %s under scope all while audit down: %d %s", c.method, c.path, r.status, r.body)
+		}
+	}
+	if r := docReq(t, ts, "POST", "admin", "/v1/docs/search", `{"q":"orders"}`); r.status != 503 {
+		t.Fatalf("search under scope all while audit down: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "GET", "admin", "/v1/docs/"+scoped.ID, ""); r.status != 200 {
+		t.Fatalf("one document under scope all: %d %s", r.status, r.body)
+	}
+}
+
+// Listed and searched documents say which of their tables the caller may
+// query, in both scopes; a document about no table has two empty lists.
+func TestDocsAccessAnnotation(t *testing.T) {
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := newServerWithAudit(t, "", func(s *Server) { s.Docs = store })
+	for title, tables := range map[string][]string{
+		"payroll": {"sales.main.salaries", "Orders", "nope"}, "salaries": {"salaries"}, "general": nil,
+	} {
+		if _, _, err := store.Create(docs.Doc{Header: docs.Header{Title: title}, Context: docs.Context{Tables: tables, Body: "about " + title}}, "poet", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type annotated struct {
+		Header             struct{ Title string }
+		Context            map[string]any
+		AccessibleTables   []string `json:"accessible_tables"`
+		InaccessibleTables []string `json:"inaccessible_tables"`
+	}
+	byTitle := func(r result) map[string]annotated {
+		t.Helper()
+		if r.status != 200 {
+			t.Fatalf("%d %s", r.status, r.body)
+		}
+		var out struct {
+			Docs    []annotated
+			Results []struct{ Doc annotated }
+		}
+		json.Unmarshal([]byte(r.body), &out)
+		for _, h := range out.Results {
+			out.Docs = append(out.Docs, h.Doc)
+		}
+		m := map[string]annotated{}
+		for _, d := range out.Docs {
+			m[d.Header.Title] = d
+		}
+		return m
+	}
+	check := func(name string, got map[string]annotated, title string, accessible, inaccessible []string) {
+		t.Helper()
+		d, ok := got[title]
+		if !ok {
+			t.Fatalf("%s: %s not listed in %v", name, title, got)
+		}
+		if !slices.Equal(d.AccessibleTables, accessible) || !slices.Equal(d.InaccessibleTables, inaccessible) {
+			t.Errorf("%s: %s accessible %v inaccessible %v, want %v and %v", name, title, d.AccessibleTables, d.InaccessibleTables, accessible, inaccessible)
+		}
+	}
+	for _, scope := range []string{DocsScopeAll, DocsScopeSchema} {
+		lastServer.DocsScope = scope
+		for name, r := range map[string]result{
+			"list":   docReq(t, ts, "GET", "analyst", "/v1/docs", ""),
+			"header": docReq(t, ts, "GET", "analyst", "/v1/docs?fields=header", ""),
+			"search": docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"about payroll salaries general","limit":10}`),
+		} {
+			got := byTitle(r)
+			check(scope+" "+name, got, "payroll", []string{"Orders"}, []string{"sales.main.salaries", "nope"})
+			check(scope+" "+name, got, "general", []string{}, []string{})
+			if _, listed := got["salaries"]; listed != (scope == DocsScopeAll) {
+				t.Errorf("%s %s: salaries listed=%v", scope, name, listed)
+			}
+			if scope == DocsScopeAll {
+				check(scope+" "+name, got, "salaries", []string{}, []string{"salaries"})
+			}
+			if name == "header" && got["payroll"].Context["body"] != nil {
+				t.Errorf("header view has a body: %v", got["payroll"].Context)
+			}
+		}
+		got := byTitle(docReq(t, ts, "GET", "admin", "/v1/docs", ""))
+		check(scope+" admin", got, "payroll", []string{"sales.main.salaries", "Orders"}, []string{"nope"})
+		check(scope+" admin", got, "salaries", []string{"salaries"}, []string{})
+	}
 }
 
 // A policy that fails to evaluate scopes nothing: every scoped request is

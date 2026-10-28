@@ -11,6 +11,17 @@ notes are taken from its section here.
   omitted when none. Under `--docs-scope schema` only documents the caller
   may read count. A client can skip listing documents for tables without
   any.
+- Documents listed by `GET /v1/docs` or returned by `POST /v1/docs/search`
+  carry `accessible_tables` and `inaccessible_tables`: which of their
+  `tables` the caller may query, by the caller's `/v1/schema` listing, in
+  both `--docs-scope` modes.
+
+### Changed
+- `GET /v1/docs` and `POST /v1/docs/search` list the caller's schema (one
+  `docs_scope` audit event per request) under `--docs-scope all` too, to
+  annotate the documents; like queries, they are refused while the audit
+  log cannot record it. `GET /v1/docs/{id}` under `all` still needs no
+  listing.
 - `--docs-scope schema`: a semantic document that names tables or schemas
   is served only to callers who may query at least one of them, as listed
   by `/v1/schema` and audited as `docs_scope`. Reads and writes alike

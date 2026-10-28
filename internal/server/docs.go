@@ -73,6 +73,59 @@ func (s *Server) docScope(r *http.Request, p *auth.Principal) (func(docs.Doc) bo
 	return scope.Readable, http.StatusOK, ""
 }
 
+// docAccess is what a listing or search knows of the caller's catalog: the
+// scope, to tell which of a document's tables the caller may query, and
+// under DocsScopeSchema the condition documents must pass. The scope is
+// listed in every mode, once per request, so the annotation is always
+// there and a failed listing fails the request in both modes.
+type docAccess struct {
+	scope *docs.Scope
+	allow func(docs.Doc) bool // nil: every document is shown
+}
+
+func (s *Server) docAccess(r *http.Request, p *auth.Principal) (docAccess, int, string) {
+	scope, status, msg := s.catalogScope(r, p)
+	if status != http.StatusOK {
+		return docAccess{}, status, msg
+	}
+	a := docAccess{scope: scope}
+	if s.docsScope() == DocsScopeSchema {
+		a.allow = scope.Readable
+	}
+	return a, http.StatusOK, ""
+}
+
+// access says which of the tables a document names the caller may query
+// and which not (as in docs.Scope.Split); a document naming no table has
+// two empty lists.
+type access struct {
+	AccessibleTables   []string `json:"accessible_tables"`
+	InaccessibleTables []string `json:"inaccessible_tables"`
+}
+
+// A document as listed or searched: whole, or its header, plus access.
+type (
+	fullDoc struct {
+		docs.Doc
+		access
+	}
+	headerDoc struct {
+		docSummary
+		access
+	}
+)
+
+// view renders d for the caller: the whole document or, with header, its
+// summary, annotated with the tables the caller may query.
+func (a docAccess) view(d docs.Doc, header bool) any {
+	var x access
+	x.AccessibleTables, x.InaccessibleTables = a.scope.Split(d)
+	if header {
+		return headerDoc{summary(d), x}
+	}
+	return fullDoc{d, x}
+}
+
 // countDocs sets Docs on each listed table: how many documents are about
 // it (naming it exactly or by its last parts). Under DocsScopeSchema only
 // the documents the caller may read count, so a count never reveals a
@@ -136,27 +189,26 @@ func summary(d docs.Doc) docSummary {
 }
 
 // listDocs lists documents, most recently updated first. ?table=, ?schema=
-// and ?q= narrow the list; ?fields=header leaves out bodies and SQL.
+// and ?q= narrow the list; ?fields=header leaves out bodies and SQL. Each
+// document says which of its tables the caller may query.
 func (s *Server) listDocs(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
 	q := r.URL.Query()
-	allow, status, msg := s.docScope(r, p)
+	header := q.Get("fields") == "header"
+	if !header && q.Get("fields") != "" {
+		writeError(w, http.StatusBadRequest, "fields must be header or empty")
+		return
+	}
+	a, status, msg := s.docAccess(r, p)
 	if status != http.StatusOK {
 		writeSchemaError(w, status, msg)
 		return
 	}
-	list := s.Docs.List(docs.Filter{Table: q.Get("table"), Schema: q.Get("schema"), Q: q.Get("q"), Allow: allow})
-	switch q.Get("fields") {
-	case "":
-		writeJSON(w, http.StatusOK, map[string]any{"docs": list})
-	case "header":
-		out := make([]docSummary, len(list))
-		for i, d := range list {
-			out[i] = summary(d)
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"docs": out})
-	default:
-		writeError(w, http.StatusBadRequest, "fields must be header or empty")
+	list := s.Docs.List(docs.Filter{Table: q.Get("table"), Schema: q.Get("schema"), Q: q.Get("q"), Allow: a.allow})
+	out := make([]any, len(list))
+	for i, d := range list {
+		out[i] = a.view(d, header)
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"docs": out})
 }
 
 func (s *Server) getDoc(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
