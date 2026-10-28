@@ -67,6 +67,10 @@ type Server struct {
 	Audit                 *audit.Writer // nil disables auditing
 	AuditSQL              string        // redacted (default), full or hash
 	Version               string
+	// ServeSkill says how much of the agent skill (skills/curral) the
+	// server hands out, unauthenticated, at GET / and GET /skill/...:
+	// SkillDocs (the default, also ""), SkillAll or SkillOff.
+	ServeSkill string
 
 	Docs *docs.Store // semantic documents; nil disables /v1/docs
 	// Judge, when set, decides which documents /v1/docs/search returns and
@@ -191,6 +195,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	if s.Docs != nil {
 		s.docRoutes(mux)
+	}
+	if s.ServeSkill != SkillOff {
+		s.skillRoutes(mux)
 	}
 	return withRequestID(mux)
 }
@@ -486,9 +493,6 @@ type queryRequest struct {
 	MaxRows int64 `json:"max_rows"`
 }
 
-// errDryRun stops a dry run right after the policy decision.
-var errDryRun = errors.New("dry run")
-
 // dryRunResponse is what a dry run reports instead of executing.
 type dryRunResponse struct {
 	DryRun        bool                `json:"dry_run"`
@@ -768,7 +772,7 @@ func (s *Server) runQuery(ctx context.Context, p *auth.Principal, ev *audit.Even
 		}
 		if q.dryRun {
 			run.allowed = ok
-			return errDryRun
+			return engine.ErrDryRun
 		}
 		if !ok {
 			return engine.ErrForbidden
@@ -960,6 +964,12 @@ func (s *Server) finishDryRun(w http.ResponseWriter, ev *audit.Event, run queryR
 		// report the error (one it denies is reported as denied, below).
 		status = http.StatusBadRequest
 		writeError(w, status, engine.PublicError(err))
+	case run.allowed && errors.Is(err, engine.ErrForbidden):
+		// The policy allowed it, but its row filters or masks cannot be
+		// applied to this statement; the run would refuse it the same way.
+		resp.Decision, resp.DecidedBy, resp.Reason = "deny", "protection", engine.PublicError(err)
+		resp.Limits = limitsJSON(run.limits)
+		resp.RowFilters, resp.MaskedColumns = protectionSummary(run.protect)
 	case run.policyCalled && run.policyE == nil:
 		resp.DecidedBy = "policy"
 		resp.Decision = "deny"

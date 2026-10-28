@@ -2,9 +2,10 @@
 # Minimal curral client for agents: needs only sh and curl.
 #
 #   curral.sh status                              (connection check; no secrets shown)
+#   curral.sh capabilities                        (who you are to the server, its version, formats)
 #   curral.sh login                               (interactive: the user runs it in a terminal)
 #   curral.sh schema [database=X] [schema=Y] [table=Z]
-#   curral.sh query  [-f json|csv|ndjson] [-d database] [-o file] [-m max_rows] [-p value]... "SQL"
+#   curral.sh query  [-f json|csv|ndjson|arrow] [-d database] [-o file] [-m max_rows] [-p value]... "SQL"
 #   curral.sh dry-run [-d database] [-p value]... "SQL"
 #   curral.sh docs [table=X] [schema=Y] [q=TEXT] [fields=header]
 #   curral.sh search [table=X] [schema=Y] [limit=N] [fields=header] "QUESTION"
@@ -17,7 +18,10 @@
 # Connection: CURRAL_URL and CURRAL_TOKEN (Bearer) or CURRAL_USER +
 # CURRAL_PASSWORD, from the environment or from the file written by login,
 # $CURRAL_CONFIG (default ~/.config/curral/credentials, KEY=value lines).
-# Credentials in the environment take precedence over the file.
+# Credentials in the environment take precedence over the file. CURRAL_CA
+# (environment or file) is a PEM file with the CA of a server whose
+# certificate the system does not trust. Several servers: one file each,
+# chosen with CURRAL_CONFIG=/path/to/file.
 # -p: each value becomes $1, $2...; numbers, true, false and null are sent as
 #     JSON, anything else as a string (to force a string: -p '"123"').
 #
@@ -41,9 +45,9 @@ umask 077
 cmd=${1:-}
 [ $# -gt 0 ] && shift
 case $cmd in
-login | status | schema | query | dry-run | docs | search | doc | doc-create | doc-update | doc-patch | doc-delete) ;;
+login | status | capabilities | schema | query | dry-run | docs | search | doc | doc-create | doc-update | doc-patch | doc-delete) ;;
 *)
-	sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' >&2
+	sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//' >&2
 	exit 2
 	;;
 esac
@@ -95,16 +99,18 @@ if [ -f "$config" ]; then
 	-???------*) ;;
 	*) echo "curral: warning: $config is readable by other users; run: chmod 600 $config" >&2 ;;
 	esac
-	f_url='' f_token='' f_user='' f_password=''
+	f_url='' f_token='' f_user='' f_password='' f_ca=''
 	while IFS= read -r line || [ -n "$line" ]; do
 		case $line in
 		CURRAL_URL=*) f_url=${line#*=} ;;
 		CURRAL_TOKEN=*) f_token=${line#*=} ;;
 		CURRAL_USER=*) f_user=${line#*=} ;;
 		CURRAL_PASSWORD=*) f_password=${line#*=} ;;
+		CURRAL_CA=*) f_ca=${line#*=} ;;
 		esac
 	done <"$config"
 	CURRAL_URL=${CURRAL_URL:-$f_url}
+	CURRAL_CA=${CURRAL_CA:-$f_ca}
 	if [ -z "${CURRAL_TOKEN:-}${CURRAL_USER:-}" ]; then
 		CURRAL_TOKEN=$f_token CURRAL_USER=$f_user CURRAL_PASSWORD=$f_password
 		from=$config
@@ -128,6 +134,10 @@ elif [ -n "${CURRAL_USER:-}" ]; then
 	auth="user $CURRAL_USER"
 else
 	unconfigured "no CURRAL_TOKEN or CURRAL_USER"
+fi
+if [ -n "${CURRAL_CA:-}" ]; then
+	[ -r "$CURRAL_CA" ] || die "CURRAL_CA: cannot read $CURRAL_CA"
+	printf 'cacert = "%s"\n' "$(cfg_quote "$CURRAL_CA")" >>"$tmp/auth"
 fi
 
 # json_string: stdin -> escaped JSON string.
@@ -184,6 +194,16 @@ request() {
 		echo "curral: HTTP $status (request $reqid)" >&2
 		retry=$(hdr Retry-After)
 		[ -n "$retry" ] && echo "curral: Retry-After: ${retry}s" >&2
+		case $cmd in
+		docs | search | doc*)
+			# The docs routes do not exist on a server started without
+			# --docs-dir: plain-text 404 from the router, not a JSON error.
+			if [ "$status" = 404 ] && ! grep -q '^{' "$tmp/body"; then
+				echo "curral: semantic documents are not enabled on this server (no --docs-dir); go on with /v1/schema alone" >&2
+				exit 1
+			fi
+			;;
+		esac
 		cat "$tmp/body" >&2
 		echo >&2
 		exit 1
@@ -215,6 +235,10 @@ status)
 	[ $# -eq 0 ] || die "usage: status"
 	echo "curral: $url, $auth (from $from)" >&2
 	OUT=- request "$url/v1/databases"
+	;;
+capabilities)
+	[ $# -eq 0 ] || die "usage: capabilities"
+	OUT=- request "$url/v1/capabilities"
 	;;
 schema)
 	for kv in "$@"; do

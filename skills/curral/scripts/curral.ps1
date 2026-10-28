@@ -3,9 +3,10 @@
 # exit codes as curral.sh.
 $usage = @'
   curral.ps1 status                              (connection check; no secrets shown)
+  curral.ps1 capabilities                        (who you are to the server, its version, formats)
   curral.ps1 login                               (interactive: the user runs it in a terminal)
   curral.ps1 schema [database=X] [schema=Y] [table=Z]
-  curral.ps1 query  [-f json|csv|ndjson] [-d database] [-o file] [-m max_rows] [-p value]... 'SQL'
+  curral.ps1 query  [-f json|csv|ndjson|arrow] [-d database] [-o file] [-m max_rows] [-p value]... 'SQL'
   curral.ps1 dry-run [-d database] [-p value]... 'SQL'
   curral.ps1 docs [table=X] [schema=Y] [q=TEXT] [fields=header]
   curral.ps1 search [table=X] [schema=Y] [limit=N] [fields=header] 'QUESTION'
@@ -26,7 +27,9 @@ Connection: CURRAL_URL and CURRAL_TOKEN (Bearer) or CURRAL_USER +
 CURRAL_PASSWORD, from the environment or from the file written by login,
 $env:CURRAL_CONFIG (default %APPDATA%\curral\credentials), where the secret is
 encrypted with DPAPI for the current Windows user. Credentials in the
-environment take precedence over the file.
+environment take precedence over the file. CURRAL_CA (environment or file) is
+a PEM file with the CA of a server whose certificate the system does not
+trust. Several servers: one file each, chosen with $env:CURRAL_CONFIG.
 -p: each value becomes $1, $2...; numbers, true, false and null are sent as
     JSON, anything else as a string (to force a string: -p '"123"').
 
@@ -116,7 +119,13 @@ function Invoke-Curral([string[]]$opts, [string]$out = '-', [string]$maxrows = '
 		Say "HTTP $status (request $reqid)"
 		$retry = [string]$hdr['retry-after']
 		if ($retry) { Say "Retry-After: ${retry}s" }
-		if (Test-Path $body) { [Console]::Error.WriteLine([IO.File]::ReadAllText($body, $utf8)) }
+		$text = if (Test-Path $body) { [IO.File]::ReadAllText($body, $utf8) } else { '' }
+		# The docs routes do not exist on a server started without --docs-dir:
+		# plain-text 404 from the router, not a JSON error.
+		if ([int]$status -eq 404 -and ($script:cmd -like 'doc*' -or $script:cmd -eq 'search')) {
+			if ($text -notmatch '^\s*\{') { Say 'semantic documents are not enabled on this server (no --docs-dir); go on with /v1/schema alone'; exit 1 }
+		}
+		[Console]::Error.WriteLine($text)
 		exit 1
 	}
 	if ($out -eq '-') {
@@ -155,7 +164,7 @@ function Get-Query([string[]]$pairs, [string[]]$keys) {
 $argv = @($args | ForEach-Object { "$_" })
 $cmd = if ($argv.Count) { $argv[0] } else { '' }
 $rest = @(if ($argv.Count -gt 1) { $argv[1..($argv.Count - 1)] })
-$commands = 'login', 'status', 'schema', 'query', 'dry-run', 'docs', 'search', 'doc', 'doc-create', 'doc-update', 'doc-patch', 'doc-delete'
+$commands = 'login', 'status', 'capabilities', 'schema', 'query', 'dry-run', 'docs', 'search', 'doc', 'doc-create', 'doc-update', 'doc-patch', 'doc-delete'
 if ($commands -cnotcontains $cmd) { [Console]::Error.WriteLine($usage); exit 2 }
 
 $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -170,6 +179,7 @@ else { Join-Path $HOME '.config/curral/credentials-ps' }
 $loginHint = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$self`" login"
 
 $envUrl, $envToken, $envUser, $envPassword = $env:CURRAL_URL, $env:CURRAL_TOKEN, $env:CURRAL_USER, $env:CURRAL_PASSWORD
+$ca = $env:CURRAL_CA
 
 # login: asks for the connection in the user's terminal (the secret is not
 # echoed) and writes it to $config, encrypted with DPAPI, so it never passes
@@ -211,6 +221,7 @@ if (Test-Path -LiteralPath $config) {
 		catch { Say "cannot decrypt the secret in $config (saved by another user or machine)"; Say "the user must run, in their own terminal: $loginHint"; exit 5 }
 	}
 	if (-not $url) { $url = $f['CURRAL_URL'] }
+	if (-not $ca) { $ca = $f['CURRAL_CA'] }
 	if (-not $token -and -not $user) {
 		$token = Unprotect $f['CURRAL_TOKEN_DPAPI']
 		$user = $f['CURRAL_USER']
@@ -236,6 +247,10 @@ if ($token) {
 } else {
 	Unconfigured 'no CURRAL_TOKEN or CURRAL_USER'
 }
+if ($ca) {
+	if (-not (Test-Path -LiteralPath $ca)) { Die "CURRAL_CA: cannot read $ca" }
+	$authLines += "cacert = $(Quote-Cfg (Resolve-Local $ca))"
+}
 
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("curral-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp | Out-Null
@@ -249,6 +264,10 @@ try {
 			if ($rest.Count) { Die 'usage: status' }
 			Say "$url, $auth (from $from)"
 			Invoke-Curral @("url = $(Quote-Cfg "$url/v1/databases")")
+		}
+		'capabilities' {
+			if ($rest.Count) { Die 'usage: capabilities' }
+			Invoke-Curral @("url = $(Quote-Cfg "$url/v1/capabilities")")
 		}
 		'schema' {
 			$q = Get-Query $rest 'database', 'schema', 'table'

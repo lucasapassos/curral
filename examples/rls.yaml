@@ -1,5 +1,10 @@
 # Row-level security (--row-filters examples/rls.yaml). Reloaded on SIGHUP.
 #
+# Each where is validated against the real table when the server starts, so
+# the tables named here must already exist: with a fresh data directory,
+# create sales.main.orders first (see the README quickstart), then start
+# with --row-filters.
+#
 # Per table (catalog.schema.table), each rule limits the rows seen by the users
 # it matches: any of roles, or users (exact name or *@domain). A user matching
 # several rules sees the union (OR). Users matching no rule are not limited:

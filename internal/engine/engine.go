@@ -45,6 +45,10 @@ type Options struct {
 var (
 	ErrBusy      = errors.New("too many concurrent queries")
 	ErrForbidden = errors.New("forbidden")
+	// ErrDryRun, returned by an authorize callback, stops the statement
+	// right after the decision; the engine still checks that row filters
+	// and masks could be applied, so a dry run reports what a run would.
+	ErrDryRun = errors.New("dry run")
 	// ErrMaxRows is returned after a result was cut at its row limit.
 	ErrMaxRows = errors.New("row limit reached")
 )
@@ -543,6 +547,9 @@ func (e *Engine) Query(ctx context.Context, req Request,
 		// instead of executing all but the last statement.
 		ds, err := c.Prepare(req.SQL)
 		if err != nil {
+			if strings.Contains(err.Error(), "multi-statement") {
+				return &QueryError{errors.New("one statement per request: send each statement in its own request, without ';' between them")}
+			}
 			return e.failedBeforePolicy(ctx, c, req.SQL, database, &QueryError{err}, authorize)
 		}
 		st := ds.(*duckdb.Stmt)
@@ -579,15 +586,18 @@ func (e *Engine) Query(ctx context.Context, req Request,
 		err = authorize(ctx, insp)
 		lap(&tm.Authorize)
 		if err != nil {
+			if errors.Is(err, ErrDryRun) && req.Protect != nil && len(*req.Protect) > 0 {
+				// A dry run reports protections a run could not apply.
+				if _, _, perr := e.protectStatement(ctx, c, typ, req, args, database, insp); perr != nil {
+					return perr
+				}
+			}
 			return err
 		}
 
 		execSQL := req.SQL
 		if req.Protect != nil && len(*req.Protect) > 0 {
-			if typ != duckdb.STATEMENT_TYPE_SELECT {
-				return errProtected("protected tables can only be read with SELECT")
-			}
-			rewritten, needVars, err := e.protect(ctx, c, req.SQL, args, database, *req.Protect, insp)
+			rewritten, needVars, err := e.protectStatement(ctx, c, typ, req, args, database, insp)
 			if err != nil {
 				return err
 			}
@@ -654,6 +664,17 @@ func (e *Engine) Query(ctx context.Context, req Request,
 		e.InvalidateSchema()
 	}
 	return nil
+}
+
+// protectStatement applies the request's row filters and masks to the
+// statement: only a SELECT (DESCRIBE and SHOW included) can be rewritten.
+func (e *Engine) protectStatement(ctx context.Context, c *duckdb.Conn, typ duckdb.StmtType, req Request,
+	args []driver.NamedValue, database string, insp Inspection,
+) (string, bool, error) {
+	if typ != duckdb.STATEMENT_TYPE_SELECT {
+		return "", false, errProtected("protected tables can only be read with SELECT")
+	}
+	return e.protect(ctx, c, req.SQL, args, database, *req.Protect, insp)
 }
 
 // failedBeforePolicy decides what a caller may see of an error raised while

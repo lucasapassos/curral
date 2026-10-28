@@ -4,6 +4,7 @@ Reference for agents that only have an HTTP tool. For the workflow, see
 `SKILL.md`.
 
 ## Contents
+- Discovery without credentials: `GET /`, `GET /skill/...`
 - Authentication
 - `GET /v1/schema`
 - `POST /v1/query`
@@ -12,6 +13,25 @@ Reference for agents that only have an HTTP tool. For the workflow, see
 - Headers and trailers
 - Errors
 - Other endpoints
+- Acting for someone else (services)
+
+## Discovery without credentials: `GET /`, `GET /skill/...`
+
+Two routes need no `Authorization`, so an agent that knows only the URL
+can get going:
+
+| Request | Response |
+|---|---|
+| `GET /` | JSON: the server version, where the skill and its scripts are (with the install command), the endpoints and the authentication schemes |
+| `GET /skill` or `GET /skill/SKILL.md` | the skill's instructions (Markdown) |
+| `GET /skill/references/api.md` | this file |
+| `GET /skill/scripts/curral.sh`, `.../curral.ps1`, `.../install.sh` | only on a server run with `--serve-skill all`, and only over TLS or to loopback (403 otherwise); by default 404 with the repository URL to get them from, pinned to the server's version |
+
+The documentation is that of the server's own release. Scripts are code:
+by default they come from the repository
+(`https://raw.githubusercontent.com/lucasapassos/curral/<version>/skills/curral/scripts/`),
+so the server that holds the data never ships what the agent executes. An
+operator may turn the routes off (`--serve-skill off`).
 
 ## Authentication
 
@@ -122,15 +142,24 @@ consumption by code.
  "database":"lake","tables":["lake.analytics.monthly_revenue"],"targets":[],"functions":[],
  "databases":["lake"],"resolved":true,
  "limits":{"max_rows":10000,"timeout":"30s","max_concurrency":2},
+ "max_rows":1000,
  "row_filters":["lake.analytics.monthly_revenue"],
  "masked_columns":{"lake.analytics.monthly_revenue":["revenue"]},
  "policy_sha256":"..."}
 ```
 
-- **`decision`:** `allow` or `deny`.
+- **`decision`:** `allow` or `deny`. `limits`, `max_rows`, `row_filters`
+  and `masked_columns` are present only on `allow`.
+- **`limits`:** your role's limits; **`max_rows`** at the top level is the
+  effective row limit for this request (the smallest of the server's, the
+  role's and the request's own).
 - **`decided_by`:** who decided. `policy` is the access policy. `engine` is
   a fixed server rule, such as ATTACH, multiple statements or invalid SQL;
   in that case `reason` explains.
+- **`decided_by: protection`:** the policy allows the statement, but its
+  row filters or masks cannot be applied to it (a protected table read
+  through a view or macro, `EXPLAIN`, a write that reads it); `reason`
+  says why. A run would be refused with 403 the same way.
 - **`resolved: false`:** the server could not determine everything the
   statement reads. The policy usually denies this case.
 - **Invalid SQL:** answers 400, like a normal query.
@@ -188,6 +217,7 @@ writes are allowed by the policy (403 otherwise).
 | Name | Where | |
 |---|---|---|
 | `X-Request-Id` | header, every response | identifies the request in the audit log |
+| `X-Curral-Effective-Subject` | header, authenticated responses | the user the request ran as (differs from the credential only for services acting for someone else) |
 | `X-Curral-Statement-Type` | header | `SELECT`, `EXPLAIN`, ... |
 | `X-Curral-Max-Rows` | header | row limit in force for this request |
 | `X-Curral-Row-Count` | trailer | rows sent |
@@ -219,4 +249,20 @@ Before the stream starts, an error comes as `{"error": "message"}` with the stat
 
 - `GET /v1/databases`: attached databases (name, type, default schema,
   read-only).
+- `GET /v1/capabilities`: the credential you hold (`subject`), the server
+  `version`, the output `formats` and whether the key must name an
+  identity (`delegation_required`, below).
 - `GET /healthz`: no authentication; `{"status":"ok"}`.
+
+## Acting for someone else (services)
+
+This is for an agent that is itself a service with its own users (a bot
+platform, a portal), not for an assistant working for one person. With an
+API key marked `delegation: true` on the server, every data request must
+carry `X-Curral-Execution-Context`: unpadded base64url of a JSON object
+with at least `"subject"` (the end user). The policy, row filters, masks
+and limits then apply to that subject, never to the key, requests are
+read-only, and the response confirms the subject in
+`X-Curral-Effective-Subject`. `GET /v1/capabilities` tells you whether
+your key is such a key. The contract is in the repository's
+`docs/delegation.md`.
