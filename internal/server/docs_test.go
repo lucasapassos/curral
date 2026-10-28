@@ -303,13 +303,12 @@ func TestDocsScopeSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	ts, _ := newServerWithAudit(t, "", func(s *Server) { s.Docs, s.DocsScope = store, DocsScopeSchema })
-	pol, err := policy.LoadQueries(context.Background(),
-		[]string{"../../examples/policy.rego", "../../examples/roles.json"},
-		policy.Queries{Allow: "data.curral.allow", Docs: "data.curral.docs_allow"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lastServer.SetPolicy(pol)
+	// The admin reads everything, the analyst everything but salaries, and
+	// the poet, who writes, reads nothing.
+	lastServer.SetPolicy(loadRego(t, `allow if "admin" in input.roles
+allow if { "analyst" in input.roles; every t in input.tables { t != "sales.main.salaries" } }
+docs_allow if "admin" in input.roles
+docs_allow if "poet" in input.roles`))
 
 	ids := map[string]string{}
 	for name, context := range map[string]string{"orders": `"tables":["sales.main.orders"]`, "salaries": `"tables":["salaries"]`, "general": `"tables":[]`,
