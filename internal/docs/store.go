@@ -116,21 +116,31 @@ func (s *Store) Get(id string) (Doc, string, error) {
 
 // List returns the documents matching f, most recently updated first.
 func (s *Store) List(f Filter) []Doc {
+	out, _ := s.ListTagged(f)
+	return out
+}
+
+// ListTagged is List with each document's ETag, in the same order.
+func (s *Store) ListTagged(f Filter) ([]Doc, []string) {
 	s.mu.RLock()
-	out := make([]Doc, 0, len(s.ids))
+	hits := make([]entry, 0, len(s.ids))
 	for _, e := range s.ids {
 		if e.doc.Matches(f) {
-			out = append(out, e.doc)
+			hits = append(hits, e)
 		}
 	}
 	s.mu.RUnlock()
-	slices.SortFunc(out, func(a, b Doc) int {
-		if c := b.Header.UpdatedAt.Compare(a.Header.UpdatedAt); c != 0 {
+	slices.SortFunc(hits, func(a, b entry) int {
+		if c := b.doc.Header.UpdatedAt.Compare(a.doc.Header.UpdatedAt); c != 0 {
 			return c
 		}
-		return strings.Compare(a.ID, b.ID)
+		return strings.Compare(a.doc.ID, b.doc.ID)
 	})
-	return out
+	out, tags := make([]Doc, len(hits)), make([]string, len(hits))
+	for i, e := range hits {
+		out[i], tags[i] = e.doc, e.etag
+	}
+	return out, tags
 }
 
 // Count returns, for each qualified table name in tables, how many
@@ -309,9 +319,9 @@ func (s *Store) write(d Doc) (Doc, string, error) {
 
 func (s *Store) path(id string) string { return filepath.Join(s.dir, id+".json") }
 
-// ETagMatches reports whether an If-Match header accepts tag: no header
-// and "*" accept anything, otherwise one of the listed tags, weak or not,
-// must be it.
+// ETagMatches reports whether an If-Match (or If-None-Match) header names
+// tag: no header and "*" match anything, otherwise one of the listed tags,
+// weak or not, must be it.
 func ETagMatches(ifMatch, tag string) bool {
 	if ifMatch == "" || ifMatch == "*" {
 		return true

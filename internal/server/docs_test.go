@@ -744,3 +744,89 @@ docs_allow if { "admin" in input.roles; every t in input.doc.tables { startswith
 		t.Fatalf("off: %+v", d.Context)
 	}
 }
+
+// GET /v1/docs carries the collection's ETag and answers 304 to a matching
+// If-None-Match. The tag changes with every write to the listed documents,
+// with the view and filters, and when the caller's scope changes the set.
+func TestDocsListETag(t *testing.T) {
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := newServerWithAudit(t, "", func(s *Server) { s.Docs, s.DocsScope = store, DocsScopeSchema })
+	lastServer.SetPolicy(loadRego(t, `allow if "admin" in input.roles
+allow if { "analyst" in input.roles; every t in input.tables { t != "sales.main.salaries" } }
+docs_allow if "poet" in input.roles`))
+	for title, tables := range map[string][]string{"orders": {"sales.main.orders"}, "salaries": {"sales.main.salaries"}} {
+		if _, _, err := store.Create(docs.Doc{Header: docs.Header{Title: title}, Context: docs.Context{Tables: tables, Body: "b"}}, "poet", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tag := func(user, query string, hdr ...string) (string, result) {
+		t.Helper()
+		r := docReq(t, ts, "GET", user, "/v1/docs"+query, "", hdr...)
+		if r.status != 200 && r.status != 304 {
+			t.Fatalf("%s %s: %d %s", user, query, r.status, r.body)
+		}
+		if r.header.Get("ETag") == "" {
+			t.Fatalf("%s %s: no ETag", user, query)
+		}
+		return r.header.Get("ETag"), r
+	}
+	base, _ := tag("analyst", "")
+	if again, _ := tag("analyst", ""); again != base {
+		t.Fatalf("unstable: %s then %s", base, again)
+	}
+	for _, inm := range []string{base, "W/" + base, `"other", ` + base, "*"} {
+		if _, r := tag("analyst", "", "If-None-Match", inm); r.status != 304 || r.body != "" {
+			t.Errorf("If-None-Match %s: %d %q", inm, r.status, r.body)
+		}
+	}
+	if _, r := tag("analyst", "", "If-None-Match", `"stale"`); r.status != 200 {
+		t.Errorf("stale If-None-Match: %d", r.status)
+	}
+	// Another view, filter, caller or scope is another collection.
+	seen := map[string]string{"analyst full": base}
+	for name, get := range map[string]func() string{
+		"analyst header":  func() string { v, _ := tag("analyst", "?fields=header"); return v },
+		"analyst nothing": func() string { v, _ := tag("analyst", "?table=nope"); return v },
+		"admin full":      func() string { v, _ := tag("admin", ""); return v },
+		"analyst scope all": func() string {
+			lastServer.DocsScope = DocsScopeAll
+			defer func() { lastServer.DocsScope = DocsScopeSchema }()
+			v, _ := tag("analyst", "")
+			return v
+		},
+	} {
+		v := get()
+		for other, w := range seen {
+			if v == w {
+				t.Errorf("%s and %s share the tag %s", name, other, v)
+			}
+		}
+		seen[name] = v
+	}
+	// Writes move it; undoing them brings it back.
+	r := docReq(t, ts, "POST", "poet", "/v1/docs", `{"header":{"title":"new"},"context":{"body":"b"}}`)
+	if r.status != 201 {
+		t.Fatalf("create: %d %s", r.status, r.body)
+	}
+	var d docs.Doc
+	json.Unmarshal([]byte(r.body), &d)
+	created, _ := tag("analyst", "")
+	if created == base {
+		t.Error("creating a document kept the tag")
+	}
+	if r := docReq(t, ts, "PATCH", "poet", "/v1/docs/"+d.ID, `{"header":{"title":"renamed"}}`); r.status != 200 {
+		t.Fatalf("patch: %d %s", r.status, r.body)
+	}
+	if patched, _ := tag("analyst", ""); patched == created || patched == base {
+		t.Error("changing a document kept the tag")
+	}
+	if r := docReq(t, ts, "DELETE", "poet", "/v1/docs/"+d.ID, ""); r.status != 204 {
+		t.Fatalf("delete: %d %s", r.status, r.body)
+	}
+	if deleted, _ := tag("analyst", ""); deleted != base {
+		t.Errorf("the same collection again has tag %s, had %s", deleted, base)
+	}
+}

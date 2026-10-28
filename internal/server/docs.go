@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -302,12 +304,37 @@ func (s *Server) listDocs(w http.ResponseWriter, r *http.Request, p *auth.Princi
 		return
 	}
 	f.Allow = a.allow
-	list := s.Docs.List(f)
+	list, tags := s.Docs.ListTagged(f)
 	out := make([]any, len(list))
+	// The collection's ETag covers what the response shows: which
+	// documents, in which version, with which tables accessible to this
+	// caller, in which view. It changes with any write to them and when
+	// the caller's scope changes the set or the split.
+	sum := sha256.New()
+	fmt.Fprintf(sum, "%v\n", header)
 	for i, d := range list {
-		out[i] = a.view(d, header)
+		v := a.view(d, header)
+		out[i] = v
+		fmt.Fprintf(sum, "%s %s %q\n", d.ID, tags[i], accessibleOf(v))
+	}
+	tag := `"` + hex.EncodeToString(sum.Sum(nil)[:16]) + `"`
+	w.Header().Set("ETag", tag)
+	if inm := r.Header.Get("If-None-Match"); inm != "" && docs.ETagMatches(inm, tag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"docs": out})
+}
+
+// accessibleOf is the accessible_tables of a rendered document.
+func accessibleOf(v any) []string {
+	switch v := v.(type) {
+	case fullDoc:
+		return v.AccessibleTables
+	case headerDoc:
+		return v.AccessibleTables
+	}
+	return nil
 }
 
 func (s *Server) getDoc(w http.ResponseWriter, r *http.Request, p *auth.Principal) {

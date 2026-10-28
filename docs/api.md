@@ -178,6 +178,11 @@ people) to read before writing queries. Each one is a JSON file,
 - **Concurrent edits:** `GET` returns an `ETag`; send it back in `If-Match` on
   `PUT`, `PATCH` or `DELETE` and the write fails with 412 if someone else
   changed the document in between.
+- **Cached listings:** `GET /v1/docs` returns an `ETag` for the collection it
+  shows (the documents passing the filters and the caller's scope, their
+  versions, their accessible tables and the view) and answers 304 to a
+  matching `If-None-Match`. It changes when one of them is created,
+  changed or removed, and when the caller's scope changes the set.
 - **Size:** request bodies are capped by `--max-body`.
 - **Audit:** writes produce `doc_create`, `doc_update` and `doc_delete` events
   with the document id in `doc`; like queries, they are refused (503) while
