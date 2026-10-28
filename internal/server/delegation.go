@@ -117,9 +117,5 @@ func (s *Server) docsCapability(p *auth.Principal) map[string]any {
 	if s.Docs == nil {
 		return map[string]any{"enabled": false}
 	}
-	scope := s.DocsScope
-	if scope == "" {
-		scope = DocsScopeAll
-	}
-	return map[string]any{"enabled": true, "scope": scope, "delegated_writes": p.Delegation && p.DocsWrite}
+	return map[string]any{"enabled": true, "scope": s.docsScope(), "delegated_writes": p.Delegation && p.DocsWrite}
 }

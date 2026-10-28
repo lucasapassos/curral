@@ -125,10 +125,14 @@ people) to read before writing queries. Each one is a JSON file,
   served (listed, fetched, searched) only to a caller who may query at least
   one of them; one that names only `schemas`, to a caller who may query a
   table in one of them. Names match as in the filters (a qualified name
-  exactly, a shorter one by its last parts). The decision is the one of
-  `/v1/schema`, audited as a `docs_scope` event; an out-of-scope id answers
-  404. Documents naming no table or schema reach everyone. The default, `all`, serves every document to every authenticated
-  user. `GET /v1/capabilities` reports the mode in `docs.scope`.
+  exactly, a shorter one by its last parts); a short name that fits several
+  objects counts only when the caller may query all of them, and one that
+  fits nothing in the catalog never counts. The decision is the one of
+  `/v1/schema`, audited as a `docs_scope` event. An out-of-scope id answers
+  404 on `GET`, `PUT`, `PATCH` and `DELETE` alike, so a write never reads
+  the document back. Documents naming no table or schema reach everyone.
+  The default, `all`, serves every document to every authenticated user.
+  `GET /v1/capabilities` reports the mode in `docs.scope`.
 - **Searching:** `POST /v1/docs/search` returns the documents that best fit a
   question; see [below](#searching-documents).
 - **Writing:** `POST /v1/docs` creates (201, `Location` and `ETag`), `PUT

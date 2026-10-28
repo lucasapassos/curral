@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/lucasapassos/curral/internal/docs"
@@ -160,5 +161,25 @@ func TestDocsSearchJudged(t *testing.T) {
 	got = search(t, docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"monthly revenue orders","limit":3}`))
 	if !slices.Equal(got.titles(), []string{"Refunds", "Monthly revenue"}) || got.Results[1].Judged {
 		t.Fatalf("judge failure: %+v", got)
+	}
+	// Several failures are logged once, and all the unjudged come last.
+	delete(judge.p, "Refunds")
+	got = search(t, docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"monthly revenue orders refunds","limit":3}`))
+	if len(got.Results) != 3 || !got.Results[0].Judged || got.Results[1].Judged || got.Results[2].Judged {
+		t.Fatalf("judge failures: %+v", got)
+	}
+
+	// Matches are ordered by probability; ties keep their BM25 order.
+	for _, best := range []string{"Monthly revenue", "Refunds", "Customer churn"} {
+		judge.p = map[string]float64{"Monthly revenue": 0.8, "Refunds": 0.8, "Customer churn": 0.8, best: 0.95}
+		got = search(t, docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"orders","limit":3}`))
+		if len(got.Results) != 3 || got.titles()[0] != best || got.Results[1].Score != 0.8 || got.Results[2].Score != 0.8 {
+			t.Fatalf("best %s: %+v", best, got)
+		}
+	}
+
+	// A question larger than the body limit is refused.
+	if r := docReq(t, ts, "POST", "analyst", "/v1/docs/search", `{"q":"`+strings.Repeat("x", 2000)+`"}`); r.status != 413 {
+		t.Fatalf("oversized search: %d %s", r.status, r.body)
 	}
 }

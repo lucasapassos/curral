@@ -312,6 +312,9 @@ func LoadUsers(path string) (*Users, error) {
 				return nil, fmt.Errorf("%s: api key %q: invalid attribute %q", path, k.Name, name)
 			}
 		}
+		if k.DocsWrite && !k.Delegation {
+			return nil, fmt.Errorf("%s: api key %q: docs_write needs delegation: true", path, k.Name)
+		}
 		keys[k.Name] = true
 		if _, err := k.ExpiresAt(); err != nil {
 			return nil, fmt.Errorf("%s: api key %q: invalid expires %q", path, k.Name, k.Expires)

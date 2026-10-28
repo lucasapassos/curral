@@ -30,16 +30,27 @@ const (
 // ValidDocsScope reports whether v is a --docs-scope value.
 func ValidDocsScope(v string) bool { return v == DocsScopeAll || v == DocsScopeSchema }
 
-// docScope returns the condition documents must pass to be shown to p.
-// Under DocsScopeAll everything passes. Under DocsScopeSchema the tables p
-// may read are listed as for /v1/schema (same policy, same audit event,
-// kind "docs_scope"), and a document naming tables must name one of them.
-// A status other than 200 comes with the message the client may see.
+// docsScope is the configured scope, DocsScopeAll when unset.
+func (s *Server) docsScope() string {
+	if s.DocsScope == "" {
+		return DocsScopeAll
+	}
+	return s.DocsScope
+}
+
+// docScope returns the condition documents must pass to be shown to p, nil
+// when every document is. Under DocsScopeSchema the tables p may read are
+// listed as for /v1/schema (same policy, same audit event, kind
+// "docs_scope") and a document naming tables or schemas must name a
+// readable one; see docs.Scope. A status other than 200 comes with the
+// message the client may see.
 func (s *Server) docScope(r *http.Request, p *auth.Principal) (func(docs.Doc) bool, int, string) {
-	if s.DocsScope != DocsScopeSchema {
+	if s.docsScope() != DocsScopeSchema {
 		return nil, http.StatusOK, ""
 	}
-	tables, status, msg := s.listSchema(r.Context(), p, s.newEvent(r, "docs_scope", p), engine.SchemaFilter{}, nil)
+	var all []string
+	tables, status, msg := s.listSchema(r.Context(), p, s.newEvent(r, "docs_scope", p), engine.SchemaFilter{},
+		func(t engine.TableSchema) bool { all = append(all, t.Qualified()); return true })
 	if status != http.StatusOK {
 		return nil, status, msg
 	}
@@ -47,13 +58,20 @@ func (s *Server) docScope(r *http.Request, p *auth.Principal) (func(docs.Doc) bo
 	for i, t := range tables {
 		visible[i] = t.Qualified()
 	}
-	return func(d docs.Doc) bool { return d.Readable(visible) }, http.StatusOK, ""
+	return docs.NewScope(all, visible).Readable, http.StatusOK, ""
 }
 
-func writeScopeError(w http.ResponseWriter, status int, msg string) {
+// retryAfter marks a 503 or 429 as transient.
+func retryAfter(w http.ResponseWriter, status int) {
 	if status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests {
 		w.Header().Set("Retry-After", "1")
 	}
+}
+
+// writeSchemaError answers an error from listSchema, marking a 503 or 429
+// as transient.
+func writeSchemaError(w http.ResponseWriter, status int, msg string) {
+	retryAfter(w, status)
 	writeError(w, status, msg)
 }
 
@@ -89,7 +107,7 @@ func (s *Server) listDocs(w http.ResponseWriter, r *http.Request, p *auth.Princi
 	q := r.URL.Query()
 	allow, status, msg := s.docScope(r, p)
 	if status != http.StatusOK {
-		writeScopeError(w, status, msg)
+		writeSchemaError(w, status, msg)
 		return
 	}
 	list := s.Docs.List(docs.Filter{Table: q.Get("table"), Schema: q.Get("schema"), Q: q.Get("q"), Allow: allow})
@@ -114,19 +132,21 @@ func (s *Server) getDoc(w http.ResponseWriter, r *http.Request, p *auth.Principa
 		return
 	}
 	d, tag, err := s.Docs.Get(id)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
-		return
-	}
-	allow, status, msg := s.docScope(r, p)
-	if status != http.StatusOK {
-		writeScopeError(w, status, msg)
-		return
-	}
-	// Out of scope reads as missing: the id must not reveal the document.
-	if allow != nil && !allow(d) {
-		writeError(w, http.StatusNotFound, docs.ErrNotFound.Error())
-		return
+	// A document about nothing in particular is in every scope and needs
+	// no schema listing. Any other id, missing or not, settles the scope
+	// first, so an unknown id and an out-of-scope one answer alike (404,
+	// or both 503 while the audit log is down): the id must not reveal the
+	// document.
+	if err != nil || !d.Unscoped() {
+		allow, status, msg := s.docScope(r, p)
+		if status != http.StatusOK {
+			writeSchemaError(w, status, msg)
+			return
+		}
+		if err != nil || (allow != nil && !allow(d)) {
+			writeError(w, http.StatusNotFound, docs.ErrNotFound.Error())
+			return
+		}
 	}
 	w.Header().Set("ETag", tag)
 	writeJSON(w, http.StatusOK, d)
@@ -185,6 +205,31 @@ func (s *Server) docWriter(action string) handler {
 			}
 		}
 
+		// Under --docs-scope schema a document out of the caller's scope is
+		// as good as missing on writes too: a write would otherwise read it
+		// back (PATCH returns the document) or reveal it by its status. The
+		// version checked here is the one written: without an If-Match from
+		// the client the write is conditional on the ETag seen now.
+		ifMatch := r.Header.Get("If-Match")
+		if r.Method != http.MethodPost {
+			allow, status, msg := s.docScope(r, p)
+			if status != http.StatusOK {
+				retryAfter(w, status)
+				finish(status, "error", "scope", msg)
+				return
+			}
+			if allow != nil {
+				cur, tag, err := s.Docs.Get(ev.Doc)
+				if err != nil || !allow(cur) {
+					finish(http.StatusNotFound, "error", "scope", docs.ErrNotFound.Error())
+					return
+				}
+				if ifMatch == "" {
+					ifMatch = tag
+				}
+			}
+		}
+
 		pol := s.Policy()
 		// The policy sees both versions: a rule scoped to some tables must
 		// check what the document is about now (current) as well as what it
@@ -211,7 +256,6 @@ func (s *Server) docWriter(action string) handler {
 			return nil
 		}
 
-		ifMatch := r.Header.Get("If-Match")
 		var (
 			d   docs.Doc
 			tag string

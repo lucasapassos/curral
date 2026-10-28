@@ -89,7 +89,7 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, p *auth.Prin
 	}
 	allow, status, msg := s.docScope(r, p)
 	if status != http.StatusOK {
-		writeScopeError(w, status, msg)
+		writeSchemaError(w, status, msg)
 		return
 	}
 	f := docs.Filter{Table: in.Table, Schema: in.Schema, Allow: allow}

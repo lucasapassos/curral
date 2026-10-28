@@ -120,6 +120,31 @@ func TestAPIKeyDelegation(t *testing.T) {
 	if err != nil || !u.APIKeys[0].Delegation || u.APIKeys[0].Attributes["tenant"] != "tenant-a" {
 		t.Fatalf("%+v %v", u, err)
 	}
+	hash := strings.Repeat("a", 64)
+	for _, body := range []string{
+		"users: [{name: a}]",
+		"users: [{name: a, password_hash: x}, {name: a, password_hash: x}]",
+		"api_keys: [{name: x, key_sha256: short}]",
+		"api_keys: [{name: x, key_sha256: " + hash + "}, {name: x, key_sha256: " + hash + "}]",
+		"users: [{name: x, password_hash: h}]\napi_keys: [{name: x, key_sha256: " + hash + "}]",
+		"api_keys: [{name: x, key_sha256: " + hash + ", expires: nope}]",
+	} {
+		if _, err := LoadUsers(writeFile(t, body)); err == nil {
+			t.Errorf("%s: expected error", body)
+		}
+	}
+	if _, err := LoadUsers(filepath.Join(t.TempDir(), "missing.yaml")); err == nil {
+		t.Error("missing file: expected error")
+	}
+	// docs_write only means something on a delegating key.
+	writer := "api_keys: [{name: portal, key_sha256: " + strings.Repeat("a", 64) + ", docs_write: true%s}]"
+	if _, err := LoadUsers(writeFile(t, fmt.Sprintf(writer, ""))); err == nil || !strings.Contains(err.Error(), "docs_write needs delegation") {
+		t.Errorf("docs_write without delegation: %v", err)
+	}
+	u, err = LoadUsers(writeFile(t, fmt.Sprintf(writer, ", delegation: true")))
+	if err != nil || !u.APIKeys[0].DocsWrite {
+		t.Fatalf("%+v %v", u, err)
+	}
 }
 
 func TestStandaloneExpr(t *testing.T) {

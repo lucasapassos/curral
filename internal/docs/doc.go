@@ -166,36 +166,9 @@ func (d Doc) Matches(f Filter) bool {
 	return true
 }
 
-// Readable reports whether d may be shown to someone who can read the
-// fully qualified tables in visible: a document that names tables must
-// name at least one of them, a document that names only schemas must name
-// the schema of at least one of them, and a document about no table or
-// schema in particular is always readable. Names match as in Filter: a
-// qualified name exactly, a shorter one by its last parts.
-func (d Doc) Readable(visible []string) bool {
-	if len(d.Context.Tables) == 0 && len(d.Context.Schemas) == 0 {
-		return true
-	}
-	for _, t := range d.Context.Tables {
-		if nameIn(t, visible) {
-			return true
-		}
-	}
-	if len(d.Context.Tables) == 0 {
-		schemas := make([]string, 0, len(visible))
-		for _, v := range visible {
-			if i := strings.LastIndex(v, "."); i > 0 {
-				schemas = append(schemas, v[:i])
-			}
-		}
-		for _, s := range d.Context.Schemas {
-			if nameIn(s, schemas) {
-				return true
-			}
-		}
-	}
-	return false
-}
+// Unscoped reports whether d is about no table or schema in particular,
+// so every Scope shows it.
+func (d Doc) Unscoped() bool { return len(d.Context.Tables) == 0 && len(d.Context.Schemas) == 0 }
 
 // nameIn matches a name exactly or as the last parts of a qualified one, so
 // "orders" and "main.orders" both find "sales.main.orders".

@@ -36,7 +36,7 @@ list: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--policy-row-filters-query` | `data.curral.row_filters` | rule with SQL row predicates per table, ANDed with `--row-filters`; undefined adds none |
 | `--docs-dir` | (off) | directory of semantic documents served at `/v1/docs`; reloaded on `SIGHUP` |
 | `--policy-docs-query` | `data.curral.docs_allow` | decision allowing writes to `/v1/docs`; undefined means deny |
-| `--docs-scope` | `all` | `all`: every authenticated user reads every document; `schema`: a document about tables is served only to callers who may query one of them (as listed by `/v1/schema`) |
+| `--docs-scope` | `all` | `all`: every authenticated user reads every document; `schema`: a document about tables or schemas is served only to callers who may query one of them (as listed by `/v1/schema`); needs `--docs-dir` |
 | `--jev-key` | (off) | TypeSafe API key: `/v1/docs/search` asks Jev which documents fit the question; prefer `CURRAL_JEV_KEY`. Sends the candidate documents to TypeSafe |
 | `--jev-threshold` | 0.7 | minimum Jev probability for a search match |
 | `--jev-floor` | 0.2 | when nothing reaches the threshold, documents at or above this still come back as weak matches (`below_threshold`); 0 returns the best whatever their probability |

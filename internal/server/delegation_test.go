@@ -182,9 +182,13 @@ row_filters := {"sales.main.orders":"id > 0"} if input.identity.kind in {"user",
 // trail, and makes the request read-only.
 func TestCallerContext(t *testing.T) {
 	auditPath := filepath.Join(t.TempDir(), "audit.log")
-	ts, _ := newServerWithAudit(t, auditPath)
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := newServerWithAudit(t, auditPath, func(s *Server) { s.Docs = store })
 	key, hash, _ := auth.NewAPIKey()
-	lastServer.SetAuth(auth.New(&config.Users{APIKeys: []config.APIKey{{Name: "shared", KeyHash: hash, Roles: []string{"analyst"}}}}, 0))
+	lastServer.SetAuth(auth.New(&config.Users{APIKeys: []config.APIKey{{Name: "shared", KeyHash: hash, Roles: []string{"analyst", "poet"}}}}, 0))
 	call := delegatedClient(t, ts, key)
 	caller := map[string]string{callerContextHeader: contextHeader(map[string]any{"subject": "portal:user:42"})}
 	status, h, body := call("POST", "/v1/query", caller, `{"sql":"SELECT * FROM orders"}`)
@@ -193,6 +197,12 @@ func TestCallerContext(t *testing.T) {
 	}
 	if status, _, _ = call("POST", "/v1/query", caller, `{"sql":"DELETE FROM orders"}`); status != 403 {
 		t.Fatalf("caller context must be read-only: %d", status)
+	}
+	if status, _, _ = call("POST", "/v1/docs", caller, sampleDoc); status != 403 {
+		t.Fatalf("caller context never writes documents: %d", status)
+	}
+	if status, _, _ = call("GET", "/v1/docs", map[string]string{callerContextHeader: "not*base64"}, ""); status != 403 {
+		t.Fatalf("malformed caller context: %d", status)
 	}
 	if status, _, _ = call("POST", "/v1/query", map[string]string{executionContextHeader: caller[callerContextHeader]}, `{"sql":"SELECT 1"}`); status != 403 {
 		t.Fatalf("a shared key cannot delegate: %d", status)

@@ -342,9 +342,155 @@ func TestDocsScopeSchema(t *testing.T) {
 	if r := docReq(t, ts, "POST", "admin", "/v1/docs/search", `{"q":"salaries notes"}`); r.status != 200 || !slices.Contains(titles(r), "salaries notes") {
 		t.Fatalf("admin search: %d %v", r.status, titles(r))
 	}
+	if r := docReq(t, ts, "GET", "admin", "/v1/docs?fields=bogus", ""); r.status != 400 {
+		t.Fatalf("fields=bogus: %d %s", r.status, r.body)
+	}
+
+	// Writes see the same scope. To the poet, who may query no table, and
+	// to the analyst, who may not write, an out-of-scope id is missing
+	// with every method: a PATCH cannot read the document back, and no
+	// status tells an out-of-scope id from an unknown one.
+	bodies := map[string]string{"PATCH": `{}`, "PUT": `{"header":{"title":"x"},"context":{"body":"b"}}`, "DELETE": ""}
+	missing := strings.Repeat("0", len(ids["orders"]))
+	for method, body := range bodies {
+		for user, out := range map[string][]string{"poet": {ids["salaries"], ids["orders"], missing}, "analyst": {ids["salaries"], missing}} {
+			for _, id := range out {
+				if r := docReq(t, ts, method, user, "/v1/docs/"+id, body); r.status != 404 {
+					t.Fatalf("%s %s as %s: %d %s", method, id, user, r.status, r.body)
+				}
+			}
+		}
+	}
+	// In scope, the poet writes as usual: a document about nothing, with
+	// the client's If-Match honored, and the admin reaches every document.
+	if r := docReq(t, ts, "PATCH", "poet", "/v1/docs/"+ids["general"], `{"header":{"title":"general notes, revised"}}`, "If-Match", `"stale"`); r.status != 412 {
+		t.Fatalf("stale If-Match in scope: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "PATCH", "poet", "/v1/docs/"+ids["general"], `{"context":{"body":{"nested":1}}}`); r.status != 400 {
+		t.Fatalf("patch of a field with an object: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "POST", "poet", "/v1/docs", sampleDoc+"{}"); r.status != 400 {
+		t.Fatalf("trailing data: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "PATCH", "poet", "/v1/docs/not-an-id", `{}`); r.status != 404 {
+		t.Fatalf("invalid id: %d %s", r.status, r.body)
+	}
+	r := docReq(t, ts, "PATCH", "poet", "/v1/docs/"+ids["general"], `{"header":{"title":"general notes, revised"}}`)
+	if r.status != 200 || !strings.Contains(r.body, "general notes, revised") {
+		t.Fatalf("patch in scope: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "DELETE", "poet", "/v1/docs/"+ids["general"], "", "If-Match", r.header.Get("ETag")); r.status != 204 {
+		t.Fatalf("delete in scope: %d %s", r.status, r.body)
+	}
+	if r := docReq(t, ts, "PATCH", "admin", "/v1/docs/"+ids["salaries"], `{}`); r.status != 200 {
+		t.Fatalf("admin patch: %d %s", r.status, r.body)
+	}
+
 	// Scope all: the analyst reads everything again.
 	lastServer.DocsScope = DocsScopeAll
-	if r := docReq(t, ts, "GET", "analyst", "/v1/docs", ""); r.status != 200 || len(titles(r)) != 5 {
+	if r := docReq(t, ts, "GET", "analyst", "/v1/docs", ""); r.status != 200 || len(titles(r)) != 4 {
 		t.Fatalf("analyst list, scope all: %d %v", r.status, titles(r))
+	}
+}
+
+// seedScoped stores a document about orders and one about nothing in a new
+// store, for servers that scope by schema.
+func seedScoped(t *testing.T) (store *docs.Store, scoped, general docs.Doc) {
+	t.Helper()
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scoped, _, err = store.Create(docs.Doc{Header: docs.Header{Title: "orders notes"},
+		Context: docs.Context{Tables: []string{"sales.main.orders"}, Body: "b"}}, "admin", nil); err != nil {
+		t.Fatal(err)
+	}
+	if general, _, err = store.Create(docs.Doc{Header: docs.Header{Title: "general notes"},
+		Context: docs.Context{Body: "b"}}, "admin", nil); err != nil {
+		t.Fatal(err)
+	}
+	return store, scoped, general
+}
+
+// scopedCalls are the requests that need the caller's scope: every read
+// of a document about tables, known or not, searches and writes.
+func scopedCalls(scoped docs.Doc) []struct{ method, path, body string } {
+	missing := strings.Repeat("0", len(scoped.ID))
+	return []struct{ method, path, body string }{
+		{"GET", "/v1/docs", ""}, {"GET", "/v1/docs/" + scoped.ID, ""}, {"GET", "/v1/docs/" + missing, ""},
+		{"POST", "/v1/docs/search", `{"q":"orders"}`}, {"PATCH", "/v1/docs/" + scoped.ID, `{}`}, {"DELETE", "/v1/docs/" + missing, ""},
+	}
+}
+
+// With the audit sink failing, scoped documents are not served (as the
+// schema is not listed), with Retry-After; one about nothing still is.
+func TestDocsScopeFailClosed(t *testing.T) {
+	if _, err := os.Stat("/dev/full"); err != nil {
+		t.Skip("no /dev/full")
+	}
+	store, scoped, general := seedScoped(t)
+	ts, aw := newServerWithAudit(t, "/dev/full", func(s *Server) { s.Docs, s.DocsScope = store, DocsScopeSchema })
+	defer aw.Close()
+	// The first event fails to write and marks the sink unhealthy.
+	docReq(t, ts, "GET", "admin", "/v1/docs", "")
+	deadline := time.Now().Add(2 * time.Second)
+	for aw.Healthy() == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, c := range scopedCalls(scoped) {
+		r := docReq(t, ts, c.method, "admin", c.path, c.body)
+		if r.status != 503 || r.header.Get("Retry-After") == "" || !strings.Contains(r.body, "audit") {
+			t.Fatalf("%s %s while audit down: %d %v %s", c.method, c.path, r.status, r.header, r.body)
+		}
+	}
+	if r := docReq(t, ts, "GET", "admin", "/v1/docs/"+general.ID, ""); r.status != 200 {
+		t.Fatalf("a document in every scope needs no listing: %d %s", r.status, r.body)
+	}
+}
+
+// A policy that fails to evaluate scopes nothing: every scoped request is
+// an error, reads and writes alike.
+func TestDocsScopePolicyError(t *testing.T) {
+	store, scoped, _ := seedScoped(t)
+	ts, _ := newServerWithAudit(t, "", func(s *Server) { s.Docs, s.DocsScope = store, DocsScopeSchema })
+	lastServer.SetPolicy(loadRego(t, "allow if to_number(input.user) > 0\ndocs_allow := true"))
+	for _, c := range scopedCalls(scoped) {
+		if r := docReq(t, ts, c.method, "admin", c.path, c.body); r.status != 500 || !strings.Contains(r.body, "policy") {
+			t.Fatalf("%s %s: %d %s", c.method, c.path, r.status, r.body)
+		}
+	}
+}
+
+// loadRego compiles rules in package curral with both decisions.
+func loadRego(t *testing.T, rules string) *policy.Policy {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "p.rego")
+	os.WriteFile(path, []byte("package curral\nimport rego.v1\n"+rules+"\n"), 0o600)
+	pol, err := policy.LoadQueries(context.Background(), []string{path},
+		policy.Queries{Allow: "data.curral.allow", Docs: "data.curral.docs_allow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pol
+}
+
+// A docs decision that fails to evaluate, or a store that cannot save,
+// refuse the write with a 500 that says which.
+func TestDocsWriteErrors(t *testing.T) {
+	ts, _ := newDocsServer(t, t.TempDir(), filepath.Join(t.TempDir(), "audit.log"), func(s *Server) {
+		s.SetPolicy(loadRego(t, "docs_allow if to_number(input.user) > 0"))
+	})
+	if r := docReq(t, ts, "POST", "poet", "/v1/docs", sampleDoc); r.status != 500 || !strings.Contains(r.body, "policy") {
+		t.Fatalf("policy error: %d %s", r.status, r.body)
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root writes anywhere")
+	}
+	dir := t.TempDir()
+	ts, _ = newDocsServer(t, dir, filepath.Join(t.TempDir(), "audit.log"))
+	os.Chmod(dir, 0o500)
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	if r := docReq(t, ts, "POST", "poet", "/v1/docs", sampleDoc); r.status != 500 || !strings.Contains(r.body, "could not save") {
+		t.Fatalf("store error: %d %s", r.status, r.body)
 	}
 }

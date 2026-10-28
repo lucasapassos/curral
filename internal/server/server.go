@@ -1161,10 +1161,7 @@ func (s *Server) schema(w http.ResponseWriter, r *http.Request, p *auth.Principa
 	f := engine.SchemaFilter{Database: q.Get("database"), Schema: q.Get("schema"), Table: q.Get("table")}
 	tables, status, msg := s.listSchema(r.Context(), p, s.newEvent(r, "schema", p), f, nil)
 	if status != http.StatusOK {
-		if status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests {
-			w.Header().Set("Retry-After", "1")
-		}
-		writeError(w, status, msg)
+		writeSchemaError(w, status, msg)
 		return
 	}
 	writeJSON(w, http.StatusOK, schemaResponse{
