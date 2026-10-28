@@ -167,7 +167,8 @@ people) to read before writing queries. Each one is a JSON file,
   entry of `context.tables` and `context.schemas` to one catalog object
   (by its qualified name, or by its last parts when only one object fits)
   and saves the qualified name, so scopes, filters and clients match it
-  exactly; a name fitting nothing or several objects is a 400 naming it.
+  exactly; a name fitting nothing or several objects is a 400 naming it
+  (not the objects it fits).
   `warn` qualifies what resolves and keeps the rest as written, logging it;
   `off`, the default, saves names as written. The policy sees the resolved
   names. The catalog is read whole for this, not through the writer's

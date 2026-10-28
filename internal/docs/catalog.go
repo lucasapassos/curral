@@ -44,7 +44,9 @@ func indexAs(m map[string][]string, name string) {
 	}
 }
 
-// resolve names the one object name fits, or says why it fits none.
+// resolve names the one object name fits, or says why it fits none. The
+// candidates of an ambiguous name are not listed: the writer learns that
+// the name exists in several places, not where.
 func resolve(idx map[string][]string, kind, name string) (string, error) {
 	objs := idx[strings.ToLower(strings.TrimSpace(name))]
 	switch len(objs) {
@@ -53,7 +55,7 @@ func resolve(idx map[string][]string, kind, name string) (string, error) {
 	case 1:
 		return objs[0], nil
 	}
-	return "", fmt.Errorf("%q fits several %ss: %s", name, kind, strings.Join(objs, ", "))
+	return "", fmt.Errorf("%q fits several %ss; qualify it", name, kind)
 }
 
 // Normalize rewrites the tables and schemas d names to their qualified

@@ -29,9 +29,9 @@ func TestCatalogNormalize(t *testing.T) {
 		t.Fatalf("strict: %v %+v", err, d.Context)
 	}
 	for _, want := range []string{
-		`context.tables[1]: "salaries" fits several tables: sales.main.salaries, hr.main.salaries`,
+		`context.tables[1]: "salaries" fits several tables; qualify it`,
 		`context.tables[2]: "nope" is not a table in the catalog`,
-		`context.schemas[0]: "main" fits several schemas: Sales.main, hr.main`,
+		`context.schemas[0]: "main" fits several schemas; qualify it`,
 		`context.schemas[1]: "sales" is not a schema in the catalog`,
 	} {
 		if !strings.Contains(err.Error(), want) {

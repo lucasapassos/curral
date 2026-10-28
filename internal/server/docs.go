@@ -46,16 +46,15 @@ func ValidDocsNames(v string) bool {
 	return v == DocsNamesOff || v == DocsNamesWarn || v == DocsNamesStrict
 }
 
-// resolveDocNames rewrites the tables and schemas d names to their
-// qualified catalog names, as --docs-validate-names says: nothing when off,
-// and under strict an error (a 400) for a name fitting none or several
-// objects, which warn only logs. The catalog is read whole, not through
-// the writer's policy: a writer thus learns whether a name exists, which
-// is documented, but never what the object holds.
-func (s *Server) resolveDocNames(ctx context.Context, ev *audit.Event, d *docs.Doc) error {
-	mode := s.DocsValidateNames
-	if mode == "" || mode == DocsNamesOff || s.Engine == nil {
-		return nil
+// docCatalog loads the catalog a write resolves its tables and schemas
+// against, as --docs-validate-names asks; nil when off. It is loaded
+// before the store is locked: a cold schema snapshot can take seconds and
+// must not hold up every document read. The catalog is read whole, not
+// through the writer's policy: a writer thus learns whether a name exists,
+// which is documented, but never what the object holds.
+func (s *Server) docCatalog(ctx context.Context, ev *audit.Event) (*docs.Catalog, error) {
+	if mode := s.DocsValidateNames; mode == "" || mode == DocsNamesOff || s.Engine == nil {
+		return nil, nil
 	}
 	var names []string
 	_, err := s.Engine.Schema(ctx, engine.SchemaFilter{}, func(_ context.Context, t engine.TableSchema, _ engine.Inspection) (bool, error) {
@@ -64,9 +63,20 @@ func (s *Server) resolveDocNames(ctx context.Context, ev *audit.Event, d *docs.D
 	})
 	if err != nil {
 		s.Log.Error("document write refused: catalog unavailable", "request_id", ev.RequestID, "err", err)
-		return errDocCatalog
+		return nil, errDocCatalog
 	}
-	unresolved, err := docs.NewCatalog(names).Normalize(d, mode == DocsNamesStrict)
+	return docs.NewCatalog(names), nil
+}
+
+// resolveDocNames rewrites the tables and schemas d names to their
+// qualified names in catalog (nil: leave them): under strict a name
+// fitting none or several objects is an error (a 400), which warn only
+// logs.
+func (s *Server) resolveDocNames(catalog *docs.Catalog, ev *audit.Event, d *docs.Doc) error {
+	if catalog == nil {
+		return nil
+	}
+	unresolved, err := catalog.Normalize(d, s.DocsValidateNames == DocsNamesStrict)
 	if err != nil {
 		return err
 	}
@@ -409,6 +419,16 @@ func (s *Server) docWriter(action string) handler {
 			}
 		}
 
+		var catalog *docs.Catalog
+		if r.Method != http.MethodDelete {
+			var err error
+			if catalog, err = s.docCatalog(r.Context(), ev); err != nil {
+				w.Header().Set("Retry-After", "1")
+				finish(http.StatusServiceUnavailable, "error", "catalog", err.Error())
+				return
+			}
+		}
+
 		pol := s.Policy()
 		// The names are resolved first, so the policy sees qualified ones.
 		// The policy sees both versions: a rule scoped to some tables must
@@ -418,7 +438,7 @@ func (s *Server) docWriter(action string) handler {
 		// actor, so the policy can tie what a service may write to its users.
 		check := func(old, next *docs.Doc) error {
 			if next != nil {
-				if err := s.resolveDocNames(r.Context(), ev, next); err != nil {
+				if err := s.resolveDocNames(catalog, ev, next); err != nil {
 					return err
 				}
 			}
@@ -475,9 +495,6 @@ func (s *Server) docWriter(action string) handler {
 			finish(http.StatusForbidden, "deny", "policy", err.Error())
 		case errors.Is(err, errDocPolicy):
 			finish(http.StatusInternalServerError, "error", "policy", err.Error())
-		case errors.Is(err, errDocCatalog):
-			w.Header().Set("Retry-After", "1")
-			finish(http.StatusServiceUnavailable, "error", "catalog", err.Error())
 		case err != nil:
 			s.Log.Error("document write failed", "request_id", ev.RequestID, "err", err)
 			finish(http.StatusInternalServerError, "error", "docs", "could not save the document")
