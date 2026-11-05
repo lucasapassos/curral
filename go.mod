@@ -8,12 +8,12 @@ require (
 	github.com/duckdb/duckdb-go/v2 v2.20000.0
 	github.com/lestrrat-go/httprc/v3 v3.0.6
 	github.com/lestrrat-go/jwx/v3 v3.4.0
-	github.com/open-policy-agent/opa v1.21.2
+	github.com/open-policy-agent/opa v1.21.4
 	github.com/prometheus/client_golang v1.25.0
 	golang.org/x/crypto v0.58.0
 	golang.org/x/sync v0.24.0
 	golang.org/x/term v0.47.0
-	google.golang.org/grpc v1.84.0
+	google.golang.org/grpc v1.85.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
