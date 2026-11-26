@@ -30,6 +30,9 @@ import (
 // maxBody bounds what is kept in memory per cached response.
 const maxBody = 16 << 20
 
+// maxCacheBytes caps the total cached response bytes held by one proxy.
+const maxCacheBytes = 128 << 20
+
 // credentialMargin is how long before vended credentials expire a cached
 // response stops being served.
 const credentialMargin = time.Minute
@@ -47,9 +50,12 @@ type Proxy struct {
 	ln       net.Listener
 	srv      *http.Server
 	log      *slog.Logger
+	stop     chan struct{}
+	stopOnce sync.Once
 
 	mu      sync.RWMutex
 	entries map[string]entry
+	bytes   int64
 	gen     uint64 // bumped on invalidation so in-flight fills are discarded
 	group   singleflight.Group
 
@@ -79,11 +85,50 @@ func Start(upstream string, ttl time.Duration, log *slog.Logger) (*Proxy, error)
 		},
 		ln:      ln,
 		log:     log,
+		stop:    make(chan struct{}),
 		entries: map[string]entry{},
 	}
 	p.srv = &http.Server{Handler: p, ReadHeaderTimeout: 10 * time.Second}
 	go p.srv.Serve(ln)
+	go p.sweepLoop()
 	return p, nil
+}
+
+func (p *Proxy) sweepLoop() {
+	interval := max(p.ttl, time.Second)
+	if interval > time.Minute {
+		interval = time.Minute
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-p.stop:
+			return
+		case <-t.C:
+			p.Sweep()
+		}
+	}
+}
+
+// Sweep removes expired entries from memory.
+func (p *Proxy) Sweep() {
+	now := time.Now()
+	p.mu.Lock()
+	p.sweepLocked(now)
+	p.mu.Unlock()
+}
+
+func (p *Proxy) sweepLocked(now time.Time) {
+	for k, e := range p.entries {
+		if !now.Before(e.expires) {
+			p.bytes -= int64(len(e.body))
+			delete(p.entries, k)
+		}
+	}
+	if p.bytes < 0 {
+		p.bytes = 0
+	}
 }
 
 // URL is the endpoint to give DuckDB instead of the upstream one.
@@ -91,12 +136,16 @@ func (p *Proxy) URL() string {
 	return "http://" + p.ln.Addr().String() + strings.TrimRight(p.upstream.Path, "/")
 }
 
-func (p *Proxy) Close() error { return p.srv.Close() }
+func (p *Proxy) Close() error {
+	p.stopOnce.Do(func() { close(p.stop) })
+	return p.srv.Close()
+}
 
 // Invalidate drops every cached response.
 func (p *Proxy) Invalidate() {
 	p.mu.Lock()
 	p.entries = map[string]entry{}
+	p.bytes = 0
 	p.gen++
 	p.mu.Unlock()
 }
@@ -146,8 +195,26 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				expires = credExp.Add(-credentialMargin)
 			}
 			p.mu.Lock()
-			if p.gen == startGen && time.Now().Before(expires) {
-				p.entries[key] = entry{header: resp.header, body: resp.body, expires: expires}
+			now := time.Now()
+			if p.gen == startGen && now.Before(expires) {
+				if prev, exists := p.entries[key]; exists {
+					p.bytes -= int64(len(prev.body))
+					delete(p.entries, key)
+				}
+				if p.bytes+int64(len(resp.body)) > maxCacheBytes {
+					p.sweepLocked(now)
+				}
+				for k, e := range p.entries {
+					if p.bytes+int64(len(resp.body)) <= maxCacheBytes {
+						break
+					}
+					p.bytes -= int64(len(e.body))
+					delete(p.entries, k)
+				}
+				if p.bytes+int64(len(resp.body)) <= maxCacheBytes {
+					p.entries[key] = entry{header: resp.header, body: resp.body, expires: expires}
+					p.bytes += int64(len(resp.body))
+				}
 			}
 			p.mu.Unlock()
 		}

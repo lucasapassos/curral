@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,6 +20,7 @@ import (
 	"github.com/lucasapassos/curral/internal/auth"
 	"github.com/lucasapassos/curral/internal/config"
 	"github.com/lucasapassos/curral/internal/docs"
+	"github.com/lucasapassos/curral/internal/engine"
 	"github.com/lucasapassos/curral/internal/policy"
 )
 
@@ -948,4 +951,240 @@ docs_allow if "poet" in input.roles`))
 	if deleted, _ := tag("analyst", ""); deleted != base {
 		t.Errorf("the same collection again has tag %s, had %s", deleted, base)
 	}
+}
+
+// Engine.ValidateSQL and validateDocSQLs parse and bind document SQL without
+// executing it: off skips validation, warn logs failures, strict returns a 400
+// error with sanitized messages (never leaking DuckDB binder suggestions).
+func TestDocsValidateSQL(t *testing.T) {
+	for _, valid := range []string{DocsSQLOff, DocsSQLWarn, DocsSQLStrict} {
+		if !ValidDocsSQL(valid) {
+			t.Errorf("ValidDocsSQL(%q) = false, want true", valid)
+		}
+	}
+	for _, bad := range []string{"", "invalid", "true", "STRICT"} {
+		if ValidDocsSQL(bad) {
+			t.Errorf("ValidDocsSQL(%q) = true, want false", bad)
+		}
+	}
+
+	store, err := docs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logBuf bytes.Buffer
+	ts, _ := newServerWithAudit(t, "", func(s *Server) {
+		s.Docs = store
+		s.Log = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	})
+	srv := lastServer
+	ctx := context.Background()
+
+	// 1. Engine.ValidateSQL direct checks.
+	t.Run("engine_valid_sql", func(t *testing.T) {
+		for _, q := range []string{
+			"SELECT sum(amount) FROM sales.main.orders",
+			"SELECT * FROM orders", // unqualified against default db/schema
+			"SELECT * FROM sales.main.orders WHERE amount > $1",
+		} {
+			if err := srv.Engine.ValidateSQL(ctx, q); err != nil {
+				t.Errorf("ValidateSQL(%q): unexpected error: %v", q, err)
+			}
+		}
+	})
+
+	t.Run("engine_invalid_sql", func(t *testing.T) {
+		cases := []struct {
+			name      string
+			sql       string
+			wantSub   string
+			forbidSub string
+			wantErr   error
+		}{
+			{
+				name:    "invalid_utf8",
+				sql:     "SELECT '\xff'",
+				wantSub: "UTF-8",
+			},
+			{
+				name:    "syntax_error",
+				sql:     "SELEC * FROM orders",
+				wantSub: "Parser Error",
+			},
+			{
+				name:      "nonexistent_table_no_suggestions",
+				sql:       "SELECT * FROM sales.main.salariess",
+				wantSub:   "salariess",
+				forbidSub: "Did you mean",
+			},
+			{
+				name:      "nonexistent_column_no_suggestions",
+				sql:       "SELECT amoun FROM sales.main.orders",
+				wantSub:   "amoun",
+				forbidSub: "Candidate bindings",
+			},
+			{
+				name:    "multi_statement",
+				sql:     "SELECT 1; SELECT 2",
+				wantSub: "one statement",
+			},
+			{
+				name:    "always_denied_attach",
+				sql:     "ATTACH ':memory:' AS extra",
+				wantErr: engine.ErrForbidden,
+			},
+			{
+				name:    "always_denied_detach",
+				sql:     "DETACH sales",
+				wantErr: engine.ErrForbidden,
+			},
+			{
+				name:    "always_denied_load",
+				sql:     "LOAD 'httpfs'",
+				wantErr: engine.ErrForbidden,
+			},
+			{
+				name:    "always_denied_install",
+				sql:     "INSTALL 'httpfs'",
+				wantErr: engine.ErrForbidden,
+			},
+			{
+				name:    "transaction_statement",
+				sql:     "BEGIN TRANSACTION",
+				wantSub: "transaction statements are not supported",
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				err := srv.Engine.ValidateSQL(ctx, tc.sql)
+				if err == nil {
+					t.Fatalf("ValidateSQL(%q) = nil, want error", tc.sql)
+				}
+				if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+					t.Errorf("ValidateSQL(%q) err = %v, want errors.Is(_, %v)", tc.sql, err, tc.wantErr)
+				}
+				if tc.wantSub != "" && !strings.Contains(err.Error(), tc.wantSub) {
+					t.Errorf("ValidateSQL(%q) err = %q, want substring %q", tc.sql, err.Error(), tc.wantSub)
+				}
+				if tc.forbidSub != "" && strings.Contains(err.Error(), tc.forbidSub) {
+					t.Errorf("ValidateSQL(%q) leaked %q in err: %q", tc.sql, tc.forbidSub, err.Error())
+				}
+			})
+		}
+	})
+
+	t.Run("engine_never_executes", func(t *testing.T) {
+		// ValidateSQL must prepare only and always roll back: a valid DDL
+		// statement must NOT create the table.
+		if err := srv.Engine.ValidateSQL(ctx, "CREATE TABLE sales.main.should_not_exist (id INT)"); err != nil {
+			t.Fatalf("ValidateSQL(CREATE TABLE): %v", err)
+		}
+		if r := do(t, ts, "admin", `{"sql":"SELECT * FROM sales.main.should_not_exist"}`); r.status == 200 {
+			t.Fatalf("ValidateSQL executed CREATE TABLE: table exists (%s)", r.body)
+		}
+	})
+
+	// 2. validateDocSQLs modes: off, warn, strict.
+	validDoc := &docs.Doc{
+		ID: "docvalid01",
+		Context: docs.Context{
+			SQLs: []docs.SQL{{SQL: "SELECT sum(amount) FROM sales.main.orders"}},
+		},
+	}
+	badDoc := &docs.Doc{
+		ID: "docbad0001",
+		Context: docs.Context{
+			SQLs: []docs.SQL{
+				{SQL: "SELECT sum(amount) FROM sales.main.orders"},
+				{SQL: "SELECT * FROM sales.main.salariess"},
+			},
+		},
+	}
+	ev := &audit.Event{RequestID: "req-1", User: "poet"}
+
+	t.Run("mode_off", func(t *testing.T) {
+		logBuf.Reset()
+		for _, mode := range []string{"", DocsSQLOff} {
+			if err := srv.validateDocSQLs(ctx, mode, ev, badDoc); err != nil {
+				t.Errorf("mode %q: unexpected error: %v", mode, err)
+			}
+		}
+		if logBuf.Len() != 0 {
+			t.Errorf("mode off logged unexpectedly: %s", logBuf.String())
+		}
+	})
+
+	t.Run("mode_warn", func(t *testing.T) {
+		logBuf.Reset()
+		if err := srv.validateDocSQLs(ctx, DocsSQLWarn, ev, validDoc); err != nil {
+			t.Fatalf("valid doc in warn: %v", err)
+		}
+		if logBuf.Len() != 0 {
+			t.Errorf("valid doc in warn logged: %s", logBuf.String())
+		}
+		if err := srv.validateDocSQLs(ctx, DocsSQLWarn, ev, badDoc); err != nil {
+			t.Fatalf("bad doc in warn returned error: %v", err)
+		}
+		if !strings.Contains(logBuf.String(), "document sql failed validation") {
+			t.Errorf("bad doc in warn did not log warning; got: %q", logBuf.String())
+		}
+	})
+
+	t.Run("mode_strict", func(t *testing.T) {
+		if err := srv.validateDocSQLs(ctx, DocsSQLStrict, ev, validDoc); err != nil {
+			t.Fatalf("valid doc in strict: %v", err)
+		}
+		err := srv.validateDocSQLs(ctx, DocsSQLStrict, ev, badDoc)
+		if err == nil {
+			t.Fatalf("bad doc in strict: got nil, want error")
+		}
+		var sqlErr *docSQLError
+		if !errors.As(err, &sqlErr) {
+			t.Fatalf("bad doc in strict: err type %T, want *docSQLError", err)
+		}
+		if !strings.HasPrefix(err.Error(), "context.sqls[1].sql: ") {
+			t.Errorf("strict error = %q, want prefix %q", err.Error(), "context.sqls[1].sql: ")
+		}
+		if strings.Contains(err.Error(), "Did you mean") {
+			t.Errorf("strict error leaked binder suggestion: %q", err.Error())
+		}
+	})
+
+	t.Run("nil_engine_and_empty_sqls", func(t *testing.T) {
+		noEng := &Server{Log: slog.New(slog.DiscardHandler)}
+		if err := noEng.validateDocSQLs(ctx, DocsSQLStrict, ev, badDoc); err != nil {
+			t.Errorf("nil engine: %v", err)
+		}
+		empty := &docs.Doc{ID: "docempty01"}
+		if err := srv.validateDocSQLs(ctx, DocsSQLStrict, ev, empty); err != nil {
+			t.Errorf("empty sqls: %v", err)
+		}
+	})
+
+	// 3. ValidateAllDocsSQL across stored documents.
+	t.Run("validate_all_docs_sql", func(t *testing.T) {
+		if _, _, err := store.Create(docs.Doc{
+			Header:  docs.Header{Title: "good"},
+			Context: docs.Context{Body: "b", SQLs: []docs.SQL{{SQL: "SELECT count(*) FROM orders"}}},
+		}, "poet", nil); err != nil {
+			t.Fatal(err)
+		}
+		badStored, _, err := store.Create(docs.Doc{
+			Header:  docs.Header{Title: "bad"},
+			Context: docs.Context{Body: "b", SQLs: []docs.SQL{{SQL: "SELECT * FROM no_such_table"}}},
+		}, "poet", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got := srv.ValidateAllDocsSQL(ctx, DocsSQLOff); len(got) != 0 {
+			t.Errorf("off: got %v, want empty", got)
+		}
+		for _, mode := range []string{DocsSQLWarn, DocsSQLStrict} {
+			got := srv.ValidateAllDocsSQL(ctx, mode)
+			if len(got) != 1 || !strings.Contains(got[0], badStored.ID) || !strings.Contains(got[0], "context.sqls[0].sql:") {
+				t.Errorf("mode %s: got %v, want 1 failure for %s", mode, got, badStored.ID)
+			}
+		}
+	})
 }

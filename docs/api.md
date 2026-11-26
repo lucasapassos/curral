@@ -30,8 +30,9 @@ With `Authorization: Basic ...` (or a bearer token, see
 {"sql": "SELECT * FROM orders WHERE id = $1", "params": [42], "database": "sales", "format": "csv"}
 ```
 
-- **`format`**: `csv`, `json` (default), `ndjson` or `arrow` (Arrow IPC stream,
-  `application/vnd.apache.arrow.stream`). It can also come from `?format=` or the `Accept` header.
+- **`format`**: `csv`, `json` (default), `ndjson`, `arrow` (Arrow IPC stream,
+  `application/vnd.apache.arrow.stream`) or `parquet` (Apache Parquet file,
+  `application/vnd.apache.parquet`, requires a build with `-tags duckdb_arrow`). It can also come from `?format=` or the `Accept` header.
 - **`database`**: catalog used for unqualified names. The default comes from the catalog's `default` field.
 - **`max_rows`**: row limit for this response. It can only **lower** the limit in effect: the smallest of `--max-rows`, the role's `max_rows` in the policy and the request wins. No `LIMIT` is added to the SQL: the server stops reading the result when the limit is reached and signals the cut (`X-Curral-Max-Rows`, trailer `X-Curral-Error: row limit reached`, `error` field in JSON). Queries with `ORDER BY`, aggregation or window functions compute everything before the first row; for cheap samples, put a `LIMIT` in the SQL itself.
 - **Blocked catalog functions**: `duckdb_tables()`, `duckdb_views()`, `duckdb_columns()`, `duckdb_schemas()` and similar, the `information_schema.*`, `pg_catalog.*` and `sqlite_master` views, plus `SHOW TABLES` and `PRAGMA show_tables`, respond 403 for every role. They walk every attached catalog, and two of them running at once over an Iceberg catalog crash the process (a DuckDB bug). To list the catalog, use `/v1/schema`. `DESCRIBE table` and `SHOW table` work for the tables the caller may read, protected ones included.

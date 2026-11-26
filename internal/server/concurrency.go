@@ -35,6 +35,23 @@ func (g *groupSlots) release(group string) {
 	g.active[group]--
 }
 
+// withinLimit checks whether group (which the caller already holds a slot in)
+// is still at or below max. If not, it releases the caller's slot and returns
+// false.
+func (g *groupSlots) withinLimit(group string, max int64) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if int64(g.active[group]) <= max {
+		return true
+	}
+	if g.active[group] <= 1 {
+		delete(g.active, group)
+	} else {
+		g.active[group]--
+	}
+	return false
+}
+
 // running is the number of groups with queries in flight.
 func (g *groupSlots) running() int {
 	g.mu.Lock()

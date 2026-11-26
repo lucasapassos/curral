@@ -70,7 +70,20 @@ func TestRunQuery(t *testing.T) {
 	}
 	t.Setenv("CURRAL_TOKEN", "")
 	t.Setenv("CURRAL_USER", "")
+	t.Setenv("CURRAL_CONFIG", filepath.Join(t.TempDir(), "missing"))
 	if err := runQuery([]string{"SELECT 1"}); err == nil || !strings.Contains(err.Error(), "no credentials") {
 		t.Fatalf("no credentials: %v", err)
+	}
+
+	// Credentials file fallback (written by curral.sh login).
+	cfg := filepath.Join(t.TempDir(), "credentials")
+	os.WriteFile(cfg, []byte("CURRAL_URL="+srv.URL+"\nCURRAL_TOKEN=curral_FILE\n"), 0o600)
+	t.Setenv("CURRAL_URL", "")
+	t.Setenv("CURRAL_CONFIG", cfg)
+	if err := runQuery([]string{"-o", out, "SELECT 1"}); err != nil {
+		t.Fatalf("from credentials file: %v", err)
+	}
+	if auth != "Bearer curral_FILE" {
+		t.Fatalf("auth from file = %q", auth)
 	}
 }

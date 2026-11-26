@@ -51,6 +51,9 @@ var (
 	ErrDryRun = errors.New("dry run")
 	// ErrMaxRows is returned after a result was cut at its row limit.
 	ErrMaxRows = errors.New("row limit reached")
+	// ErrArrowUnavailable is returned when Arrow or Parquet output is requested
+	// in a build compiled without -tags duckdb_arrow.
+	ErrArrowUnavailable = errors.New("arrow output is not available in this build (needs -tags duckdb_arrow)")
 )
 
 // QueryError is a problem with the submitted SQL (parse/bind/runtime).
@@ -197,13 +200,13 @@ func (e *Engine) Load() (running, waiting, limit int) {
 	return len(e.sem), int(e.waiting.Load()), cap(e.sem)
 }
 
-// CacheStats reports hits/misses of a database's catalog cache, if enabled.
-func (e *Engine) CacheStats(database string) (hits, misses int64, ok bool) {
+// CacheStats reports hits/misses/passthrough of a database's catalog cache, if enabled.
+func (e *Engine) CacheStats(database string) (hits, misses, passthrough int64, ok bool) {
 	p, ok := e.caches[database]
 	if !ok {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
-	return p.Hits.Load(), p.Misses.Load(), true
+	return p.Hits.Load(), p.Misses.Load(), p.Passthrough.Load(), true
 }
 
 // CachedDatabases lists databases with a catalog metadata cache.
@@ -339,11 +342,18 @@ type Request struct {
 	// read protected tables; the statement is rewritten to apply them.
 	Protect *map[string]Protection
 	// User and Roles are exposed to filters and masks as the session
-	// variables curral_user and curral_roles (getvariable(...)), and a
-	// delegated identity, as JSON, as curral_identity ('' otherwise).
+	// variables curral_user and curral_roles (getvariable(...)), a
+	// delegated identity, as JSON, as curral_identity ('' otherwise), and
+	// MaskSalt as curral_mask_salt (required by the "hash" mask preset).
 	User         string
 	Roles        []string
 	IdentityJSON string
+	MaskSalt     string
+	// CachedInspection, when non-nil and Resolved, skips EXPLAIN in inspect()
+	// and reuses this inspection for policy evaluation and protection checks.
+	// Policy, limits, RLS, masks, and catalog-listing checks still run on every
+	// execution.
+	CachedInspection *Inspection
 }
 
 // Description is what a statement takes and returns, read without running
@@ -451,7 +461,10 @@ func listsCatalog(query string, insp Inspection) (string, bool) {
 
 // Table functions running SQL given as a string, whose listing functions the
 // lexer cannot see; in a planned statement the plan shows what they run.
-var dynamicSQL = map[string]bool{"query": true, "query_table": true, "json_execute_serialized_sql": true}
+var dynamicSQL = map[string]bool{
+	"query": true, "query_table": true, "json_execute_serialized_sql": true,
+	"postgres_query": true, "postgres_execute": true,
+}
 
 // Schemas made of views over the listing functions.
 var catalogSchemas = map[string]bool{
@@ -572,7 +585,14 @@ func (e *Engine) Query(ctx context.Context, req Request,
 			}
 		}
 		params := st
-		insp, err := e.inspect(ctx, c, typ, req.SQL, args, database)
+		var insp Inspection
+		if req.CachedInspection != nil && req.CachedInspection.Resolved &&
+			req.CachedInspection.StatementType == stmtTypeName(typ) &&
+			req.CachedInspection.Database == database {
+			insp = *req.CachedInspection
+		} else {
+			insp, err = e.inspect(ctx, c, typ, req.SQL, args, database)
+		}
 		lap(&tm.Inspect)
 		if err != nil {
 			return e.failedBeforePolicy(ctx, c, req.SQL, database, err, authorize)
@@ -662,9 +682,15 @@ func (e *Engine) Query(ctx context.Context, req Request,
 	committed = true
 	if ddl {
 		e.InvalidateSchema()
+		e.rewrites.clear()
 	}
 	return nil
 }
+
+// maskSaltPlaceholder matches policy.MaskSaltPlaceholder without importing
+// internal/policy. It is substituted inside the protected subquery only so the
+// secret salt is never exposed as a DuckDB session variable to user SQL.
+const maskSaltPlaceholder = "__CURRAL_MASK_SALT__"
 
 // protectStatement applies the request's row filters and masks to the
 // statement: only a SELECT (DESCRIBE and SHOW included) can be rewritten.
@@ -674,7 +700,44 @@ func (e *Engine) protectStatement(ctx context.Context, c *duckdb.Conn, typ duckd
 	if typ != duckdb.STATEMENT_TYPE_SELECT {
 		return "", false, errProtected("protected tables can only be read with SELECT")
 	}
-	return e.protect(ctx, c, req.SQL, args, database, *req.Protect, insp)
+	prot := *req.Protect
+	if protectionUsesMaskSalt(prot) {
+		if req.MaskSalt == "" {
+			return "", false, errProtected("hash mask requires --mask-salt")
+		}
+		prot = bindMaskSalt(prot, req.MaskSalt)
+	}
+	return e.protect(ctx, c, req.SQL, args, database, prot, insp)
+}
+
+func protectionUsesMaskSalt(prot map[string]Protection) bool {
+	for _, p := range prot {
+		if strings.Contains(p.Filter, maskSaltPlaceholder) {
+			return true
+		}
+		for _, expr := range p.Masks {
+			if strings.Contains(expr, maskSaltPlaceholder) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func bindMaskSalt(prot map[string]Protection, salt string) map[string]Protection {
+	lit := quoteString(salt)
+	out := make(map[string]Protection, len(prot))
+	for t, p := range prot {
+		np := Protection{Filter: strings.ReplaceAll(p.Filter, maskSaltPlaceholder, lit)}
+		if len(p.Masks) > 0 {
+			np.Masks = make(map[string]string, len(p.Masks))
+			for col, expr := range p.Masks {
+				np.Masks[col] = strings.ReplaceAll(expr, maskSaltPlaceholder, lit)
+			}
+		}
+		out[t] = np
+	}
+	return out
 }
 
 // failedBeforePolicy decides what a caller may see of an error raised while
@@ -769,7 +832,8 @@ func setSessionVariables(ctx context.Context, c *duckdb.Conn, user string, roles
 	}
 	// One round trip; the statements are built here, not from user input.
 	_, err = c.ExecContext(ctx, "SET VARIABLE curral_user = "+quoteString(user)+
-		"; SET VARIABLE curral_roles = "+list+"; SET VARIABLE curral_identity = "+quoteString(identity), nil)
+		"; SET VARIABLE curral_roles = "+list+
+		"; SET VARIABLE curral_identity = "+quoteString(identity), nil)
 	return err
 }
 

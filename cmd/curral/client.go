@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -10,10 +12,18 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"golang.org/x/term"
+
+	"github.com/lucasapassos/curral/internal/mcp"
 )
 
 type paramFlag []any
@@ -56,13 +66,14 @@ Flags:
 func runQuery(args []string) error {
 	fs := flag.NewFlagSet("curral query", flag.ContinueOnError)
 	fs.Usage = func() { fmt.Fprint(fs.Output(), queryUsage); fs.PrintDefaults() }
-	url := fs.String("url", envOr("CURRAL_URL", "http://127.0.0.1:8080"), "server URL (env CURRAL_URL)")
-	user := fs.String("user", os.Getenv("CURRAL_USER"), "user for Basic auth (env CURRAL_USER)")
+	cfg := loadCredentialsFile()
+	srvURL := fs.String("url", envOr("CURRAL_URL", orDefault(cfg["CURRAL_URL"], "http://127.0.0.1:8080")), "server URL (env CURRAL_URL)")
+	user := fs.String("user", envOr("CURRAL_USER", cfg["CURRAL_USER"]), "user for Basic auth (env CURRAL_USER)")
 	format := fs.String("f", "csv", "output format: csv, json, ndjson or arrow")
 	database := fs.String("d", "", "database for unqualified names")
 	out := fs.String("o", "", "write the result to this file instead of stdout")
 	dryRun := fs.Bool("dry-run", false, "show the inspection and policy decision without executing")
-	caFile := fs.String("ca", "", "PEM file with the CA that signed the server certificate")
+	caFile := fs.String("ca", envOr("CURRAL_CA", cfg["CURRAL_CA"]), "PEM file with the CA that signed the server certificate")
 	insecure := fs.Bool("insecure", false, "skip TLS certificate verification (testing only)")
 	timeout := fs.Duration("timeout", 0, "client-side timeout (0 = none)")
 	maxRows := fs.Int64("max-rows", 0, "return at most this many rows (lowers the server's limit; 0 = server limit)")
@@ -92,42 +103,18 @@ func runQuery(args []string) error {
 		"sql": sql, "params": []any(params), "format": *format,
 		"database": *database, "dry_run": *dryRun, "max_rows": *maxRows,
 	})
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(*url, "/")+"/v1/query", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(*srvURL, "/")+"/v1/query", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	// Tokens often come from files with a trailing newline.
-	token := strings.TrimSpace(os.Getenv("CURRAL_TOKEN"))
-	switch {
-	case token != "":
-		req.Header.Set("Authorization", "Bearer "+token)
-	case *user != "":
-		pass, ok := os.LookupEnv("CURRAL_PASSWORD")
-		if !ok {
-			if pass, err = promptPassword(*user); err != nil {
-				return err
-			}
-		}
-		req.SetBasicAuth(*user, pass)
-	default:
-		return errors.New("no credentials: set CURRAL_TOKEN, or CURRAL_USER/--user")
+	if err := applyAuth(req, *user, cfg); err != nil {
+		return err
 	}
-
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: *insecure} //nolint:gosec // opt-in for testing
-	if *caFile != "" {
-		pem, err := os.ReadFile(*caFile)
-		if err != nil {
-			return err
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return fmt.Errorf("%s: no certificates found", *caFile)
-		}
-		tr.TLSClientConfig.RootCAs = pool
+	client, err := newHTTPClient(*caFile, *insecure, *timeout)
+	if err != nil {
+		return err
 	}
-	client := &http.Client{Transport: tr, Timeout: *timeout}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -183,14 +170,212 @@ func envOr(key, def string) string {
 	return def
 }
 
-func promptPassword(user string) (string, error) {
-	tty, err := os.Open("/dev/tty")
-	if err != nil {
-		return "", errors.New("no password: set CURRAL_PASSWORD or run in a terminal")
+func orDefault(v, def string) string {
+	if v != "" {
+		return v
 	}
-	defer tty.Close()
-	fmt.Fprintf(os.Stderr, "Password for %s: ", user)
-	b, err := readPassword(int(tty.Fd()))
-	fmt.Fprintln(os.Stderr)
-	return string(b), err
+	return def
+}
+
+func loadCredentialsFile() map[string]string {
+	out := map[string]string{}
+	path := os.Getenv("CURRAL_CONFIG")
+	if path == "" {
+		if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+			path = filepath.Join(xdg, "curral", "credentials")
+		} else if home, err := os.UserHomeDir(); err == nil {
+			path = filepath.Join(home, ".config", "curral", "credentials")
+		}
+	}
+	if path == "" {
+		return out
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return out
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		k, v, ok := strings.Cut(sc.Text(), "=")
+		if ok {
+			out[strings.TrimSpace(k)] = v
+		}
+	}
+	return out
+}
+
+func applyAuth(req *http.Request, user string, cfg map[string]string) error {
+	// Tokens often come from files with a trailing newline.
+	token := strings.TrimSpace(os.Getenv("CURRAL_TOKEN"))
+	if token == "" && user == "" {
+		token = strings.TrimSpace(cfg["CURRAL_TOKEN"])
+	}
+	switch {
+	case token != "":
+		req.Header.Set("Authorization", "Bearer "+token)
+	case user != "":
+		pass, ok := os.LookupEnv("CURRAL_PASSWORD")
+		if !ok {
+			if p, has := cfg["CURRAL_PASSWORD"]; has && user == cfg["CURRAL_USER"] {
+				pass = p
+			} else {
+				var err error
+				if pass, err = promptPassword(user); err != nil {
+					return err
+				}
+			}
+		}
+		req.SetBasicAuth(user, pass)
+	default:
+		return errors.New("no credentials: set CURRAL_TOKEN, or CURRAL_USER/--user")
+	}
+	return nil
+}
+
+func newHTTPClient(caFile string, insecure bool, timeout time.Duration) (*http.Client, error) {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: insecure} //nolint:gosec // opt-in for testing
+	if caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("%s: no certificates found", caFile)
+		}
+		tr.TLSClientConfig.RootCAs = pool
+	}
+	return &http.Client{Transport: tr, Timeout: timeout}, nil
+}
+
+func runSimpleGET(name, endpoint string, args []string, allowedFilters []string) error {
+	cfg := loadCredentialsFile()
+	fs := flag.NewFlagSet("curral "+name, flag.ContinueOnError)
+	srvURL := fs.String("url", envOr("CURRAL_URL", orDefault(cfg["CURRAL_URL"], "http://127.0.0.1:8080")), "server URL (env CURRAL_URL)")
+	user := fs.String("user", envOr("CURRAL_USER", cfg["CURRAL_USER"]), "user for Basic auth (env CURRAL_USER)")
+	caFile := fs.String("ca", envOr("CURRAL_CA", cfg["CURRAL_CA"]), "PEM file with the CA that signed the server certificate")
+	insecure := fs.Bool("insecure", false, "skip TLS certificate verification (testing only)")
+	timeout := fs.Duration("timeout", 0, "client-side timeout (0 = none)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	q := url.Values{}
+	for _, kv := range fs.Args() {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || !containsStr(allowedFilters, k) {
+			return fmt.Errorf("invalid argument %q", kv)
+		}
+		q.Add(k, v)
+	}
+	target := strings.TrimRight(*srvURL, "/") + endpoint
+	if enc := q.Encode(); enc != "" {
+		target += "?" + enc
+	}
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		return err
+	}
+	if err := applyAuth(req, *user, cfg); err != nil {
+		return err
+	}
+	client, err := newHTTPClient(*caFile, *insecure, *timeout)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		var e struct {
+			Error string `json:"error"`
+		}
+		msg := strings.TrimSpace(string(b))
+		if json.Unmarshal(b, &e) == nil && e.Error != "" {
+			msg = e.Error
+		}
+		return fmt.Errorf("%s (request %s): %s", resp.Status, resp.Header.Get("X-Request-Id"), msg)
+	}
+	_, err = io.Copy(os.Stdout, resp.Body)
+	return err
+}
+
+func containsStr(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func runSchema(args []string) error {
+	return runSimpleGET("schema", "/v1/schema", args, []string{"database", "schema", "table"})
+}
+
+func runCapabilities(args []string) error {
+	return runSimpleGET("capabilities", "/v1/capabilities", args, nil)
+}
+
+func runMCP(args []string) error {
+	cfg := loadCredentialsFile()
+	fs := flag.NewFlagSet("curral mcp", flag.ContinueOnError)
+	srvURL := fs.String("url", envOr("CURRAL_URL", orDefault(cfg["CURRAL_URL"], "http://127.0.0.1:8080")), "server URL (env CURRAL_URL)")
+	user := fs.String("user", envOr("CURRAL_USER", cfg["CURRAL_USER"]), "user for Basic auth (env CURRAL_USER)")
+	caFile := fs.String("ca", envOr("CURRAL_CA", cfg["CURRAL_CA"]), "PEM file with the CA that signed the server certificate")
+	insecure := fs.Bool("insecure", false, "skip TLS certificate verification (testing only)")
+	timeout := fs.Duration("timeout", 0, "client-side timeout (0 = none)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	token := strings.TrimSpace(os.Getenv("CURRAL_TOKEN"))
+	if token == "" && *user == "" {
+		token = strings.TrimSpace(cfg["CURRAL_TOKEN"])
+	}
+	pass := os.Getenv("CURRAL_PASSWORD")
+	if token == "" && *user != "" && pass == "" && *user == cfg["CURRAL_USER"] {
+		pass = cfg["CURRAL_PASSWORD"]
+	}
+	if token == "" && *user == "" {
+		return errors.New("no credentials: set CURRAL_TOKEN, CURRAL_USER, or configure ~/.config/curral/credentials")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return mcp.RunStdio(ctx, os.Stdin, os.Stdout, mcp.ClientConfig{
+		URL:      *srvURL,
+		Token:    token,
+		User:     *user,
+		Password: pass,
+		CAFile:   *caFile,
+		Insecure: *insecure,
+		Timeout:  *timeout,
+		Version:  version,
+	})
+}
+
+func promptPassword(user string) (string, error) {
+	if tty, err := os.Open("/dev/tty"); err == nil {
+		defer tty.Close()
+		fmt.Fprintf(os.Stderr, "Password for %s: ", user)
+		b, err := readPassword(int(tty.Fd()))
+		fmt.Fprintln(os.Stderr)
+		return string(b), err
+	}
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		fmt.Fprintf(os.Stderr, "Password for %s: ", user)
+		b, err := readPassword(int(os.Stdin.Fd()))
+		fmt.Fprintln(os.Stderr)
+		return string(b), err
+	}
+	return "", errors.New("no password: set CURRAL_PASSWORD or run in a terminal")
 }

@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -32,6 +33,7 @@ import (
 	"github.com/lucasapassos/curral/internal/engine"
 	"github.com/lucasapassos/curral/internal/metrics"
 	"github.com/lucasapassos/curral/internal/policy"
+	"github.com/lucasapassos/curral/internal/policytest"
 	"github.com/lucasapassos/curral/internal/rerank"
 	"github.com/lucasapassos/curral/internal/rls"
 	"github.com/lucasapassos/curral/internal/server"
@@ -44,6 +46,9 @@ Usage:
   curral check          [flags]   validate catalog, users and policy, then exit
   curral hash-password            read a password and print its bcrypt hash
   curral query          [flags] [SQL]  run a statement on a curral server (client)
+  curral schema         [flags] [filters...]  list tables and columns you may query
+  curral capabilities   [flags]   show server capabilities and your credential info
+  curral mcp            [flags]   run an MCP stdio server backed by a curral server
   curral gen-api-key NAME [ROLE...]
                                   create an API key; prints the key once and the users-file entry
   curral install-extensions --extension-dir DIR NAME...
@@ -75,6 +80,12 @@ func main() {
 		err = runGenAPIKey(os.Args[2:])
 	case "query":
 		err = runQuery(os.Args[2:])
+	case "schema":
+		err = runSchema(os.Args[2:])
+	case "capabilities":
+		err = runCapabilities(os.Args[2:])
+	case "mcp":
+		err = runMCP(os.Args[2:])
 	case "install-extensions":
 		err = runInstallExtensions(os.Args[2:])
 	case "healthcheck":
@@ -103,61 +114,67 @@ func (l *listFlag) Set(v string) error {
 }
 
 type serveFlags struct {
-	listen         string
-	catalog        string
-	users          string
-	policies       listFlag
-	policyQuery    string
-	limitsQuery    string
-	masksQuery     string
-	filtersQuery   string
-	docsQuery      string
-	docsDir        string
-	docsScope      string
-	docsNames      string
-	jevKey         string
-	jevThreshold   float64
-	jevFloor       float64
-	jevTimeout     time.Duration
-	shortlist      int
-	rowFilters     string
-	maxConcurrency int
-	perUserConc    int64
-	queueTimeout   time.Duration
-	queryTimeout   time.Duration
-	maxRows        int64
-	maxBody        int64
-	threads        int
-	memoryLimit    string
-	tempDir        string
-	maxTempSize    string
-	extensionDir   string
-	externalAccess bool
-	allowedPaths   listFlag
-	schemaTTL      time.Duration
-	authCacheTTL   time.Duration
-	auditLog       string
-	auditSQL       string
-	auditQueue     int
-	metricsListen  string
-	flightListen   string
-	serveSkill     string
-	oidcIssuer     string
-	oidcAudience   string
-	oidcUserClaim  string
-	oidcRolesClaim string
-	oidcSkew       time.Duration
-	oidcVerified   bool
-	oidcDomains    listFlag
-	tlsCert        string
-	tlsKey         string
-	trustedProxies listFlag
-	ipMaxFail      int
-	userMaxFail    int
-	failWindow     time.Duration
-	lockout        time.Duration
-	logLevel       string
-	logFormat      string
+	listen            string
+	catalog           string
+	users             string
+	policies          listFlag
+	policyQuery       string
+	limitsQuery       string
+	masksQuery        string
+	filtersQuery      string
+	docsQuery         string
+	docsDir           string
+	docsScope         string
+	docsNames         string
+	docsSQL           string
+	maskSalt          string
+	mcpEnabled        bool
+	policyTests       string
+	jevKey            string
+	jevThreshold      float64
+	jevFloor          float64
+	jevTimeout        time.Duration
+	shortlist         int
+	rowFilters        string
+	rowFiltersMissing string
+	maxConcurrency    int
+	perUserConc       int64
+	queueTimeout      time.Duration
+	queryTimeout      time.Duration
+	maxRows           int64
+	maxBody           int64
+	threads           int
+	memoryLimit       string
+	tempDir           string
+	maxTempSize       string
+	extensionDir      string
+	externalAccess    bool
+	allowedPaths      listFlag
+	schemaTTL         time.Duration
+	authCacheTTL      time.Duration
+	auditLog          string
+	auditSQL          string
+	auditQueue        int
+	metricsListen     string
+	flightListen      string
+	serveSkill        string
+	oidcIssuer        string
+	oidcProviders     string
+	oidcAudience      string
+	oidcUserClaim     string
+	oidcRolesClaim    string
+	oidcSkew          time.Duration
+	oidcVerified      bool
+	oidcDomains       listFlag
+	tlsCert           string
+	tlsKey            string
+	trustedProxies    listFlag
+	ipMaxFail         int
+	userMaxFail       int
+	failWindow        time.Duration
+	lockout           time.Duration
+	logLevel          string
+	logFormat         string
 }
 
 func parseFlags(args []string) (*serveFlags, error) {
@@ -174,12 +191,17 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.StringVar(&f.docsQuery, "policy-docs-query", "data.curral.docs_allow", "Rego decision allowing writes to /v1/docs (undefined = deny); used with --docs-dir")
 	fs.StringVar(&f.docsScope, "docs-scope", server.DocsScopeAll, "who reads which documents: all (every authenticated user reads every document) or schema (a document about tables or schemas is served only to callers who may query one of them, as in /v1/schema); needs --docs-dir")
 	fs.StringVar(&f.docsNames, "docs-validate-names", server.DocsNamesOff, "what document writes do with context.tables and context.schemas: off (saved as written), warn (names resolving to one catalog object are qualified, the rest logged) or strict (a name not resolving to exactly one object is refused with 400); needs --docs-dir")
+	fs.StringVar(&f.docsSQL, "docs-validate-sql", server.DocsSQLOff, "what document writes (and curral check) do with context.sqls[].sql: off, warn (prepare and log failures) or strict (refuse invalid SQL with 400); needs --docs-dir")
+	fs.StringVar(&f.maskSalt, "mask-salt", "", "secret salt for the hash column mask preset (prefer CURRAL_MASK_SALT)")
+	fs.BoolVar(&f.mcpEnabled, "mcp", false, "enable the Streamable HTTP MCP endpoint at POST /mcp")
+	fs.StringVar(&f.policyTests, "policy-tests", "", "YAML file of declarative policy test cases to run in curral check")
 	fs.StringVar(&f.jevKey, "jev-key", "", "TypeSafe API key: /v1/docs/search asks Jev which documents fit the question (sends their content to TypeSafe); empty ranks by BM25 alone. Prefer CURRAL_JEV_KEY")
 	fs.Float64Var(&f.jevThreshold, "jev-threshold", rerank.DefaultThreshold, "minimum Jev probability (0-1) for a document to match a search")
 	fs.Float64Var(&f.jevFloor, "jev-floor", rerank.DefaultFloor, "when no document reaches --jev-threshold, return those at or above this as weak matches (below_threshold); 0 returns the best whatever their probability")
 	fs.DurationVar(&f.jevTimeout, "jev-timeout", 5*time.Second, "time a search waits for Jev; documents not judged by then keep their BM25 place")
 	fs.IntVar(&f.shortlist, "search-shortlist", 20, "best BM25 candidates a search hands to Jev")
 	fs.StringVar(&f.rowFilters, "row-filters", "", "row-level security file (per table, which rows matching users see); reloaded on SIGHUP")
+	fs.StringVar(&f.rowFiltersMissing, "row-filters-missing", "strict", "what to do when a table in --row-filters does not exist yet: strict (abort boot/reload) or warn (log and keep the rule)")
 	fs.StringVar(&f.limitsQuery, "policy-limits-query", "", "optional Rego rule with per-request limits {timeout, max_rows}, e.g. data.curral.limits")
 	fs.IntVar(&f.maxConcurrency, "max-concurrency", 8, "queries executing at the same time")
 	fs.Int64Var(&f.perUserConc, "max-concurrency-per-user", 0, "queries one user may run at once when the policy sets no max_concurrency (0 = no limit)")
@@ -203,6 +225,7 @@ func parseFlags(args []string) (*serveFlags, error) {
 	fs.StringVar(&f.serveSkill, "serve-skill", server.SkillDocs, "how much of the agent skill to serve, unauthenticated, at GET / and GET /skill/...: docs (SKILL.md and the API reference; the scripts come from the repository at this version), all (also the scripts, over TLS or to loopback only) or off")
 	fs.StringVar(&f.flightListen, "flight-listen", "", "serve Arrow Flight SQL (JDBC/ADBC clients such as DBeaver and DataGrip) on this address, e.g. :31337, with the same users, policy, TLS and audit as HTTP; empty disables")
 	fs.StringVar(&f.oidcIssuer, "oidc-issuer", "", "accept bearer JWTs from this OIDC issuer (discovery + JWKS); empty disables")
+	fs.StringVar(&f.oidcProviders, "oidc-providers", "", "YAML file listing multiple OIDC providers (mutually exclusive with --oidc-issuer)")
 	fs.StringVar(&f.oidcAudience, "oidc-audience", "", "required audience (aud) of JWTs")
 	fs.StringVar(&f.oidcUserClaim, "oidc-user-claim", "sub", "JWT claim used as the user name (e.g. email, preferred_username)")
 	fs.StringVar(&f.oidcRolesClaim, "oidc-roles-claim", "roles", "JWT claim with the roles; dotted paths allowed (realm_access.roles)")
@@ -241,6 +264,9 @@ func parseFlags(args []string) (*serveFlags, error) {
 	if (f.tlsCert == "") != (f.tlsKey == "") {
 		return nil, fmt.Errorf("--tls-cert and --tls-key go together")
 	}
+	if f.oidcProviders != "" && f.oidcIssuer != "" {
+		return nil, fmt.Errorf("--oidc-providers and --oidc-issuer are mutually exclusive")
+	}
 	if !server.ValidDocsScope(f.docsScope) {
 		return nil, fmt.Errorf("--docs-scope must be %s or %s", server.DocsScopeAll, server.DocsScopeSchema)
 	}
@@ -253,6 +279,12 @@ func parseFlags(args []string) (*serveFlags, error) {
 	if f.docsNames != server.DocsNamesOff && f.docsDir == "" {
 		return nil, fmt.Errorf("--docs-validate-names %s needs --docs-dir", f.docsNames)
 	}
+	if !server.ValidDocsSQL(f.docsSQL) {
+		return nil, fmt.Errorf("--docs-validate-sql must be %s, %s or %s", server.DocsSQLOff, server.DocsSQLWarn, server.DocsSQLStrict)
+	}
+	if f.docsSQL != server.DocsSQLOff && f.docsDir == "" {
+		return nil, fmt.Errorf("--docs-validate-sql %s needs --docs-dir", f.docsSQL)
+	}
 	if f.jevThreshold <= 0 || f.jevThreshold > 1 {
 		return nil, fmt.Errorf("--jev-threshold must be above 0 and at most 1")
 	}
@@ -261,6 +293,11 @@ func parseFlags(args []string) (*serveFlags, error) {
 	}
 	if f.shortlist < 1 {
 		return nil, fmt.Errorf("--search-shortlist must be at least 1")
+	}
+	switch f.rowFiltersMissing {
+	case "strict", "warn":
+	default:
+		return nil, fmt.Errorf("--row-filters-missing must be strict or warn")
 	}
 	switch f.serveSkill {
 	case server.SkillDocs, server.SkillAll, server.SkillOff:
@@ -375,16 +412,81 @@ func runServe(args []string, checkOnly bool) error {
 	for _, name := range cat.EnvRefs {
 		os.Unsetenv(name)
 	}
+	if f.maskSalt != "" {
+		os.Unsetenv("CURRAL_MASK_SALT")
+	}
 
 	dbs := make([]string, 0, len(eng.Databases()))
 	for _, d := range eng.Databases() {
 		dbs = append(dbs, d.Name)
 	}
-	rowRules, err := loadRowFilters(ctx, f.rowFilters, eng)
+	rowRules, err := loadRowFilters(ctx, f.rowFilters, eng, f.rowFiltersMissing, log)
 	if err != nil {
 		return err
 	}
 	if checkOnly {
+		if f.oidcProviders != "" {
+			if _, err := config.LoadOIDCProviders(f.oidcProviders); err != nil {
+				return err
+			}
+		}
+		checkSrv := &server.Server{
+			Engine:          eng,
+			Log:             log,
+			MaxRows:         f.maxRows,
+			MaxBody:         f.maxBody,
+			MaskSalt:        f.maskSalt,
+			DocsValidateSQL: f.docsSQL,
+			Version:         version,
+		}
+		checkSrv.SetAuth(auth.New(users, 0))
+		checkSrv.SetPolicy(pol)
+		checkSrv.SetRowFilters(rowRules)
+		if f.docsDir != "" {
+			if checkSrv.Docs, err = docs.Open(f.docsDir); err != nil {
+				return err
+			}
+			if errs := checkSrv.ValidateAllDocsSQL(ctx, f.docsSQL); len(errs) > 0 {
+				for _, e := range errs {
+					fmt.Fprintln(os.Stderr, "docs-sql:", e)
+				}
+				if f.docsSQL == server.DocsSQLStrict {
+					return fmt.Errorf("%d semantic document SQL check(s) failed", len(errs))
+				}
+			}
+		}
+		if f.policyTests != "" {
+			suite, err := policytest.Load(f.policyTests)
+			if err != nil {
+				return err
+			}
+			eval := func(ctx context.Context, p *auth.Principal, q, db string, mr int64) (policytest.DryRunResult, int, error) {
+				status, body := checkSrv.DryRunForPrincipal(ctx, p, q, db, mr)
+				var res policytest.DryRunResult
+				if status == http.StatusOK {
+					if err := json.Unmarshal(body, &res); err != nil {
+						return res, status, err
+					}
+				}
+				return res, status, nil
+			}
+			results := policytest.Run(ctx, eval, suite)
+			failed := 0
+			for _, r := range results {
+				if r.Passed {
+					fmt.Printf("PASS %s\n", r.Name)
+				} else {
+					failed++
+					fmt.Fprintf(os.Stderr, "FAIL %s:\n", r.Name)
+					for _, msg := range r.Failures {
+						fmt.Fprintf(os.Stderr, "  - %s\n", msg)
+					}
+				}
+			}
+			if failed > 0 {
+				return fmt.Errorf("%d of %d policy test(s) failed", failed, len(results))
+			}
+		}
 		fmt.Printf("ok: %d database(s) [%s], %d user(s), %d api key(s), %d identit(ies), %d table(s) with row filters, policy %s\n",
 			len(dbs), strings.Join(dbs, ", "), len(users.Users), len(users.APIKeys), len(users.Identities), rowRules.Len(), f.policyQuery)
 		return nil
@@ -430,8 +532,37 @@ func runServe(args []string, checkOnly bool) error {
 		log.Info("metrics enabled", "addr", f.metricsListen)
 	}
 
-	var oidc *auth.OIDC
-	if f.oidcIssuer != "" {
+	var oidc auth.TokenAuthenticator
+	if f.oidcProviders != "" {
+		ps, err := config.LoadOIDCProviders(f.oidcProviders)
+		if err != nil {
+			return err
+		}
+		cfgs := make([]auth.OIDCConfig, len(ps))
+		issuers := make([]string, len(ps))
+		for i, p := range ps {
+			skew := p.Skew
+			if skew == 0 {
+				skew = 30 * time.Second
+			}
+			cfgs[i] = auth.OIDCConfig{
+				Issuer:               p.Issuer,
+				Audience:             p.Audience,
+				UserClaim:            p.UserClaim,
+				RolesClaim:           p.RolesClaim,
+				RolePrefix:           p.RolePrefix,
+				Skew:                 skew,
+				RequireEmailVerified: p.RequireEmailVerified,
+				HostedDomains:        p.HostedDomains,
+			}
+			issuers[i] = p.Issuer
+		}
+		oidc, err = auth.NewMultiOIDC(ctx, cfgs)
+		if err != nil {
+			return err
+		}
+		log.Info("multi-oidc enabled", "file", f.oidcProviders, "providers", len(cfgs), "issuers", issuers)
+	} else if f.oidcIssuer != "" {
 		oidc, err = auth.NewOIDC(ctx, auth.OIDCConfig{
 			Issuer: f.oidcIssuer, Audience: f.oidcAudience,
 			UserClaim: f.oidcUserClaim, RolesClaim: f.oidcRolesClaim, Skew: f.oidcSkew,
@@ -457,13 +588,15 @@ func runServe(args []string, checkOnly bool) error {
 		AuditSQL:   f.auditSQL,
 		Version:    version,
 		ServeSkill: f.serveSkill,
+		MaskSalt:   f.maskSalt,
+		MCPEnabled: f.mcpEnabled,
 	}
 	if f.docsDir != "" {
 		if srv.Docs, err = docs.Open(f.docsDir); err != nil {
 			return err
 		}
-		srv.DocsScope, srv.DocsValidateNames = f.docsScope, f.docsNames
-		log.Info("semantic documents enabled", "dir", f.docsDir, "docs", srv.Docs.Len(), "policy_query", f.docsQuery, "scope", f.docsScope, "validate_names", f.docsNames)
+		srv.DocsScope, srv.DocsValidateNames, srv.DocsValidateSQL = f.docsScope, f.docsNames, f.docsSQL
+		log.Info("semantic documents enabled", "dir", f.docsDir, "docs", srv.Docs.Len(), "policy_query", f.docsQuery, "scope", f.docsScope, "validate_names", f.docsNames, "validate_sql", f.docsSQL)
 		srv.SearchThreshold, srv.SearchFloor, srv.SearchShortlist = f.jevThreshold, f.jevFloor, f.shortlist
 		if f.jevKey != "" {
 			srv.Judge = &rerank.Jev{Key: f.jevKey, Timeout: f.jevTimeout}
@@ -492,7 +625,7 @@ func runServe(args []string, checkOnly bool) error {
 	// A broken file keeps the previous version in effect. The catalog is
 	// locked into DuckDB at boot and needs a restart.
 	hup := make(chan os.Signal, 1)
-	signal.Notify(hup, syscall.SIGHUP)
+	notifyReload(hup)
 	go func() {
 		for range hup {
 			if aw != nil {
@@ -514,7 +647,7 @@ func runServe(args []string, checkOnly bool) error {
 			}
 			var newRules *rls.Rules
 			if err == nil {
-				newRules, err = loadRowFilters(context.Background(), f.rowFilters, eng)
+				newRules, err = loadRowFilters(context.Background(), f.rowFilters, eng, f.rowFiltersMissing, log)
 			}
 			if err != nil {
 				srv.Reload(nil, nil, err) // users, policy and row filters all stay as they were
@@ -547,6 +680,7 @@ func runServe(args []string, checkOnly bool) error {
 		for range time.Tick(time.Minute) {
 			srv.IPLimiter.Sweep()
 			srv.UserLimiter.Sweep()
+			srv.SweepAuth()
 		}
 	}()
 
@@ -640,8 +774,9 @@ var (
 )
 
 // loadRowFilters reads the RLS file and prepares every rule against its
-// table, so a typo fails startup (or a reload) instead of every query.
-func loadRowFilters(ctx context.Context, path string, eng *engine.Engine) (*rls.Rules, error) {
+// table, so a typo fails startup (or a reload) instead of every query. When
+// missing is "warn", tables that do not exist yet are logged and kept.
+func loadRowFilters(ctx context.Context, path string, eng *engine.Engine, missing string, log *slog.Logger) (*rls.Rules, error) {
 	if path == "" {
 		return nil, nil
 	}
@@ -650,7 +785,12 @@ func loadRowFilters(ctx context.Context, path string, eng *engine.Engine) (*rls.
 		return nil, err
 	}
 	err = r.Each(func(table string, rule rls.Rule) error {
-		return eng.CheckProtection(ctx, table, engine.Protection{Filter: rule.Where})
+		err := eng.CheckProtection(ctx, table, engine.Protection{Filter: rule.Where})
+		if err != nil && missing == "warn" && strings.Contains(err.Error(), "does not exist") {
+			log.Warn("row filter table does not exist yet; keeping rule", "table", table, "err", err)
+			return nil
+		}
+		return err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)

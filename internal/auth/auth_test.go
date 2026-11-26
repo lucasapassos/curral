@@ -27,6 +27,22 @@ func TestAuthenticate(t *testing.T) {
 	}
 }
 
+func TestAuthenticateCacheSweep(t *testing.T) {
+	h, err := Hash("pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := New(&config.Users{Users: []config.User{{Name: "u", PasswordHash: h, Roles: []string{"r"}}}}, 20*time.Millisecond)
+	if a.Authenticate("u", "pw") == nil || a.cacheCount.Load() != 1 {
+		t.Fatalf("cache count = %d", a.cacheCount.Load())
+	}
+	time.Sleep(40 * time.Millisecond)
+	a.Sweep()
+	if a.cacheCount.Load() != 0 {
+		t.Fatalf("expired entry not swept: count = %d", a.cacheCount.Load())
+	}
+}
+
 func TestAPIKeys(t *testing.T) {
 	key, hash, err := NewAPIKey()
 	if err != nil || !strings.HasPrefix(key, APIKeyPrefix) || len(hash) != 64 {

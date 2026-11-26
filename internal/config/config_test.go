@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExpandEnv(t *testing.T) {
@@ -170,5 +171,56 @@ func TestStandaloneExpr(t *testing.T) {
 		if got := StandaloneExpr(s); got != want {
 			t.Errorf("%q: got %v, want %v", s, got, want)
 		}
+	}
+}
+
+func TestLoadOIDCProviders(t *testing.T) {
+	ps, err := LoadOIDCProviders(writeFile(t, `
+providers:
+  - issuer: https://accounts.google.com
+    audience: client-1
+    user_claim: email
+    roles_claim: groups
+    role_prefix: "corp:"
+    skew: 45s
+    require_email_verified: true
+    hosted_domains: [example.com]
+  - issuer: https://token.actions.githubusercontent.com
+    audience: curral
+    user_claim: sub
+    roles_claim: job_workflow_ref
+    role_prefix: "gh:"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ps) != 2 {
+		t.Fatalf("got %d providers, want 2", len(ps))
+	}
+	if ps[0].Issuer != "https://accounts.google.com" || ps[0].Audience != "client-1" ||
+		ps[0].UserClaim != "email" || ps[0].RolesClaim != "groups" || ps[0].RolePrefix != "corp:" ||
+		ps[0].Skew != 45*time.Second || !ps[0].RequireEmailVerified ||
+		len(ps[0].HostedDomains) != 1 || ps[0].HostedDomains[0] != "example.com" {
+		t.Fatalf("unexpected provider[0]: %+v", ps[0])
+	}
+	if ps[1].Issuer != "https://token.actions.githubusercontent.com" || ps[1].RolePrefix != "gh:" {
+		t.Fatalf("unexpected provider[1]: %+v", ps[1])
+	}
+
+	bad := map[string]string{
+		"empty list":    `providers: []`,
+		"missing iss":   `providers: [{audience: curral}]`,
+		"missing aud":   `providers: [{issuer: https://a}]`,
+		"duplicate iss": `providers: [{issuer: https://a, audience: x}, {issuer: https://a, audience: y}]`,
+		"unknown field": `providers: [{issuer: https://a, audience: x, typo: 1}]`,
+		"negative skew": `providers: [{issuer: https://a, audience: x, skew: -5s}]`,
+	}
+	for name, body := range bad {
+		if _, err := LoadOIDCProviders(writeFile(t, body)); err == nil {
+			t.Errorf("%s: expected error", name)
+		}
+	}
+	if _, err := LoadOIDCProviders(filepath.Join(t.TempDir(), "missing.yaml")); err == nil {
+		t.Error("missing file: expected error")
 	}
 }

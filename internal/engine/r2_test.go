@@ -295,8 +295,8 @@ func TestR2CacheProbe(t *testing.T) {
 					t.Logf("%-55.55s run %d: %6dms  %s", q, i+1, time.Since(start).Milliseconds(), httpSummary(t, e))
 				}
 			}
-			if hits, misses, ok := e.CacheStats("lake"); ok {
-				t.Logf("catalog cache: hits=%d misses=%d", hits, misses)
+			if hits, misses, passthrough, ok := e.CacheStats("lake"); ok {
+				t.Logf("catalog cache: hits=%d misses=%d passthrough=%d", hits, misses, passthrough)
 			}
 		})
 	}

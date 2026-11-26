@@ -187,8 +187,8 @@ func (p *Policy) Limits(ctx context.Context, input map[string]any) (Limits, erro
 
 // Masks evaluates the masks query, if configured: table -> column -> SQL
 // expression replacing the column. An undefined result means no masks.
-// Values are presets ("null", "redact", "last:N") or {"sql": "..."}.
-// Anything malformed is an error, so the request is refused.
+// Values are presets ("null", "redact", "last:N", "first:N", "email", "hash")
+// or {"sql": "..."}. Anything malformed is an error, so the request is refused.
 func (p *Policy) Masks(ctx context.Context, input map[string]any) (map[string]map[string]string, error) {
 	if p.masks == nil {
 		return nil, nil
@@ -229,6 +229,11 @@ func (p *Policy) Masks(ctx context.Context, input map[string]any) (map[string]ma
 	return out, nil
 }
 
+// MaskSaltPlaceholder is emitted by the "hash" column mask preset and replaced
+// by the engine with the server's --mask-salt inside the protected subquery
+// (never exposed as a DuckDB session variable readable by user SQL).
+const MaskSaltPlaceholder = "__CURRAL_MASK_SALT__"
+
 func maskSQL(col string, m any) (string, error) {
 	c := `"` + strings.ReplaceAll(col, `"`, `""`) + `"`
 	switch v := m.(type) {
@@ -238,14 +243,24 @@ func maskSQL(col string, m any) (string, error) {
 			return "CASE WHEN false THEN " + c + " END", nil // NULL of the column's type
 		case v == "redact":
 			return "'***'", nil
+		case v == "hash":
+			return fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL ELSE sha256(%s || ':' || CAST(%s AS VARCHAR)) END", c, MaskSaltPlaceholder, c), nil
+		case v == "email":
+			return fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL WHEN strpos(CAST(%s AS VARCHAR), '@') > 1 THEN left(CAST(%s AS VARCHAR), 1) || '***@' || split_part(CAST(%s AS VARCHAR), '@', 2) ELSE '***' END", c, c, c, c), nil
 		case strings.HasPrefix(v, "last:"):
 			n, err := strconv.Atoi(strings.TrimPrefix(v, "last:"))
 			if err != nil || n < 0 {
 				return "", fmt.Errorf("invalid preset %q", v)
 			}
 			return fmt.Sprintf("'***' || right(CAST(%s AS VARCHAR), %d)", c, n), nil
+		case strings.HasPrefix(v, "first:"):
+			n, err := strconv.Atoi(strings.TrimPrefix(v, "first:"))
+			if err != nil || n < 0 {
+				return "", fmt.Errorf("invalid preset %q", v)
+			}
+			return fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL ELSE left(CAST(%s AS VARCHAR), %d) || '***' END", c, c, n), nil
 		}
-		return "", fmt.Errorf("unknown preset %q (null, redact, last:N or {\"sql\": ...})", v)
+		return "", fmt.Errorf("unknown preset %q (null, redact, last:N, first:N, email, hash or {\"sql\": ...})", v)
 	case map[string]any:
 		s, ok := v["sql"].(string)
 		if !ok || strings.TrimSpace(s) == "" || len(v) != 1 {

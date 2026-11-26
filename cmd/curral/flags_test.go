@@ -44,4 +44,23 @@ func TestParseFlagsDocsScope(t *testing.T) {
 	if _, err := parseFlags(slices.Concat(base, []string{"--jev-threshold", "2"})); err == nil || !strings.Contains(err.Error(), "--jev-threshold must be") {
 		t.Fatalf("jev threshold: %v", err)
 	}
+	if f, err := parseFlags(slices.Concat(base, []string{"--row-filters-missing", "warn"})); err != nil || f.rowFiltersMissing != "warn" {
+		t.Fatalf("row-filters-missing warn: %+v %v", f, err)
+	}
+	if _, err := parseFlags(slices.Concat(base, []string{"--row-filters-missing", "bogus"})); err == nil || !strings.Contains(err.Error(), "--row-filters-missing must be") {
+		t.Fatalf("row-filters-missing bogus: %v", err)
+	}
+	if _, err := parseFlags(slices.Concat(base, []string{"--docs-validate-sql", "bogus"})); err == nil || !strings.Contains(err.Error(), "--docs-validate-sql must be") {
+		t.Fatalf("docs-validate-sql bogus: %v", err)
+	}
+	if _, err := parseFlags(slices.Concat(base, []string{"--docs-validate-sql", "strict"})); err == nil || !strings.Contains(err.Error(), "needs --docs-dir") {
+		t.Fatalf("docs-validate-sql without docs: %v", err)
+	}
+	if f, err := parseFlags(slices.Concat(base, []string{"--docs-validate-sql", "strict", "--docs-dir", "docs", "--mask-salt", "s3cr3t", "--mcp", "--policy-tests", "tests.yaml", "--oidc-providers", "oidc.yaml"})); err != nil ||
+		f.docsSQL != server.DocsSQLStrict || f.maskSalt != "s3cr3t" || !f.mcpEnabled || f.policyTests != "tests.yaml" || f.oidcProviders != "oidc.yaml" {
+		t.Fatalf("new flags: %+v %v", f, err)
+	}
+	if _, err := parseFlags(slices.Concat(base, []string{"--oidc-providers", "oidc.yaml", "--oidc-issuer", "https://accounts.google.com"})); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("oidc-providers + oidc-issuer: %v", err)
+	}
 }

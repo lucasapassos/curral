@@ -49,6 +49,70 @@ func ValidDocsNames(v string) bool {
 	return v == DocsNamesOff || v == DocsNamesWarn || v == DocsNamesStrict
 }
 
+// Values of --docs-validate-sql.
+const (
+	DocsSQLOff    = "off"    // document SQLs are saved as written
+	DocsSQLWarn   = "warn"   // invalid document SQLs are logged
+	DocsSQLStrict = "strict" // invalid document SQL is a 400
+)
+
+// ValidDocsSQL reports whether v is a --docs-validate-sql value.
+func ValidDocsSQL(v string) bool {
+	return v == DocsSQLOff || v == DocsSQLWarn || v == DocsSQLStrict
+}
+
+// docSQLError is a document SQL statement that failed validation in strict mode.
+type docSQLError struct{ msg string }
+
+func (e *docSQLError) Error() string { return e.msg }
+
+// validateDocSQLs checks every SQL example in d against the engine without
+// executing it, according to mode (--docs-validate-sql): off does nothing,
+// warn logs failures and allows the write, strict returns a 400 error.
+func (s *Server) validateDocSQLs(ctx context.Context, mode string, ev *audit.Event, d *docs.Doc) error {
+	if mode == "" || mode == DocsSQLOff || s.Engine == nil || d == nil || len(d.Context.SQLs) == 0 {
+		return nil
+	}
+	for i, item := range d.Context.SQLs {
+		if err := s.Engine.ValidateSQL(ctx, item.SQL); err != nil {
+			if mode == DocsSQLStrict {
+				return &docSQLError{msg: fmt.Sprintf("context.sqls[%d].sql: %s", i, engine.PublicError(err))}
+			}
+			if s.Log != nil {
+				var reqID, user string
+				if ev != nil {
+					reqID, user = ev.RequestID, ev.User
+				}
+				s.Log.Warn("document sql failed validation",
+					"request_id", reqID, "user", user, "doc", d.ID, "index", i, "err", err)
+			}
+		}
+	}
+	return nil
+}
+
+// ValidateAllDocsSQL validates every SQL example in every stored document
+// according to mode, returning a list of failure descriptions (empty when off
+// or all valid).
+func (s *Server) ValidateAllDocsSQL(ctx context.Context, mode string) []string {
+	if mode == "" || mode == DocsSQLOff || s.Engine == nil || s.Docs == nil {
+		return nil
+	}
+	var failures []string
+	for _, d := range s.Docs.List(docs.Filter{}) {
+		for i, item := range d.Context.SQLs {
+			if err := s.Engine.ValidateSQL(ctx, item.SQL); err != nil {
+				msg := fmt.Sprintf("%s: context.sqls[%d].sql: %s", d.ID, i, engine.PublicError(err))
+				failures = append(failures, msg)
+				if s.Log != nil {
+					s.Log.Warn("document sql failed validation", "doc", d.ID, "index", i, "err", err)
+				}
+			}
+		}
+	}
+	return failures
+}
+
 // docCatalog loads the catalog a write resolves its tables and schemas
 // against, as --docs-validate-names asks; nil when off, empty without an
 // engine (nothing resolves). It is loaded before the store is locked and
@@ -535,6 +599,11 @@ func (s *Server) docWriter(action string) handler {
 			if !ok {
 				return errDocDenied
 			}
+			if next != nil {
+				if err := s.validateDocSQLs(r.Context(), s.DocsValidateSQL, ev, next); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 
@@ -561,8 +630,9 @@ func (s *Server) docWriter(action string) handler {
 		}
 
 		var invalid *docs.ValidationError
+		var invalidSQL *docSQLError
 		switch {
-		case errors.As(err, &invalid):
+		case errors.As(err, &invalid), errors.As(err, &invalidSQL):
 			finish(http.StatusBadRequest, "error", "request", err.Error())
 		case errors.Is(err, docs.ErrNotFound):
 			finish(http.StatusNotFound, "error", "request", err.Error())

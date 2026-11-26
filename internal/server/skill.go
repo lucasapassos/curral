@@ -79,6 +79,9 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	if s.Docs != nil {
 		endpoints["docs"] = "GET /v1/docs, GET /v1/docs/{id}, POST /v1/docs/search"
 	}
+	if s.MCPEnabled {
+		endpoints["mcp"] = "POST /mcp (Model Context Protocol, Streamable HTTP)"
+	}
 	agents := map[string]string{
 		"start_here": "/skill/SKILL.md",
 		"api":        "/skill/references/api.md",
@@ -132,7 +135,8 @@ func (s *Server) skillFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	if name == "scripts/install.sh" {
 		// The installer downloads the rest from this server.
-		data = []byte(strings.Replace(string(data), "\nset -eu\n",
+		src := strings.ReplaceAll(string(data), "\r\n", "\n")
+		data = []byte(strings.Replace(src, "\nset -eu\n",
 			"\nset -eu\nCURRAL_SKILL_SOURCE=${CURRAL_SKILL_SOURCE:-"+baseURL(r)+"/skill}\n", 1))
 	}
 	w.Write(data)

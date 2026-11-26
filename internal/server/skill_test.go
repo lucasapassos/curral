@@ -253,7 +253,7 @@ func TestProtectedMetadata(t *testing.T) {
 		{"SUMMARIZE orders", 200, `"count":5`}, // filtered rows (amount < 500), masked amount
 		{"SELECT count(*) AS n, count(amount) AS a FROM orders", 200, `"n":5,"a":0`},
 		{"EXPLAIN SELECT * FROM orders", 403, "only be read with SELECT"},
-		{"SELECT * FROM big_orders", 403, "indirectly"},
+		{"SELECT * FROM big_orders", 200, `"row_count":0`}, // amount masked to NULL before view's WHERE amount > 100
 	} {
 		r := do(t, ts, "analyst", `{"sql":`+jsonString(c.sql)+`}`)
 		if r.status != c.status || !strings.Contains(r.body, c.contains) {

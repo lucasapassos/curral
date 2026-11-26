@@ -5,6 +5,62 @@ notes are taken from its section here.
 
 ## [Unreleased]
 
+## [v0.9.0] - 2026-11-26
+
+Multi-tenant isolation hardening, native MCP support, multi-issuer OIDC,
+transparent protection on local views, Parquet output, and Flight SQL
+cancellation.
+
+### Added
+- **Native MCP server**: Streamable HTTP endpoint (`--mcp` -> `POST /mcp`,
+  protected by authentication and advertised at `GET /`) and stdio client
+  bridge (`curral mcp`) exposing `curral_query`, `curral_schema`,
+  `curral_docs_search`, `curral_docs_get`, `curral_databases` and
+  `curral_capabilities` through the same policy, RLS, masking, limits and
+  audit pipeline.
+- **Multiple OIDC providers (`--oidc-providers`)**: YAML configuration for
+  federating multiple JWT issuers simultaneously with per-provider
+  `role_prefix`, strict `iss`-based routing and isolated JWKS verification.
+- **Column masking presets (`hash`, `email`, `first:N`)** and `--mask-salt`
+  (`CURRAL_MASK_SALT`, unset from the process environment after boot):
+  deterministic salted SHA-256 hashing for `JOIN`/`COUNT(DISTINCT)` without
+  exposing the salt in session variables, plus `NULL`-preserving email and
+  prefix masks.
+- **Declarative policy test runner (`curral check --policy-tests <file.yaml>`)**:
+  validates multi-tenant access matrices (`allow`, `row_filters`, `masks`,
+  `limits`, `docs_allow`) against the real OPA bundle and catalog in CI.
+- **Semantic document SQL validation (`--docs-validate-sql off|warn|strict`)**:
+  prepares `context.sqls[].sql` via DuckDB dry-run on document writes (after
+  `docs_allow` authorization) and in `curral check`.
+- **Transparent protection on local DuckDB views**: queries against local
+  views over RLS/masked tables now rewrite recursively (with depth/cycle
+  limits, column alias preservation and plan scan verification) instead of
+  being refused as indirect reads.
+- **Parquet output (`format=parquet` / `application/vnd.apache.parquet`)** on
+  `POST /v1/query` (requires `-tags duckdb_arrow`), respecting `max_rows`.
+- **Flight SQL `CancelFlightInfo` & prepared-statement inspection cache**:
+  in-flight query cancellation isolated strictly per owner, plus a bounded
+  short-lived inspection cache invalidated on DDL (while always re-evaluating
+  policy, RLS, masks and limits on execution).
+- **HTTP `gzip` compression** for JSON/CSV/NDJSON responses, Prometheus
+  metrics for schema cache, docs search, Jev and Iceberg passthrough, and
+  `--row-filters-missing strict|warn`.
+- **Cross-platform clients & releases**: `clients/python/curral.py` updates,
+  Windows/macOS signal handling in `cmd/curral`, and `darwin/arm64` +
+  `windows/amd64` release artifacts alongside `linux/amd64` and `linux/arm64`.
+
+### Security & Changed
+- **Multi-tenant catalog isolation**: inaccessible databases are now hidden
+  from `GET /v1/databases`, `GET /v1/schema`, Flight `DoGetCatalogs` and
+  `SetSessionOptions`; BM25 IDF is scoped to accessible documents under
+  `--docs-scope schema`; per-user concurrency is enforced before queueing.
+- **Inspection & rewrite hardening**: blocked `postgres_query` /
+  `postgres_execute` as dynamic SQL; scoped `usesSessionVariables` to local
+  catalogs; fixed default-schema qualification in `qualify` and multi-role
+  limit aggregation in `examples/policy.rego`.
+- **Memory hygiene**: periodic sweepers for auth cache and Iceberg catalog
+  cache (with a 128 MiB body cap).
+
 ## [v0.8.0] - 2026-10-27
 
 Agent discovery and onboarding ([#32](https://github.com/lucasapassos/curral/pull/32)),

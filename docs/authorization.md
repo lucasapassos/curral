@@ -175,8 +175,10 @@ masks := {"lake.analytics.customers": {"ssn": "last:2", "name": "redact", "birth
 }
 ```
 
-- **Presets:** `null` (keeps the column type), `redact` (`'***'`) and
-  `last:N`. For special cases, `{"sql": "<expression>"}`.
+- **Presets:** `null` (keeps the column type), `redact` (`'***'`),
+  `last:N`, `first:N`, `email` (`a***@domain.com`) and `hash` (deterministic
+  salted SHA-256 using `--mask-salt`, preserving equality for `JOIN`,
+  `GROUP BY` and `COUNT(DISTINCT)`). For special cases, `{"sql": "<expression>"}`.
 
 ### How it is applied
 

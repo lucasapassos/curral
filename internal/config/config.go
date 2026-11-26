@@ -153,6 +153,45 @@ type User struct {
 	Roles        []string `yaml:"roles"`
 }
 
+// OIDCProvider configures one OIDC issuer in an --oidc-providers file.
+type OIDCProvider struct {
+	Issuer               string        `yaml:"issuer"`
+	Audience             string        `yaml:"audience"`
+	UserClaim            string        `yaml:"user_claim"`
+	RolesClaim           string        `yaml:"roles_claim"`
+	RolePrefix           string        `yaml:"role_prefix"`
+	Skew                 time.Duration `yaml:"skew"`
+	RequireEmailVerified bool          `yaml:"require_email_verified"`
+	HostedDomains        []string      `yaml:"hosted_domains"`
+}
+
+// LoadOIDCProviders reads and validates a multi-provider OIDC configuration file.
+func LoadOIDCProviders(path string) ([]OIDCProvider, error) {
+	var doc struct {
+		Providers []OIDCProvider `yaml:"providers"`
+	}
+	if err := loadYAML(path, &doc); err != nil {
+		return nil, err
+	}
+	if len(doc.Providers) == 0 {
+		return nil, fmt.Errorf("%s: no providers defined", path)
+	}
+	seen := make(map[string]bool, len(doc.Providers))
+	for i, p := range doc.Providers {
+		if p.Issuer == "" || p.Audience == "" {
+			return nil, fmt.Errorf("%s: provider[%d]: issuer and audience are required", path, i)
+		}
+		if seen[p.Issuer] {
+			return nil, fmt.Errorf("%s: duplicate issuer %q", path, p.Issuer)
+		}
+		seen[p.Issuer] = true
+		if p.Skew < 0 {
+			return nil, fmt.Errorf("%s: provider %q: negative skew %s", path, p.Issuer, p.Skew)
+		}
+	}
+	return doc.Providers, nil
+}
+
 var identRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // ValidIdent reports whether s is a plain SQL identifier/keyword.

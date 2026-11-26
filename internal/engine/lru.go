@@ -54,3 +54,10 @@ func (c *lru[V]) len() int {
 	defer c.mu.Unlock()
 	return c.order.Len()
 }
+
+func (c *lru[V]) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.order.Init()
+	clear(c.items)
+}

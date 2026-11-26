@@ -124,3 +124,29 @@ func TestMatchedTerms(t *testing.T) {
 		t.Errorf("no match: %v", got)
 	}
 }
+
+func TestSearchScopeIDFIsolation(t *testing.T) {
+	s, _ := Open(t.TempDir())
+	pub, _, _ := s.Create(Doc{
+		Header:  Header{Title: "Public orders"},
+		Context: Context{Tables: []string{"sales.main.orders"}, Body: "revenue and projectx metrics"},
+	}, "ana", nil)
+	onlyPub := Filter{Allow: func(d Doc) bool { return d.ID == pub.ID }}
+
+	before := s.Search("projectx", onlyPub, 5)
+	if len(before) != 1 || before[0].Score == 0 {
+		t.Fatalf("before: %+v", before)
+	}
+	// Adding out-of-scope documents mentioning the same rare term must not
+	// change the BM25 score seen by a scoped caller.
+	for range 5 {
+		s.Create(Doc{
+			Header:  Header{Title: "Secret projectx"},
+			Context: Context{Tables: []string{"hr.main.secret"}, Body: "projectx confidential"},
+		}, "admin", nil)
+	}
+	after := s.Search("projectx", onlyPub, 5)
+	if len(after) != 1 || after[0].Score != before[0].Score {
+		t.Fatalf("scoped score changed from %v to %v after adding hidden docs", before[0].Score, after[0].Score)
+	}
+}

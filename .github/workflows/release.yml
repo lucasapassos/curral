@@ -40,8 +40,10 @@ jobs:
       matrix:
         include:
           # 22.04 (glibc 2.35) so the binaries also run on older distributions.
-          - { runner: ubuntu-22.04, arch: amd64 }
-          - { runner: ubuntu-22.04-arm, arch: arm64 }
+          - { runner: ubuntu-22.04, os: linux, arch: amd64, ext: "", archive: tar.gz }
+          - { runner: ubuntu-22.04-arm, os: linux, arch: arm64, ext: "", archive: tar.gz }
+          - { runner: macos-14, os: darwin, arch: arm64, ext: "", archive: tar.gz }
+          - { runner: windows-latest, os: windows, arch: amd64, ext: ".exe", archive: zip }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -49,21 +51,27 @@ jobs:
         with:
           go-version-file: go.mod
       - name: build
+        shell: bash
         run: |
-          name=curral_${GITHUB_REF_NAME}_linux_${{ matrix.arch }}
+          name=curral_${GITHUB_REF_NAME}_${{ matrix.os }}_${{ matrix.arch }}
+          bin=dist/$name/curral${{ matrix.ext }}
           mkdir -p dist/$name
           CGO_ENABLED=1 go build -trimpath -tags duckdb_arrow \
             -ldflags "-s -w -X main.version=${GITHUB_REF_NAME} -X main.commit=${GITHUB_SHA}" \
-            -o dist/$name/curral ./cmd/curral
-          dist/$name/curral version
-          dist/$name/curral install-extensions --extension-dir dist/$name/extensions httpfs avro iceberg
+            -o "$bin" ./cmd/curral
+          "$bin" version
+          "$bin" install-extensions --extension-dir dist/$name/extensions httpfs avro iceberg
           cp README.md CHANGELOG.md LICENSE dist/$name/
           cp -r examples dist/$name/
-          tar -C dist -czf dist/$name.tar.gz $name
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd dist && 7z a -tzip "$name.zip" "$name")
+          else
+            tar -C dist -czf "dist/$name.tar.gz" "$name"
+          fi
       - uses: actions/upload-artifact@v7
         with:
-          name: bin-${{ matrix.arch }}
-          path: dist/*.tar.gz
+          name: bin-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*.${{ matrix.archive }}
 
   image:
     needs: test
@@ -152,6 +160,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cd dist && sha256sum *.tar.gz > SHA256SUMS && cd ..
-          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+          cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS && cd ..
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
             --title "curral $GITHUB_REF_NAME" --notes-file notes.md

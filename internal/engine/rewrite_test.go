@@ -73,11 +73,15 @@ func TestProtectRewrite(t *testing.T) {
 
 func TestProtectRefusals(t *testing.T) {
 	e := newEngine(t, Options{})
+	if _, err := e.db.Exec("CREATE MACRO sales.main.orders_macro() AS TABLE SELECT * FROM sales.main.orders"); err != nil {
+		t.Fatal(err)
+	}
 	for sql, want := range map[string]string{
-		"SELECT * FROM big_orders":                      "indirectly", // view over the table
+		"SELECT * FROM orders_macro()":                  "indirectly", // table macro over the table
 		"INSERT INTO crm.clients SELECT id FROM orders": "only be read with SELECT",
 		"CREATE TABLE crm.copy AS SELECT * FROM orders": "only be read with SELECT",
 		"SELECT * FROM orders TABLESAMPLE 50%":          "TABLESAMPLE",
+		"SELECT * FROM big_orders TABLESAMPLE 50%":      "TABLESAMPLE",
 		"EXPLAIN SELECT * FROM orders":                  "only be read with SELECT",
 	} {
 		_, err := runProtected(e, sql, nil)
@@ -87,8 +91,7 @@ func TestProtectRefusals(t *testing.T) {
 	}
 	// DESCRIBE and SHOW return column names and types, as GET /v1/schema
 	// does for the same caller, never rows: they are answered over the
-	// protected subquery (the masked column keeps the mask's type), while a
-	// view wrapping them still reads the table indirectly.
+	// protected subquery (the masked column keeps the mask's type).
 	for _, sql := range []string{"DESCRIBE orders", "SHOW orders", "SHOW sales.main.orders", "SELECT * FROM (SHOW orders)",
 		"DESCRIBE SELECT amount FROM orders", "SELECT column_name FROM (DESCRIBE orders), (SELECT 1)"} {
 		rows, err := runProtected(e, sql, nil)
@@ -96,10 +99,12 @@ func TestProtectRefusals(t *testing.T) {
 			t.Errorf("%s: %v %v", sql, rows, err)
 		}
 	}
-	// A view over the table describes fine too (its columns, no rows), while
-	// reading it still does not.
+	// A local view over a protected table describes and queries transparently.
 	if rows, err := runProtected(e, "DESCRIBE big_orders", nil); err != nil || len(rows) == 0 {
 		t.Errorf("DESCRIBE of a view over the table: %v %v", rows, err)
+	}
+	if rows, err := runProtected(e, "SELECT * FROM big_orders", nil); err != nil || len(rows) != 0 {
+		t.Errorf("SELECT from big_orders with id=1, amount=0: got %v err=%v, want []", rows, err)
 	}
 	// PIVOT expands into several statements and is refused before any check.
 	if _, err := runProtected(e, "PIVOT orders ON id USING sum(amount)", nil); err == nil {
@@ -109,6 +114,105 @@ func TestProtectRefusals(t *testing.T) {
 	_, rows, _ := run(e, Request{SQL: "SELECT count(*) FROM crm.clients"}, nil)
 	if rows[0][0] != int64(0) {
 		t.Fatalf("write happened: %v", rows)
+	}
+}
+
+func TestProtectLocalViews(t *testing.T) {
+	e := newEngine(t, Options{})
+	for _, ddl := range []string{
+		"INSERT INTO sales.main.salaries VALUES ('alice', 100), ('bob', 200)",
+		"CREATE VIEW sales.main.v_orders AS SELECT id, amount FROM sales.main.orders",
+		"CREATE VIEW sales.main.v_nested AS SELECT id, amount FROM v_orders WHERE id >= 1",
+		"CREATE VIEW sales.main.v_aliased(a, b) AS SELECT id, amount FROM sales.main.orders",
+		"CREATE SCHEMA sales.analytics",
+		"CREATE VIEW sales.analytics.v_analytics AS SELECT id, amount FROM sales.main.orders",
+		"CREATE VIEW sales.analytics.v_analytics_nested AS SELECT id, amount FROM analytics.v_analytics",
+		"CREATE MACRO sales.main.m_orders() AS TABLE SELECT id, amount FROM sales.main.orders",
+	} {
+		if _, err := e.db.Exec(ddl); err != nil {
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+	// Also test a view in a non-default schema created via Engine.Query referencing
+	// a 1-part table/view name in its own schema.
+	for _, ddl := range []string{
+		"CREATE TABLE sales.analytics.local_orders AS SELECT id, amount FROM sales.main.orders",
+		"CREATE VIEW sales.analytics.v_local AS SELECT id, amount FROM local_orders",
+	} {
+		if _, err := e.db.Exec(ddl); err != nil {
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+
+	// Simple local view, nested view, aliased view, outer alias, non-default schema.
+	for _, tc := range []struct {
+		sql  string
+		want string
+	}{
+		{"SELECT id, amount FROM v_orders ORDER BY id", "[[1 0]]"},
+		{"SELECT id, amount FROM v_nested ORDER BY id", "[[1 0]]"},
+		{"SELECT a, b FROM v_aliased ORDER BY a", "[[1 0]]"},
+		{"SELECT c, d FROM v_aliased AS u(c, d) ORDER BY c", "[[1 0]]"},
+		{"SELECT c, b FROM v_aliased AS u(c) ORDER BY c", "[[1 0]]"},
+		{"SELECT id, amount FROM analytics.v_analytics ORDER BY id", "[[1 0]]"},
+		{"SELECT id, amount FROM analytics.v_analytics_nested ORDER BY id", "[[1 0]]"},
+		{"SELECT a.id, b.id FROM v_orders a JOIN v_orders b ON a.id = b.id", "[[1 1]]"},
+	} {
+		rows, err := runProtected(e, tc.sql, nil)
+		if err != nil || fmt.Sprint(rows) != tc.want {
+			t.Errorf("%s\n  got %v err=%v, want %s", tc.sql, rows, err, tc.want)
+		}
+	}
+
+	// JOIN between a local view and another protected table.
+	multiProt := map[string]Protection{
+		"sales.main.orders":            {Filter: "id = 1", Masks: map[string]string{"amount": "0"}},
+		"sales.main.salaries":          {Filter: "name = 'alice'", Masks: map[string]string{"value": "-1"}},
+		"sales.analytics.local_orders": {Filter: "id = 2", Masks: map[string]string{"amount": "99"}},
+	}
+	rows, err := runProtected(e, "SELECT v.id, v.amount, s.name, s.value FROM v_orders v CROSS JOIN salaries s", multiProt)
+	if err != nil || fmt.Sprint(rows) != "[[1 0 alice -1]]" {
+		t.Errorf("view join protected table: got %v err=%v, want [[1 0 alice -1]]", rows, err)
+	}
+	// View in non-default schema referencing a 1-part protected table in its own schema.
+	if rows, err := runProtected(e, "SELECT id, amount FROM analytics.v_local", multiProt); err != nil || fmt.Sprint(rows) != "[[2 99]]" {
+		t.Errorf("analytics.v_local: got %v err=%v, want [[2 99]]", rows, err)
+	}
+
+	// DESCRIBE on a view over a protected table.
+	if rows, err := runProtected(e, "DESCRIBE v_aliased", nil); err != nil || len(rows) != 2 {
+		t.Errorf("DESCRIBE v_aliased: got %v err=%v", rows, err)
+	}
+
+	// TABLESAMPLE on a view over a protected table MUST be refused.
+	if _, err := runProtected(e, "SELECT * FROM v_orders TABLESAMPLE 50%", nil); !errors.Is(err, ErrForbidden) || !strings.Contains(err.Error(), "TABLESAMPLE") {
+		t.Errorf("TABLESAMPLE on view: got %v, want ErrForbidden with TABLESAMPLE", err)
+	}
+
+	// Table macro reading a protected table MUST STILL be refused.
+	if _, err := runProtected(e, "SELECT * FROM m_orders()", nil); !errors.Is(err, ErrForbidden) || !strings.Contains(err.Error(), "indirectly") {
+		t.Errorf("table macro: got %v, want ErrForbidden with indirectly", err)
+	}
+
+	// Exceeding maxViewDepth MUST fail closed.
+	prev := "orders"
+	for i := range maxViewDepth + 1 {
+		name := fmt.Sprintf("v_depth_%d", i)
+		if _, err := e.db.Exec(fmt.Sprintf("CREATE VIEW sales.main.%s AS SELECT * FROM %s", name, prev)); err != nil {
+			t.Fatal(err)
+		}
+		prev = name
+	}
+	if _, err := runProtected(e, "SELECT * FROM "+prev, nil); !errors.Is(err, ErrForbidden) || !strings.Contains(err.Error(), "nesting depth") {
+		t.Errorf("deep nested view: got %v, want ErrForbidden with nesting depth", err)
+	}
+
+	// DDL via Engine.Query clears the rewrite cache so updated views apply immediately.
+	if _, _, err := run(e, Request{SQL: "CREATE OR REPLACE VIEW sales.main.v_orders AS SELECT id, amount + 5 AS amount FROM orders"}, nil); err != nil {
+		t.Fatalf("redefine view via Query: %v", err)
+	}
+	if rows, err := runProtected(e, "SELECT id, amount FROM v_orders ORDER BY id", nil); err != nil || fmt.Sprint(rows) != "[[1 5]]" {
+		t.Errorf("after CREATE OR REPLACE VIEW: got %v err=%v, want [[1 5]]", rows, err)
 	}
 }
 

@@ -38,12 +38,17 @@ list: `CURRAL_POLICY=policy.rego,roles.json`.
 | `--policy-docs-query` | `data.curral.docs_allow` | decision allowing writes to `/v1/docs`; undefined means deny |
 | `--docs-scope` | `all` | `all`: every authenticated user reads every document; `schema`: a document about tables or schemas is served only to callers who may query one of them (as listed by `/v1/schema`); needs `--docs-dir` |
 | `--docs-validate-names` | `off` | what writes do with `context.tables` and `context.schemas`: `off` saves them as written; `warn` qualifies the names that resolve to one catalog object and logs the rest; `strict` refuses (400) a name not resolving to exactly one object. Resolution reads the whole catalog, so a writer learns whether a name exists. Needs `--docs-dir` |
+| `--docs-validate-sql` | `off` | what writes (and `curral check`) do with `context.sqls[].sql`: `off`, `warn` (prepare and log failures) or `strict` (refuse invalid SQL with 400); needs `--docs-dir` |
+| `--mask-salt` | (off) | secret salt for the `hash` column mask preset (`CURRAL_MASK_SALT`, removed from the environment after boot) |
+| `--mcp` | `false` | enable the Streamable HTTP Model Context Protocol endpoint at `POST /mcp` |
+| `--policy-tests` | (off) | YAML file of declarative policy test cases executed by `curral check` |
 | `--jev-key` | (off) | TypeSafe API key: `/v1/docs/search` asks Jev which documents fit the question; prefer `CURRAL_JEV_KEY`. Sends the candidate documents to TypeSafe |
 | `--jev-threshold` | 0.7 | minimum Jev probability for a search match |
 | `--jev-floor` | 0.2 | when nothing reaches the threshold, documents at or above this still come back as weak matches (`below_threshold`); 0 returns the best whatever their probability |
 | `--jev-timeout` | 5s | how long a search waits for Jev; unrated documents keep their BM25 place |
 | `--search-shortlist` | 20 | best BM25 candidates a search hands to Jev |
 | `--row-filters` | (off) | RLS file: which rows each user sees, per table; reloaded on `SIGHUP` |
+| `--row-filters-missing` | `strict` | what to do when a table in `--row-filters` does not exist yet: `strict` aborts boot/reload, `warn` logs and keeps the rule |
 | `--max-concurrency` | 8 | queries executing at the same time |
 | `--queue-timeout` | 5s | wait for a free slot; after that the response is 503 |
 | `--max-concurrency-per-user` | 0 (no limit) | concurrent queries per user when the policy sets no `max_concurrency` |

@@ -27,6 +27,9 @@ type Protection struct {
 // maxSubqCache bounds cached protection subqueries.
 const maxSubqCache = 1024
 
+// maxViewDepth caps recursive local view expansion during protection rewriting.
+const maxViewDepth = 8
+
 // errProtected marks a statement refused because of protected tables.
 func errProtected(format string, a ...any) error {
 	return fmt.Errorf("%w: %s", ErrForbidden, fmt.Sprintf(format, a...))
@@ -143,17 +146,19 @@ func (e *Engine) buildRewrite(ctx context.Context, c *duckdb.Conn, query, databa
 	}
 
 	// Replace references, counting them per table (and references to remote
-	// catalogs, whose plan scans carry no table name).
+	// catalogs, whose plan scans carry no table name). Local DuckDB views that
+	// read protected tables are expanded inline into subqueries so the
+	// protection applies transparently.
 	refs, metaRefs := map[string]int{}, map[string]int{}
 	remoteRefs, metaRemoteRefs := 0, 0
 	var subqueryErr error
 	// meta: inside a DESCRIBE or SHOW (not SUMMARIZE, which reads the rows).
-	var walk func(n any, ctes []string, meta bool) any
-	walk = func(n any, ctes []string, meta bool) any {
+	var walk func(n any, ctes []string, meta bool, curDB, curSchema string, depth int, seenViews map[string]bool) any
+	walk = func(n any, ctes []string, meta bool, curDB, curSchema string, depth int, seenViews map[string]bool) any {
 		switch v := n.(type) {
 		case []any:
 			for i := range v {
-				v[i] = walk(v[i], ctes, meta)
+				v[i] = walk(v[i], ctes, meta, curDB, curSchema, depth, seenViews)
 			}
 		case map[string]any:
 			if v["type"] == "SHOW_REF" && v["show_type"] != "SUMMARY" {
@@ -174,7 +179,7 @@ func (e *Engine) buildRewrite(ctx context.Context, c *duckdb.Conn, query, databa
 			// only, like DESCRIBE.
 			if _, ok := v["query"].(map[string]any); v["type"] == "SHOW_REF" && !ok {
 				if name, ok := showName(v); ok {
-					if table, ok := byKey[strings.ToLower(e.qualify([]string{name}, database))]; ok {
+					if table, ok := byKey[strings.ToLower(e.qualify([]string{name}, curDB))]; ok {
 						refs[table]++
 						metaRefs[table]++
 					}
@@ -185,39 +190,141 @@ func (e *Engine) buildRewrite(ctx context.Context, c *duckdb.Conn, query, databa
 				if len(parts) == 1 && contains(ctes, strings.ToLower(parts[0])) {
 					return v // a CTE, not a table
 				}
-				qualified := e.qualify(parts, database)
+				var qualified, viewSQL string
+				var isView, checkedView bool
+				if len(parts) == 1 && curSchema != "" && !strings.EqualFold(curSchema, e.schemas[curDB]) {
+					cand := curDB + "." + curSchema + "." + parts[0]
+					if _, ok := byKey[strings.ToLower(cand)]; ok {
+						qualified = cand
+					} else if !e.IsRemote(cand) {
+						vs, found, err := lookupLocalView(ctx, c, curDB, curSchema, parts[0])
+						if err != nil {
+							subqueryErr = errProtected("cannot inspect view %s: %v", cand, err)
+							return v
+						}
+						if found {
+							qualified, viewSQL, isView, checkedView = cand, vs, true, true
+						} else {
+							qualified = e.qualify(parts, curDB)
+						}
+					} else {
+						qualified = cand
+					}
+				} else {
+					qualified = e.qualify(parts, curDB)
+				}
 				if e.IsRemote(qualified) {
 					remoteRefs++
 					if meta {
 						metaRemoteRefs++
 					}
 				}
-				table, ok := byKey[strings.ToLower(qualified)]
+				if table, ok := byKey[strings.ToLower(qualified)]; ok {
+					refs[table]++
+					if meta {
+						metaRefs[table]++
+					}
+					if v["sample"] != nil || v["at_clause"] != nil {
+						subqueryErr = errProtected("TABLESAMPLE/AT on protected table %s is not supported", table)
+						return v
+					}
+					sub, err := e.protectedSubquery(ctx, c, table, prot[table], v)
+					if err != nil {
+						subqueryErr = err
+						return v
+					}
+					return sub
+				}
+				if e.IsRemote(qualified) {
+					return v
+				}
+				qParts := strings.Split(qualified, ".")
+				if len(qParts) != 3 {
+					return v
+				}
+				if !checkedView {
+					vs, found, err := lookupLocalView(ctx, c, qParts[0], qParts[1], qParts[2])
+					if err != nil {
+						subqueryErr = errProtected("cannot inspect view %s: %v", qualified, err)
+						return v
+					}
+					viewSQL, isView = vs, found
+				}
+				if !isView {
+					return v
+				}
+				viewKey := strings.ToLower(qualified)
+				if depth >= maxViewDepth {
+					subqueryErr = errProtected("view nesting depth exceeds %d at %s", maxViewDepth, qualified)
+					return v
+				}
+				if seenViews[viewKey] {
+					subqueryErr = errProtected("cyclic view reference at %s", qualified)
+					return v
+				}
+				viewAliases, selectSQL, ok := parseViewSQL(viewSQL)
 				if !ok {
+					subqueryErr = errProtected("view %s definition cannot be parsed for protected tables", qualified)
 					return v
 				}
-				refs[table]++
-				if meta {
-					metaRefs[table]++
-				}
-				if v["sample"] != nil || v["at_clause"] != nil {
-					subqueryErr = errProtected("TABLESAMPLE/AT on protected table %s is not supported", table)
-					return v
-				}
-				sub, err := e.protectedSubquery(ctx, c, table, prot[table], v)
+				vRaw, vAgain, err := serializeRoundTrip(ctx, c, selectSQL)
 				if err != nil {
+					subqueryErr = errProtected("view %s cannot be checked for protected tables: %v", qualified, err)
+					return v
+				}
+				if err := checkRoundTrip(vRaw, vAgain); err != nil {
 					subqueryErr = err
 					return v
 				}
-				return sub
+				vDoc, err := decodeJSON(vRaw)
+				if err != nil {
+					subqueryErr = errProtected("view %s parse tree error: %v", qualified, err)
+					return v
+				}
+				vStmts, _ := vDoc.(map[string]any)["statements"].([]any)
+				if len(vStmts) != 1 {
+					subqueryErr = errProtected("view %s is not a single SELECT statement", qualified)
+					return v
+				}
+				nextSeen := maps.Clone(seenViews)
+				if nextSeen == nil {
+					nextSeen = map[string]bool{}
+				}
+				nextSeen[viewKey] = true
+
+				refsBefore := totalRefCount(refs)
+				remoteBefore := remoteRefs
+				viewStmt := walk(vStmts[0], nil, meta, qParts[0], qParts[1], depth+1, nextSeen)
+				if subqueryErr != nil {
+					return v
+				}
+				if totalRefCount(refs) == refsBefore && remoteRefs == remoteBefore {
+					return v // view touches no protected tables or remote catalogs
+				}
+				if v["sample"] != nil || v["at_clause"] != nil {
+					subqueryErr = errProtected("TABLESAMPLE/AT on view %s over protected table is not supported", qualified)
+					return v
+				}
+				alias, _ := v["alias"].(string)
+				if alias == "" {
+					alias, _ = v["table_name"].(string)
+				}
+				return map[string]any{
+					"type":              "SUBQUERY",
+					"alias":             alias,
+					"column_name_alias": mergeColumnAliases(viewAliases, v["column_name_alias"]),
+					"sample":            nil,
+					"query_location":    v["query_location"],
+					"subquery":          viewStmt,
+				}
 			}
 			for k, x := range v {
-				v[k] = walk(x, ctes, meta)
+				v[k] = walk(x, ctes, meta, curDB, curSchema, depth, seenViews)
 			}
 		}
 		return n
 	}
-	walk(doc, nil, false)
+	walk(doc, nil, false, database, e.schemas[database], 0, nil)
 	if subqueryErr != nil {
 		return nil, subqueryErr
 	}
@@ -273,12 +380,28 @@ func (e *Engine) usesSessionVariables(ctx context.Context, c *duckdb.Conn, query
 	if slices.Contains(names, "getvariable") {
 		return true, nil
 	}
-	for _, n := range names {
-		macro, err := scalarString(ctx, c,
-			"SELECT count(*)::VARCHAR FROM duckdb_functions() WHERE NOT internal AND lower(function_name) = $1", n)
-		if err != nil || macro != "0" {
-			return true, nil
+	names = uniq(names)
+	if len(names) == 0 {
+		return false, nil
+	}
+	// Only inspect local catalogs (and memory/temp) for user-defined macros:
+	// calling duckdb_functions() across attached remote catalogs (Iceberg) can
+	// race with concurrent queries.
+	localDBs := []string{"'memory'", "'temp'"}
+	for _, d := range e.databases {
+		if d.Type == "duckdb" {
+			localDBs = append(localDBs, quoteString(d.Name))
 		}
+	}
+	quotedNames := make([]string, len(names))
+	for i, n := range names {
+		quotedNames[i] = quoteString(n)
+	}
+	q := "SELECT count(*)::VARCHAR FROM duckdb_functions() WHERE NOT internal AND database_name IN (" +
+		strings.Join(localDBs, ", ") + ") AND lower(function_name) IN (" + strings.Join(quotedNames, ", ") + ")"
+	macro, err := scalarString(ctx, c, q)
+	if err != nil || macro != "0" {
+		return true, nil
 	}
 	return false, nil
 }
@@ -477,13 +600,142 @@ func deserializeSQL(ctx context.Context, c *duckdb.Conn, doc string) (string, er
 	return scalarString(ctx, c, "SELECT json_deserialize_sql($1::JSON)", doc)
 }
 
-func scalarString(ctx context.Context, c *duckdb.Conn, query, arg string) (string, error) {
+// lookupLocalView returns the CREATE VIEW SQL for a non-internal local DuckDB
+// view, or ("", false, nil) if no such view exists.
+func lookupLocalView(ctx context.Context, c *duckdb.Conn, db, schema, name string) (string, bool, error) {
+	ds, err := c.Prepare(`SELECT sql FROM duckdb_views()
+		WHERE NOT internal
+		  AND lower(database_name) = lower($1)
+		  AND lower(schema_name) = lower($2)
+		  AND lower(view_name) = lower($3)
+		LIMIT 1`)
+	if err != nil {
+		return "", false, err
+	}
+	defer ds.Close()
+	rows, err := ds.(*duckdb.Stmt).QueryContext(ctx, []driver.NamedValue{
+		{Ordinal: 1, Value: db},
+		{Ordinal: 2, Value: schema},
+		{Ordinal: 3, Value: name},
+	})
+	if err != nil {
+		return "", false, err
+	}
+	defer rows.Close()
+	dest := make([]driver.Value, 1)
+	if err := rows.Next(dest); err != nil {
+		if errors.Is(err, io.EOF) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	s, _ := dest[0].(string)
+	return s, true, nil
+}
+
+// parseViewSQL extracts optional declared column aliases and the underlying
+// SELECT statement from a CREATE VIEW DDL string returned by duckdb_views().
+func parseViewSQL(viewSQL string) (aliases []string, selectSQL string, ok bool) {
+	toks, lexOK := tokenize(viewSQL)
+	if !lexOK {
+		return nil, "", false
+	}
+	c := &cursor{toks: toks}
+	if !c.accept("CREATE") {
+		return nil, "", false
+	}
+	if c.accept("OR") && !c.accept("REPLACE") {
+		return nil, "", false
+	}
+	c.accept("TEMP", "TEMPORARY")
+	c.accept("RECURSIVE")
+	if !c.accept("VIEW") {
+		return nil, "", false
+	}
+	if c.accept("IF") && !(c.accept("NOT") && c.accept("EXISTS")) {
+		return nil, "", false
+	}
+	if _, ok := c.name(); !ok {
+		return nil, "", false
+	}
+	if p := c.peek(); p.kind == tokPunct && p.text == "(" {
+		c.i++
+		for {
+			t := c.peek()
+			if t.kind != tokWord && t.kind != tokQuoted {
+				return nil, "", false
+			}
+			aliases = append(aliases, t.text)
+			c.i++
+			if p := c.peek(); p.kind == tokPunct && p.text == "," {
+				c.i++
+				continue
+			}
+			if p := c.peek(); p.kind == tokPunct && p.text == ")" {
+				c.i++
+				break
+			}
+			return nil, "", false
+		}
+	}
+	if !c.accept("AS") {
+		return nil, "", false
+	}
+	if c.i >= len(c.toks) {
+		return nil, "", false
+	}
+	start := c.toks[c.i].pos
+	end := len(viewSQL)
+	if last := c.toks[len(c.toks)-1]; last.kind == tokPunct && last.text == ";" {
+		end = last.pos
+	}
+	selectSQL = strings.TrimSpace(viewSQL[start:end])
+	if selectSQL == "" {
+		return nil, "", false
+	}
+	return aliases, selectSQL, true
+}
+
+// mergeColumnAliases combines a view's declared column aliases with any outer
+// FROM v AS u(c, d) column alias list, with outer aliases overriding positionally.
+func mergeColumnAliases(viewAliases []string, outer any) []any {
+	outerList, _ := outer.([]any)
+	if len(viewAliases) == 0 {
+		if outerList == nil {
+			return []any{}
+		}
+		return outerList
+	}
+	n := max(len(viewAliases), len(outerList))
+	out := make([]any, n)
+	for i, a := range viewAliases {
+		out[i] = a
+	}
+	for i, a := range outerList {
+		out[i] = a
+	}
+	return out
+}
+
+func totalRefCount(refs map[string]int) int {
+	total := 0
+	for _, n := range refs {
+		total += n
+	}
+	return total
+}
+
+func scalarString(ctx context.Context, c *duckdb.Conn, query string, args ...any) (string, error) {
 	ds, err := c.Prepare(query)
 	if err != nil {
 		return "", err
 	}
 	defer ds.Close()
-	rows, err := ds.(*duckdb.Stmt).QueryContext(ctx, []driver.NamedValue{{Ordinal: 1, Value: arg}})
+	named := make([]driver.NamedValue, len(args))
+	for i, a := range args {
+		named[i] = driver.NamedValue{Ordinal: i + 1, Value: a}
+	}
+	rows, err := ds.(*duckdb.Stmt).QueryContext(ctx, named)
 	if err != nil {
 		return "", err
 	}

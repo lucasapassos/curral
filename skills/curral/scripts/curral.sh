@@ -87,7 +87,7 @@ if [ "$cmd" = login ]; then
 	echo "curral: saved to $config" >&2
 	[ -z "${CURRAL_TOKEN:-}${CURRAL_USER:-}" ] ||
 		echo "curral: warning: CURRAL_TOKEN/CURRAL_USER in this environment take precedence over the file" >&2
-	CURRAL_URL='' CURRAL_TOKEN='' CURRAL_USER='' CURRAL_PASSWORD='' CURRAL_CONFIG=$config sh "$self" status >/dev/null
+	CURRAL_URL='' CURRAL_TOKEN='' CURRAL_USER='' CURRAL_PASSWORD='' CURRAL_CONFIG=$config sh "$self" capabilities >/dev/null
 	exit
 fi
 
@@ -284,8 +284,8 @@ query | dry-run)
 docs)
 	for kv in "$@"; do
 		case $kv in
-		table=* | schema=* | q=* | fields=*) ;;
-		*) die "invalid filter: $kv (use table=, schema=, q=, fields=header)" ;;
+		table=* | tables=* | schema=* | schemas=* | q=* | fields=* | access=*) ;;
+		*) die "invalid filter: $kv (use table=, tables=, schema=, schemas=, q=, fields=header, access=true)" ;;
 		esac
 	done
 	# Each filter becomes "--data-urlencode k=v" as separate quoted words: a
@@ -298,16 +298,28 @@ docs)
 	OUT=- request -G "$@" "$url/v1/docs"
 	;;
 search)
-	[ $# -ge 1 ] || die "usage: search [table=X] [schema=Y] [limit=N] [fields=header] \"QUESTION\""
+	[ $# -ge 1 ] || die "usage: search [table=X|tables=A,B] [schema=Y|schemas=A,B] [limit=N] [fields=header] [access=true] \"QUESTION\""
 	body=""
 	while [ $# -gt 1 ]; do
 		case $1 in
 		table=* | schema=* | fields=*)
 			body="$body,\"${1%%=*}\":$(printf '%s' "${1#*=}" | json_string)" ;;
+		tables=* | schemas=*)
+			key=${1%%=*}
+			arr=""
+			oldifs=$IFS
+			IFS=,
+			for item in ${1#*=}; do
+				[ -n "$item" ] && arr="${arr:+$arr,}$(printf '%s' "$item" | json_string)"
+			done
+			IFS=$oldifs
+			body="$body,\"$key\":[$arr]" ;;
+		access=true | access=false)
+			body="$body,\"access\":${1#access=}" ;;
 		limit=*)
 			case ${1#limit=} in *[!0-9]* | "") die "limit= needs an integer" ;; esac
 			body="$body,\"limit\":${1#limit=}" ;;
-		*) die "invalid option: $1 (use table=, schema=, limit=, fields=header; the question goes last)" ;;
+		*) die "invalid option: $1 (use table=, tables=, schema=, schemas=, limit=, fields=header, access=true; the question goes last)" ;;
 		esac
 		shift
 	done

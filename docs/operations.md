@@ -18,7 +18,10 @@ internal network.
 | `curral_auth_failures_total` | counter | |
 | `curral_audit_events_written_total` / `curral_audit_events_dropped_total` | counter | |
 | `curral_audit_healthy` | gauge | 0 = queries are being refused |
-| `curral_catalog_cache_requests_total` | counter | `database`, `result` (`hit`, `miss`) |
+| `curral_catalog_cache_requests_total` | counter | `database`, `result` (`hit`, `miss`, `passthrough`) |
+| `curral_schema_requests_total` / `curral_schema_duration_seconds` | counter / histogram | `status` |
+| `curral_docs_search_requests_total` / `curral_docs_search_duration_seconds` | counter / histogram | `ranker`, `status` |
+| `curral_jev_judgments_total` / `curral_jev_duration_seconds` | counter / histogram | `result` (`ok`, `error`) |
 | `curral_build_info` | gauge | `version`, `commit`, `duckdb`, `policy_sha256` |
 
 Other metrics are documented next to their features:

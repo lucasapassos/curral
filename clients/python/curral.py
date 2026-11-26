@@ -66,10 +66,16 @@ class Client:
         database: str | None = None,
         cafile: str | None = None,
         timeout: float | None = None,
+        execution_context: dict[str, Any] | None = None,
+        caller_context: dict[str, Any] | None = None,
     ):
+        if execution_context is not None and caller_context is not None:
+            raise ValueError("pass execution_context or caller_context, not both")
         self.base = url.rstrip("/")
         self.url = self.base + "/v1/query"
         self.database, self.timeout = database, timeout
+        self._execution_context = execution_context
+        self._caller_context = caller_context
         if token:
             self._auth = "Bearer " + token.strip()
         elif user is not None:
@@ -78,6 +84,41 @@ class Client:
         else:
             raise ValueError("pass token=... or user=/password=")
         self._ssl = ssl.create_default_context(cafile=cafile) if cafile else None
+
+    def with_identity(self, subject: str, **fields: Any) -> Client:
+        """Return a copy of this client acting on behalf of a delegated identity."""
+        c = Client.__new__(Client)
+        c.base, c.url = self.base, self.url
+        c.database, c.timeout = self.database, self.timeout
+        c._auth, c._ssl = self._auth, self._ssl
+        c._execution_context = {"subject": subject, **fields}
+        c._caller_context = None
+        return c
+
+    # -- discovery ------------------------------------------------------
+
+    def capabilities(self) -> dict:
+        """Return the server's capabilities and delegation contract for this credential."""
+        with self._request("GET", "/v1/capabilities", send_context=False) as resp:
+            return json.load(resp)
+
+    def databases(self) -> list[dict]:
+        """Return the attached databases visible to the caller."""
+        with self._request("GET", "/v1/databases") as resp:
+            return json.load(resp)["databases"]
+
+    def schema(
+        self,
+        *,
+        database: str | None = None,
+        schema: str | None = None,
+        table: str | None = None,
+    ) -> dict:
+        """Return tables, views and columns the caller may query."""
+        query = {k: v for k, v in {"database": database, "schema": schema, "table": table}.items() if v}
+        path = "/v1/schema" + ("?" + urllib.parse.urlencode(query) if query else "")
+        with self._request("GET", path) as resp:
+            return json.load(resp)
 
     # -- public API -----------------------------------------------------
 
@@ -112,28 +153,75 @@ class Client:
 
     # -- semantic documents (/v1/docs) ----------------------------------
 
-    def docs(self, *, table: str | None = None, schema: str | None = None, q: str | None = None, headers_only: bool = False) -> list[dict]:
-        """Documents, most recently updated first; table/schema/q narrow the list,
-        headers_only leaves out body and sqls."""
-        query = {k: v for k, v in {"table": table, "schema": schema, "q": q}.items() if v}
+    def docs(
+        self,
+        *,
+        table: str | None = None,
+        tables: Sequence[str] | None = None,
+        schema: str | None = None,
+        schemas: Sequence[str] | None = None,
+        q: str | None = None,
+        headers_only: bool = False,
+        access: bool = False,
+        if_none_match: str | None = None,
+    ) -> list[dict] | None:
+        """Documents, most recently updated first; table/tables/schema/schemas/q narrow the list,
+        headers_only leaves out body and sqls, access annotates accessible_tables/inaccessible_tables.
+        Returns None when if_none_match matches (HTTP 304)."""
+        params: list[tuple[str, str]] = []
+        for k, v in (("table", table), ("schema", schema), ("q", q)):
+            if v:
+                params.append((k, v))
+        if tables:
+            params.append(("tables", ",".join(tables)))
+        if schemas:
+            params.append(("schemas", ",".join(schemas)))
         if headers_only:
-            query["fields"] = "header"
-        path = "/v1/docs" + ("?" + urllib.parse.urlencode(query) if query else "")
-        with self._request("GET", path) as resp:
-            return json.load(resp)["docs"]
+            params.append(("fields", "header"))
+        if access:
+            params.append(("access", "true"))
+        path = "/v1/docs" + ("?" + urllib.parse.urlencode(params) if params else "")
+        try:
+            with self._request("GET", path, if_none_match=if_none_match) as resp:
+                return json.load(resp)["docs"]
+        except CurralError as e:
+            if e.status == 304:
+                return None
+            raise
 
-    def search_docs(self, q: str, *, table: str | None = None, schema: str | None = None, limit: int | None = None, headers_only: bool = False) -> dict:
+    def search_docs(
+        self,
+        q: str,
+        *,
+        table: str | None = None,
+        tables: Sequence[str] | None = None,
+        schema: str | None = None,
+        schemas: Sequence[str] | None = None,
+        limit: int | None = None,
+        headers_only: bool = False,
+        access: bool = False,
+    ) -> dict:
         """The documents that best fit the question q, best first:
-        {"ranker", "results": [{"score", "judged", "doc"}], "below_threshold"?}."""
-        body = {k: v for k, v in {"q": q, "table": table, "schema": schema, "limit": limit}.items() if v}
+        {"ranker", "results": [{"score", "judged", "matched", "doc"}], "below_threshold"?}."""
+        body: dict[str, Any] = {k: v for k, v in {"q": q, "table": table, "schema": schema, "limit": limit}.items() if v}
+        if tables:
+            body["tables"] = list(tables)
+        if schemas:
+            body["schemas"] = list(schemas)
         if headers_only:
             body["fields"] = "header"
+        if access:
+            body["access"] = True
         with self._request("POST", "/v1/docs/search", body) as resp:
             return json.load(resp)
 
-    def doc(self, doc_id: str) -> Doc:
+    def doc(self, doc_id: str, *, access: bool = False) -> Doc:
         """One document, with its etag."""
-        return self._doc("GET", doc_id)
+        suffix = "?access=true" if access else ""
+        with self._request("GET", self._doc_path(doc_id) + suffix) as resp:
+            d = Doc(json.load(resp))
+            d.etag = resp.headers.get("ETag")
+            return d
 
     def create_doc(self, doc: dict) -> Doc:
         """Create a document ({"header": {...}, "context": {...}}); returns it with id and etag."""
@@ -170,12 +258,34 @@ class Client:
             body["database"] = database or self.database
         return self._request("POST", "/v1/query", body)
 
-    def _request(self, method, path, body=None, *, if_match=None, content_type="application/json"):
+    @staticmethod
+    def _encode_context(ctx: dict[str, Any]) -> str:
+        raw = json.dumps(ctx, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    def _request(
+        self,
+        method,
+        path,
+        body=None,
+        *,
+        if_match=None,
+        if_none_match=None,
+        content_type="application/json",
+        send_context: bool = True,
+    ):
         headers = {"Authorization": self._auth}
         if body is not None:
             headers["Content-Type"] = content_type
         if if_match:
             headers["If-Match"] = if_match
+        if if_none_match:
+            headers["If-None-Match"] = if_none_match
+        if send_context:
+            if self._execution_context is not None:
+                headers["X-Curral-Execution-Context"] = self._encode_context(self._execution_context)
+            elif self._caller_context is not None:
+                headers["X-Curral-Caller-Context"] = self._encode_context(self._caller_context)
         req = urllib.request.Request(
             self.base + path,
             data=None if body is None else json.dumps(body).encode(),
@@ -183,7 +293,7 @@ class Client:
             method=method,
         )
         try:
-            return urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl)
+            resp = urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl)
         except urllib.error.HTTPError as e:
             raw = e.read()
             try:
@@ -191,6 +301,13 @@ class Client:
             except ValueError:
                 msg = raw.decode(errors="replace")
             raise CurralError(e.code, msg, e.headers.get("X-Request-Id")) from None
+        if send_context and self._execution_context is not None:
+            want = self._execution_context.get("subject")
+            got = resp.headers.get("X-Curral-Effective-Subject")
+            if want and got != want:
+                resp.close()
+                raise CurralError(502, f"effective subject mismatch: got {got!r}, want {want!r}", resp.headers.get("X-Request-Id"))
+        return resp
 
     @staticmethod
     def _check_truncation(resp, rows: int, asked: int | None = None) -> None:

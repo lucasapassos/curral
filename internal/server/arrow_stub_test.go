@@ -9,8 +9,10 @@ import (
 
 func TestArrowUnavailable(t *testing.T) {
 	ts := newServer(t)
-	r := do(t, ts, "analyst", `{"sql":"SELECT 1","format":"arrow"}`)
-	if r.status != 400 || !strings.Contains(r.body, "duckdb_arrow") {
-		t.Fatalf("status=%d body=%s", r.status, r.body)
+	for _, format := range []string{"arrow", "parquet"} {
+		r := do(t, ts, "analyst", `{"sql":"SELECT 1","format":"`+format+`"}`)
+		if r.status != 501 || !strings.Contains(r.body, "duckdb_arrow") {
+			t.Fatalf("format=%s status=%d body=%s", format, r.status, r.body)
+		}
 	}
 }

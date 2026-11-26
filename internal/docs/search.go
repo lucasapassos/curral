@@ -78,7 +78,12 @@ func (s *Store) Search(q string, f Filter, k int) []Hit {
 	}
 	var total float64
 	df := make(map[string]int, len(qt))
+	eligible := make([]entry, 0, len(s.ids))
 	for _, e := range s.ids {
+		if !e.doc.Matches(f) {
+			continue
+		}
+		eligible = append(eligible, e)
 		total += e.terms.len
 		for _, tok := range qt {
 			if e.terms.tf[tok] > 0 {
@@ -86,16 +91,16 @@ func (s *Store) Search(q string, f Filter, k int) []Hit {
 			}
 		}
 	}
-	n := float64(len(s.ids))
+	if len(eligible) == 0 {
+		return nil
+	}
+	n := float64(len(eligible))
 	avg := total / n
 	if avg == 0 {
 		avg = 1
 	}
-	hits := make([]Hit, 0, len(s.ids))
-	for _, e := range s.ids {
-		if !e.doc.Matches(f) {
-			continue
-		}
+	hits := make([]Hit, 0, len(eligible))
+	for _, e := range eligible {
 		var score float64
 		for _, tok := range qt {
 			tf := e.terms.tf[tok]

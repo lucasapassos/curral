@@ -16,12 +16,19 @@ import (
 	"github.com/lestrrat-go/jwx/v3/jwt"
 )
 
+// TokenAuthenticator validates bearer JWTs and maps them to principals.
+// Both *OIDC and *MultiOIDC implement it.
+type TokenAuthenticator interface {
+	Authenticate(token string) (*Principal, error)
+}
+
 // OIDCConfig configures bearer JWT validation against an OIDC provider.
 type OIDCConfig struct {
 	Issuer     string        // e.g. https://login.example.com/realms/main
 	Audience   string        // required "aud" value
 	UserClaim  string        // claim naming the user; default "sub"
 	RolesClaim string        // claim with roles (string or list); dotted paths allowed, e.g. realm_access.roles
+	RolePrefix string        // optional prefix added to every role from RolesClaim, e.g. "gh:"
 	Skew       time.Duration // clock skew tolerated for exp/nbf/iat
 	HTTPClient *http.Client  // optional
 	// RequireEmailVerified rejects tokens whose email_verified claim is not
@@ -32,6 +39,8 @@ type OIDCConfig struct {
 	// Workspace domain) is one of them.
 	HostedDomains []string
 }
+
+var _ TokenAuthenticator = (*OIDC)(nil)
 
 // OIDC validates JWTs signed by the provider's keys. Keys come from the
 // provider's JWKS, found through OIDC discovery and refreshed in the
@@ -153,6 +162,11 @@ func (o *OIDC) Authenticate(token string) (*Principal, error) {
 				if s, ok := r.(string); ok {
 					p.Roles = append(p.Roles, s)
 				}
+			}
+		}
+		if o.cfg.RolePrefix != "" {
+			for i, r := range p.Roles {
+				p.Roles[i] = o.cfg.RolePrefix + r
 			}
 		}
 	}

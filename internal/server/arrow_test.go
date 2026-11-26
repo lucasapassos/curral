@@ -3,7 +3,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +14,8 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 
 	"github.com/lucasapassos/curral/internal/policy"
 )
@@ -79,5 +84,102 @@ func TestArrowMaxRows(t *testing.T) {
 	}
 	if n != 1500 {
 		t.Fatalf("rows in stream = %d", n)
+	}
+}
+
+func TestParquetOutput(t *testing.T) {
+	ts := newServer(t)
+
+	// 1. format: "parquet" returns valid Parquet bytes readable via pqarrow.
+	r := do(t, ts, "analyst", `{"sql":"SELECT id, amount, 'x' || id AS s FROM orders ORDER BY id","format":"parquet"}`)
+	if r.status != 200 || r.header.Get("Content-Type") != "application/vnd.apache.parquet" ||
+		r.trailer.Get("X-Curral-Row-Count") != "2" {
+		t.Fatalf("status=%d headers=%v trailer=%v", r.status, r.header, r.trailer)
+	}
+	tbl, err := pqarrow.ReadTable(context.Background(), bytes.NewReader([]byte(r.body)), nil, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	if err != nil {
+		t.Fatalf("read parquet: %v", err)
+	}
+	defer tbl.Release()
+	if tbl.NumRows() != 2 || tbl.NumCols() != 3 {
+		t.Fatalf("parquet shape = %dx%d", tbl.NumRows(), tbl.NumCols())
+	}
+	if got := tbl.Schema().String(); !strings.Contains(got, "id: type=int32") || !strings.Contains(got, "amount: type=decimal") {
+		t.Fatalf("schema: %s", got)
+	}
+	idChunk := tbl.Column(0).Data().Chunk(0).(*array.Int32)
+	if idChunk.Value(0) != 1 || idChunk.Value(1) != 2 {
+		t.Fatalf("ids = [%d, %d]", idChunk.Value(0), idChunk.Value(1))
+	}
+	sChunk := tbl.Column(2).Data().Chunk(0).(*array.String)
+	if sChunk.Value(0) != "x1" || sChunk.Value(1) != "x2" {
+		t.Fatalf("strings = [%q, %q]", sChunk.Value(0), sChunk.Value(1))
+	}
+
+	// 2. Accept: application/vnd.apache.parquet selects Parquet without format field.
+	req, err := http.NewRequest("POST", ts.URL+"/v1/query", strings.NewReader(`{"sql":"SELECT id FROM orders ORDER BY id"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth("analyst", "analyst-pw")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/vnd.apache.parquet")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyBytes, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "application/vnd.apache.parquet" {
+		t.Fatalf("accept parquet: status=%d ct=%q", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	tblAccept, err := pqarrow.ReadTable(context.Background(), bytes.NewReader(bodyBytes), nil, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	if err != nil {
+		t.Fatalf("read accept parquet: %v", err)
+	}
+	defer tblAccept.Release()
+	if tblAccept.NumRows() != 2 {
+		t.Fatalf("accept parquet rows = %d", tblAccept.NumRows())
+	}
+
+	// 3. Empty result set produces a valid 0-row Parquet file with schema.
+	emptyRes := do(t, ts, "analyst", `{"sql":"SELECT id, amount FROM orders WHERE 1 = 0","format":"parquet"}`)
+	if emptyRes.status != 200 || emptyRes.header.Get("Content-Type") != "application/vnd.apache.parquet" ||
+		emptyRes.trailer.Get("X-Curral-Row-Count") != "0" {
+		t.Fatalf("empty status=%d headers=%v trailer=%v", emptyRes.status, emptyRes.header, emptyRes.trailer)
+	}
+	tblEmpty, err := pqarrow.ReadTable(context.Background(), bytes.NewReader([]byte(emptyRes.body)), nil, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	if err != nil {
+		t.Fatalf("read empty parquet: %v", err)
+	}
+	defer tblEmpty.Release()
+	if tblEmpty.NumRows() != 0 || tblEmpty.NumCols() != 2 {
+		t.Fatalf("empty parquet shape = %dx%d", tblEmpty.NumRows(), tblEmpty.NumCols())
+	}
+
+	// 4. Runtime error before data and policy denial work as for other formats.
+	if r := do(t, ts, "analyst", `{"sql":"SELECT 'x'::INT FROM orders","format":"parquet"}`); r.status != 400 {
+		t.Fatalf("error before data: %d %s", r.status, r.body)
+	}
+	if r := do(t, ts, "analyst", `{"sql":"SELECT * FROM salaries","format":"parquet"}`); r.status != 403 {
+		t.Fatalf("policy: %d", r.status)
+	}
+
+	// 5. max_rows truncation writes a valid Parquet file with exactly max_rows rows.
+	truncRes := do(t, ts, "analyst", `{"sql":"SELECT * FROM range(100000)","format":"parquet","max_rows":1500}`)
+	if truncRes.status != 200 || truncRes.trailer.Get("X-Curral-Row-Count") != "1500" ||
+		truncRes.trailer.Get("X-Curral-Error") != "row limit reached" {
+		t.Fatalf("trunc status=%d trailer=%v", truncRes.status, truncRes.trailer)
+	}
+	tblTrunc, err := pqarrow.ReadTable(context.Background(), bytes.NewReader([]byte(truncRes.body)), nil, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	if err != nil {
+		t.Fatalf("read truncated parquet: %v", err)
+	}
+	defer tblTrunc.Release()
+	if tblTrunc.NumRows() != 1500 {
+		t.Fatalf("truncated parquet rows = %d", tblTrunc.NumRows())
 	}
 }

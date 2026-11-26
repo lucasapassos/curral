@@ -52,6 +52,16 @@ def test_truncation_warning():
     assert any(issubclass(x.category, TruncatedResultWarning) for x in w)
 
 
+def test_discovery():
+    c = analyst()
+    caps = c.capabilities()
+    assert caps["subject"] == "analyst" and "arrow" in caps["formats"]
+    dbs = c.databases()
+    assert any(d["name"] == "sales" for d in dbs)
+    sch = c.schema(table="orders")
+    assert len(sch["tables"]) == 1 and sch["tables"][0]["name"] == "orders"
+
+
 def test_docs():
     poet = Client(URL, user="poet", password="poet-pw")
     d = poet.create_doc({
@@ -60,9 +70,11 @@ def test_docs():
     })
     assert d["header"]["author"] == "poet" and d.etag
     try:
-        assert any(x["id"] == d["id"] for x in analyst().docs(table="orders", headers_only=True))
-        found = analyst().search_docs("gross order amount", table="orders", limit=1)
+        listed = analyst().docs(tables=["orders"], headers_only=True, access=True)
+        assert listed and any(x["id"] == d["id"] and "sales.main.orders" in x["accessible_tables"] for x in listed)
+        found = analyst().search_docs("gross order amount", tables=["orders"], limit=1, access=True)
         assert found["results"][0]["doc"]["id"] == d["id"]
+        assert "sales.main.orders" in found["results"][0]["doc"]["accessible_tables"]
         with pytest.raises(CurralError) as e:
             analyst().patch_doc(d["id"], {"header": {"title": "x"}})
         assert e.value.status == 403

@@ -105,6 +105,16 @@ func (e *Engine) InvalidateSchema() {
 	e.WarmSchema()
 }
 
+// SchemaGen returns a monotonic counter bumped whenever DDL invalidates the
+// schema cache.
+func (e *Engine) SchemaGen() uint64 {
+	c := &e.schema
+	c.mu.Lock()
+	g := c.gen
+	c.mu.Unlock()
+	return g
+}
+
 // WarmSchema loads the schema snapshot in the background unless a load is
 // already running.
 func (e *Engine) WarmSchema() {

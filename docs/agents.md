@@ -25,6 +25,21 @@ PowerShell). With it, an agent:
 Everything the HTTP API offers is reachable through the skill, so no SDK is
 required.
 
+## Native MCP server (`curral mcp` and `POST /mcp`)
+
+For clients that speak the Model Context Protocol (Claude Desktop, Cursor,
+Windsurf, or agents without shell access), curral supports MCP in two modes:
+
+- **Stdio bridge (`curral mcp`):** runs locally in the agent host, reads
+  `CURRAL_URL` and credentials from the environment or `~/.config/curral/credentials`,
+  and forwards tool calls (`curral_capabilities`, `curral_schema`,
+  `curral_search_docs`, `curral_get_doc`, `curral_dry_run`, `curral_query`)
+  over HTTP without exposing secrets in the conversation.
+- **Streamable HTTP (`--mcp` -> `POST /mcp`):** served directly by `curral serve`
+  under the same authentication, brute-force lockouts, execution delegation
+  (`X-Curral-Execution-Context`), OPA policy, row filters, column masks and
+  fail-closed audit log as `/v1/*`.
+
 ## Zero install: the server hands out the skill
 
 Every running server serves the skill's documentation at `GET /skill/...`
@@ -110,10 +125,12 @@ difference between an agent that guesses and one that knows:
   them with the user's question (`POST /v1/docs/search`) before writing SQL.
   Grant `docs_allow` to the people (or agents) who should write them, and
   read access to the tables they document; the example policy has a `poet`
-  role for that. Every authenticated user reads every document, whatever
-  tables they may query, so documents should describe meaning, not values
-  or other roles' filters. With `--jev-key`, search is ranked by a model
-  instead of word overlap.
+  role for that. Under the default `--docs-scope all`, every authenticated
+  user reads every document, whatever tables they may query; set
+  `--docs-scope schema` to restrict documents naming tables or schemas to
+  callers who may query at least one of them. Either way, documents should
+  describe meaning, not row values or other roles' filters. With `--jev-key`,
+  search is ranked by a model instead of word overlap.
 - **Limits.** `--max-rows` and per-role `max_rows`/`timeout` keep an
   exploring agent from pulling a table through the API; the client reports a
   cut result with exit code 3 and the skill aggregates in SQL instead.

@@ -158,3 +158,23 @@ func TestCredentialExpiryParsing(t *testing.T) {
 		t.Fatal("no expiry expected")
 	}
 }
+
+func TestSweepEvictsExpired(t *testing.T) {
+	p, _ := setup(t, 25*time.Millisecond, echo)
+	get(t, p.URL()+"/v1/a", "tok")
+	get(t, p.URL()+"/v1/b", "tok")
+	p.mu.RLock()
+	before := len(p.entries)
+	p.mu.RUnlock()
+	if before != 2 {
+		t.Fatalf("before=%d", before)
+	}
+	time.Sleep(40 * time.Millisecond)
+	p.Sweep()
+	p.mu.RLock()
+	after, bytes := len(p.entries), p.bytes
+	p.mu.RUnlock()
+	if after != 0 || bytes != 0 {
+		t.Fatalf("after sweep: entries=%d bytes=%d", after, bytes)
+	}
+}

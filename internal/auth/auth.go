@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -51,6 +52,9 @@ type cacheEntry struct {
 	expires time.Time
 }
 
+// maxAuthCache caps cached password verifications in memory.
+const maxAuthCache = 4096
+
 // Authenticator checks bcrypt hashes and caches successful verifications so
 // repeated requests do not pay bcrypt's cost (tens of ms) every time.
 type Authenticator struct {
@@ -62,6 +66,7 @@ type Authenticator struct {
 	bcryptSlots chan struct{}
 	ttl         time.Duration
 	cache       sync.Map // [32]byte -> cacheEntry
+	cacheCount  atomic.Int64
 	dummy       []byte
 }
 
@@ -91,7 +96,9 @@ func (a *Authenticator) Authenticate(user, pass string) *Principal {
 		if time.Now().Before(e.expires) {
 			return e.p
 		}
-		a.cache.Delete(key)
+		if _, loaded := a.cache.LoadAndDelete(key); loaded {
+			a.cacheCount.Add(-1)
+		}
 	}
 
 	a.bcryptSlots <- struct{}{}
@@ -105,10 +112,28 @@ func (a *Authenticator) Authenticate(user, pass string) *Principal {
 		return nil
 	}
 	p := &Principal{Name: u.Name, Roles: u.Roles, Method: MethodBasic}
-	if a.ttl > 0 {
-		a.cache.Store(key, cacheEntry{p: p, expires: time.Now().Add(a.ttl)})
+	if a.ttl > 0 && a.cacheCount.Load() < maxAuthCache {
+		if _, loaded := a.cache.Swap(key, cacheEntry{p: p, expires: time.Now().Add(a.ttl)}); !loaded {
+			a.cacheCount.Add(1)
+		}
 	}
 	return p
+}
+
+// Sweep removes expired entries from the password cache.
+func (a *Authenticator) Sweep() {
+	if a == nil || a.ttl <= 0 {
+		return
+	}
+	now := time.Now()
+	a.cache.Range(func(k, v any) bool {
+		if !now.Before(v.(cacheEntry).expires) {
+			if _, loaded := a.cache.LoadAndDelete(k); loaded {
+				a.cacheCount.Add(-1)
+			}
+		}
+		return true
+	})
 }
 
 type apiKey struct {

@@ -28,10 +28,11 @@ import (
 type Format string
 
 const (
-	CSV    Format = "csv"
-	JSON   Format = "json"
-	NDJSON Format = "ndjson"
-	Arrow  Format = "arrow" // Arrow IPC stream; written by the engine, not here
+	CSV     Format = "csv"
+	JSON    Format = "json"
+	NDJSON  Format = "ndjson"
+	Arrow   Format = "arrow"   // Arrow IPC stream; written by the engine, not here
+	Parquet Format = "parquet" // Apache Parquet; written by the engine, not here
 )
 
 // ParseFormat accepts a format name or a media type.
@@ -45,6 +46,8 @@ func ParseFormat(s string) (Format, bool) {
 		return NDJSON, true
 	case "arrow", "application/vnd.apache.arrow.stream":
 		return Arrow, true
+	case "parquet", "application/vnd.apache.parquet":
+		return Parquet, true
 	}
 	return "", false
 }
@@ -57,6 +60,8 @@ func (f Format) ContentType() string {
 		return "application/x-ndjson"
 	case Arrow:
 		return "application/vnd.apache.arrow.stream"
+	case Parquet:
+		return "application/vnd.apache.parquet"
 	}
 	return "application/json"
 }

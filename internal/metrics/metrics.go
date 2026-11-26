@@ -15,7 +15,7 @@ import (
 // engine's slots, the audit writer, catalog caches) are not duplicated.
 type Sources struct {
 	Load        func() (running, waiting, limit int)
-	CacheStats  func(database string) (hits, misses int64, ok bool)
+	CacheStats  func(database string) (hits, misses, passthrough int64, ok bool)
 	CachedDBs   []string
 	AuditStats  func() (written, dropped int64, healthy bool) // nil: audit disabled
 	PolicySHA   func() string                                 // hash of the policy in effect
@@ -23,19 +23,25 @@ type Sources struct {
 }
 
 type Metrics struct {
-	reg       *prometheus.Registry
-	requests  *prometheus.CounterVec
-	decisions *prometheus.CounterVec
-	stage     *prometheus.HistogramVec
-	rows      prometheus.Counter
-	bytes     prometheus.Counter
-	authFail  *prometheus.CounterVec
-	reloads   *prometheus.CounterVec
-	lockouts  *prometheus.CounterVec
-	blocked   *prometheus.CounterVec
-	throttled prometheus.Counter
-	rewritten prometheus.Counter
-	policy    *policyCollector
+	reg        *prometheus.Registry
+	requests   *prometheus.CounterVec
+	decisions  *prometheus.CounterVec
+	stage      *prometheus.HistogramVec
+	rows       prometheus.Counter
+	bytes      prometheus.Counter
+	authFail   *prometheus.CounterVec
+	reloads    *prometheus.CounterVec
+	lockouts   *prometheus.CounterVec
+	blocked    *prometheus.CounterVec
+	throttled  prometheus.Counter
+	rewritten  prometheus.Counter
+	schemaReqs *prometheus.CounterVec
+	schemaDur  prometheus.Histogram
+	searchReqs *prometheus.CounterVec
+	searchDur  *prometheus.HistogramVec
+	jevReqs    *prometheus.CounterVec
+	jevDur     prometheus.Histogram
+	policy     *policyCollector
 }
 
 // SetPolicySource sets where curral_policy_info reads the current hash.
@@ -97,8 +103,33 @@ func New(src Sources) *Metrics {
 		reloads: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "curral_config_reloads_total", Help: "Users/policy reloads (SIGHUP) by result (ok, error).",
 		}, []string{"result"}),
+		schemaReqs: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "curral_schema_requests_total", Help: "Schema listing requests (/v1/schema) by HTTP status.",
+		}, []string{"status"}),
+		schemaDur: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "curral_schema_duration_seconds",
+			Help:    "Duration of /v1/schema requests.",
+			Buckets: []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
+		}),
+		searchReqs: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "curral_docs_search_requests_total", Help: "Semantic document searches (/v1/docs/search) by ranker and HTTP status.",
+		}, []string{"ranker", "status"}),
+		searchDur: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "curral_docs_search_duration_seconds",
+			Help:    "Duration of /v1/docs/search requests by ranker.",
+			Buckets: []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
+		}, []string{"ranker"}),
+		jevReqs: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "curral_jev_judgments_total", Help: "Jev reranker document judgments by result (ok, error).",
+		}, []string{"result"}),
+		jevDur: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "curral_jev_duration_seconds",
+			Help:    "Duration of Jev reranker batches.",
+			Buckets: []float64{.01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
+		}),
 	}
 	reg.MustRegister(m.requests, m.decisions, m.stage, m.rows, m.bytes, m.authFail, m.reloads, m.lockouts, m.blocked, m.throttled, m.rewritten,
+		m.schemaReqs, m.schemaDur, m.searchReqs, m.searchDur, m.jevReqs, m.jevDur,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	if src.Load != nil {
@@ -132,7 +163,7 @@ func New(src Sources) *Metrics {
 	if src.CacheStats != nil && len(src.CachedDBs) > 0 {
 		reg.MustRegister(&cacheCollector{src: src, desc: prometheus.NewDesc(
 			"curral_catalog_cache_requests_total",
-			"Catalog metadata cache lookups by database and result (hit, miss).",
+			"Catalog metadata cache lookups by database and result (hit, miss, passthrough).",
 			[]string{"database", "result"}, nil)})
 	}
 	m.policy = &policyCollector{sha: src.PolicySHA, desc: prometheus.NewDesc(
@@ -172,12 +203,13 @@ func (c *cacheCollector) Describe(ch chan<- *prometheus.Desc) { ch <- c.desc }
 
 func (c *cacheCollector) Collect(ch chan<- prometheus.Metric) {
 	for _, db := range c.src.CachedDBs {
-		hits, misses, ok := c.src.CacheStats(db)
+		hits, misses, passthrough, ok := c.src.CacheStats(db)
 		if !ok {
 			continue
 		}
 		ch <- prometheus.MustNewConstMetric(c.desc, prometheus.CounterValue, float64(hits), db, "hit")
 		ch <- prometheus.MustNewConstMetric(c.desc, prometheus.CounterValue, float64(misses), db, "miss")
+		ch <- prometheus.MustNewConstMetric(c.desc, prometheus.CounterValue, float64(passthrough), db, "passthrough")
 	}
 }
 
@@ -247,6 +279,32 @@ func (m *Metrics) AuthBlocked(scope string) {
 func (m *Metrics) AuthFailure(method string) {
 	if m != nil {
 		m.authFail.WithLabelValues(method).Inc()
+	}
+}
+
+func (m *Metrics) ObserveSchema(status string, d time.Duration) {
+	if m != nil {
+		m.schemaReqs.WithLabelValues(status).Inc()
+		m.schemaDur.Observe(d.Seconds())
+	}
+}
+
+func (m *Metrics) ObserveDocsSearch(ranker, status string, d time.Duration) {
+	if m != nil {
+		m.searchReqs.WithLabelValues(ranker, status).Inc()
+		m.searchDur.WithLabelValues(ranker).Observe(d.Seconds())
+	}
+}
+
+func (m *Metrics) ObserveJev(okCount, errCount int, d time.Duration) {
+	if m != nil {
+		if okCount > 0 {
+			m.jevReqs.WithLabelValues("ok").Add(float64(okCount))
+		}
+		if errCount > 0 {
+			m.jevReqs.WithLabelValues("error").Add(float64(errCount))
+		}
+		m.jevDur.Observe(d.Seconds())
 	}
 }
 

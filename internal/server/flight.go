@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -33,6 +34,9 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/lucasapassos/curral/internal/auth"
 	"github.com/lucasapassos/curral/internal/engine"
@@ -49,7 +53,12 @@ func (s *Server) Flight(tlsConf *tls.Config) (*grpc.Server, error) {
 	if !engine.ArrowAvailable {
 		return nil, errors.New("flight sql needs a build with -tags duckdb_arrow")
 	}
-	f := &flightServer{s: s, sessions: auth.NewSessions(FlightSessionTTL)}
+	f := &flightServer{
+		s:         s,
+		sessions:  auth.NewSessions(FlightSessionTTL),
+		active:    map[string]activeFlight{},
+		inspCache: newInspCache(256, 30*time.Second),
+	}
 	for id, v := range map[flightsql.SqlInfo]any{
 		flightsql.SqlInfoFlightSqlServerName:         "curral",
 		flightsql.SqlInfoFlightSqlServerVersion:      s.Version,
@@ -60,7 +69,7 @@ func (s *Server) Flight(tlsConf *tls.Config) (*grpc.Server, error) {
 		// Each statement runs in its own transaction.
 		flightsql.SqlInfoFlightSqlServerTransaction: int32(flightsql.SqlTransactionNone),
 		flightsql.SqlInfoTransactionsSupported:      false,
-		flightsql.SqlInfoFlightSqlServerCancel:      false,
+		flightsql.SqlInfoFlightSqlServerCancel:      true,
 		flightsql.SqlInfoDDLCatalog:                 false,
 		flightsql.SqlInfoDDLSchema:                  true,
 		flightsql.SqlInfoDDLTable:                   true,
@@ -93,8 +102,104 @@ func (s *Server) Flight(tlsConf *tls.Config) (*grpc.Server, error) {
 
 type flightServer struct {
 	flightsql.BaseServer
-	s        *Server
-	sessions *auth.Sessions
+	s         *Server
+	sessions  *auth.Sessions
+	mu        sync.Mutex
+	active    map[string]activeFlight
+	inspCache *inspCache
+}
+
+type activeFlight struct {
+	owner  string
+	runID  string
+	cancel context.CancelFunc
+}
+
+type inspCacheKey struct {
+	sql      string
+	database string
+}
+
+type inspCacheEntry struct {
+	insp    engine.Inspection
+	gen     uint64
+	expires time.Time
+}
+
+// inspCache is a short-lived bounded cache of resolved engine.Inspection
+// values from CreatePreparedStatement so DoGetPreparedStatement can skip a
+// duplicate EXPLAIN. Policy, RLS, masks, and limits are ALWAYS re-evaluated on
+// every execution; DDL invalidates the cache via both clear() and SchemaGen().
+type inspCache struct {
+	mu      sync.Mutex
+	max     int
+	ttl     time.Duration
+	entries map[inspCacheKey]inspCacheEntry
+}
+
+func newInspCache(max int, ttl time.Duration) *inspCache {
+	return &inspCache{max: max, ttl: ttl, entries: map[inspCacheKey]inspCacheEntry{}}
+}
+
+func (c *inspCache) get(sql, database string, gen uint64) (*engine.Inspection, bool) {
+	if c == nil {
+		return nil, false
+	}
+	k := inspCacheKey{sql: sql, database: database}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[k]
+	if !ok {
+		return nil, false
+	}
+	if e.gen != gen || time.Now().After(e.expires) {
+		delete(c.entries, k)
+		return nil, false
+	}
+	cp := e.insp
+	return &cp, true
+}
+
+func (c *inspCache) put(sql, database string, insp engine.Inspection, gen uint64) {
+	if c == nil || c.max <= 0 {
+		return
+	}
+	now := time.Now()
+	k := inspCacheKey{sql: sql, database: database}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.entries[k]; !exists && len(c.entries) >= c.max {
+		// Evict expired entries first; if still full, evict one entry.
+		for ek, ev := range c.entries {
+			if now.After(ev.expires) {
+				delete(c.entries, ek)
+			}
+		}
+		if len(c.entries) >= c.max {
+			for ek := range c.entries {
+				delete(c.entries, ek)
+				break
+			}
+		}
+	}
+	c.entries[k] = inspCacheEntry{insp: insp, gen: gen, expires: now.Add(c.ttl)}
+}
+
+func (c *inspCache) clear() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	clear(c.entries)
+	c.mu.Unlock()
+}
+
+func isDDLStatement(stmtType string) bool {
+	switch strings.ToUpper(stmtType) {
+	case "CREATE", "DROP", "ALTER":
+		return true
+	}
+	return false
 }
 
 // flightCall is an authenticated Flight SQL call.
@@ -234,12 +339,17 @@ func (f *flightServer) SetSessionOptions(ctx context.Context, req *flight.SetSes
 		}
 		cookie := &http.Cookie{Name: catalogCookie, Path: "/", MaxAge: -1} // unset: delete it
 		if v.GetOptionValue() != nil {
-			i := slices.IndexFunc(f.s.Engine.Databases(), func(d engine.DatabaseInfo) bool { return strings.EqualFold(d.Name, v.GetStringValue()) })
+			c := callOf(ctx)
+			dbs, code, msg := f.s.listDatabases(ctx, c.p, nil)
+			if code != http.StatusOK {
+				return nil, status.Error(grpcCode(code), msg)
+			}
+			i := slices.IndexFunc(dbs, func(d engine.DatabaseInfo) bool { return strings.EqualFold(d.Name, v.GetStringValue()) })
 			if i < 0 {
 				res.Errors[name] = &flight.SetSessionOptionsResultError{Value: flight.SetSessionOptionsResultErrorInvalidValue}
 				continue
 			}
-			cookie = &http.Cookie{Name: catalogCookie, Path: "/", Value: base64.RawURLEncoding.EncodeToString([]byte(f.s.Engine.Databases()[i].Name))}
+			cookie = &http.Cookie{Name: catalogCookie, Path: "/", Value: base64.RawURLEncoding.EncodeToString([]byte(dbs[i].Name))}
 		}
 		if err := grpc.SetHeader(ctx, metadata.Pairs("set-cookie", cookie.String())); err != nil {
 			return nil, err
@@ -274,6 +384,7 @@ func (f *flightServer) CloseSession(ctx context.Context, _ *flight.CloseSessionR
 // so the server keeps no state between calls. It grants nothing: whoever
 // redeems it runs it with their own credentials and policy.
 type flightStatement struct {
+	ID       string        `json:"id,omitempty"`
 	SQL      string        `json:"sql"`
 	Database string        `json:"database,omitempty"`
 	Params   []flightParam `json:"params,omitempty"`
@@ -295,7 +406,7 @@ func (f *flightServer) newStatement(ctx context.Context, query string, txn []byt
 	if strings.TrimSpace(query) == "" {
 		return flightStatement{}, status.Error(codes.InvalidArgument, "sql is required")
 	}
-	return flightStatement{SQL: query, Database: callOf(ctx).database}, nil
+	return flightStatement{ID: newRequestID(), SQL: query, Database: callOf(ctx).database}, nil
 }
 
 func decodeStatement(handle []byte) (flightStatement, error) {
@@ -408,10 +519,111 @@ func paramOf(col arrow.Array, i int) flightParam {
 	return flightParam{"string", col.ValueStr(i)}
 }
 
+func activeKeyFor(_ []byte, st flightStatement) string {
+	return st.ID
+}
+
+// extractTicketHandle pulls the opaque statement handle out of a Flight SQL
+// ticket (either TicketStatementQuery or CommandPreparedStatementQuery, both
+// wrapped in google.protobuf.Any with the handle in field 1).
+func extractTicketHandle(raw []byte) []byte {
+	var a anypb.Any
+	if err := proto.Unmarshal(raw, &a); err == nil && len(a.Value) > 0 {
+		b := a.Value
+		for len(b) > 0 {
+			num, typ, n := protowire.ConsumeTag(b)
+			if n < 0 {
+				break
+			}
+			b = b[n:]
+			if num == 1 && typ == protowire.BytesType {
+				v, m := protowire.ConsumeBytes(b)
+				if m >= 0 {
+					return v
+				}
+				break
+			}
+			m := protowire.ConsumeFieldValue(num, typ, b)
+			if m < 0 {
+				break
+			}
+			b = b[m:]
+		}
+	}
+	return raw
+}
+
+func ticketKey(raw []byte) string {
+	h := extractTicketHandle(raw)
+	if st, err := decodeStatement(h); err == nil {
+		return activeKeyFor(h, st)
+	}
+	return string(h)
+}
+
+func (f *flightServer) registerActive(key, owner, runID string, cancel context.CancelFunc) {
+	if key == "" {
+		return
+	}
+	f.mu.Lock()
+	if existing, ok := f.active[key]; !ok || existing.owner == owner {
+		f.active[key] = activeFlight{owner: owner, runID: runID, cancel: cancel}
+	}
+	f.mu.Unlock()
+}
+
+func (f *flightServer) unregisterActive(key, runID string) {
+	if key == "" {
+		return
+	}
+	f.mu.Lock()
+	if existing, ok := f.active[key]; ok && existing.runID == runID {
+		delete(f.active, key)
+	}
+	f.mu.Unlock()
+}
+
+// CancelFlightInfo cancels an in-flight Flight SQL query belonging to the
+// caller. Multi-tenant isolation: a caller may only cancel its own queries;
+// attempting to cancel another user's query returns PermissionDenied without
+// disturbing the running query.
+func (f *flightServer) CancelFlightInfo(ctx context.Context, req *flight.CancelFlightInfoRequest) (flight.CancelFlightInfoResult, error) {
+	c := callOf(ctx)
+	if req == nil || req.GetInfo() == nil {
+		return flight.CancelFlightInfoResult{Status: flight.CancelStatusNotCancellable}, nil
+	}
+	var cancelled bool
+	for _, ep := range req.GetInfo().GetEndpoint() {
+		raw := ep.GetTicket().GetTicket()
+		if len(raw) == 0 {
+			continue
+		}
+		key := ticketKey(raw)
+		f.mu.Lock()
+		entry, ok := f.active[key]
+		if ok && entry.owner != c.p.Name {
+			f.mu.Unlock()
+			return flight.CancelFlightInfoResult{}, status.Error(codes.PermissionDenied, "cannot cancel another user's query")
+		}
+		if ok {
+			delete(f.active, key)
+			cancelled = true
+		}
+		f.mu.Unlock()
+		if ok {
+			entry.cancel()
+		}
+	}
+	if cancelled {
+		return flight.CancelFlightInfoResult{Status: flight.CancelStatusCancelled}, nil
+	}
+	return flight.CancelFlightInfoResult{Status: flight.CancelStatusNotCancellable}, nil
+}
+
 // query runs st for the call and streams the result. Its schema is only
 // known once the statement runs, so this returns when the first result
 // arrives or the statement fails.
-func (f *flightServer) query(ctx context.Context, st flightStatement) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+func (f *flightServer) query(ctx context.Context, activeKey string, st flightStatement, cached *engine.Inspection) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	c := callOf(ctx)
 	args, err := st.args()
 	if err != nil {
@@ -421,6 +633,10 @@ func (f *flightServer) query(ctx context.Context, st flightStatement) (*arrow.Sc
 	f.s.setSQL(ev, st.SQL)
 	ev.ParamsCount, ev.Database = len(args), st.Database
 
+	qctx, cancel := context.WithCancel(ctx)
+	runID := newRequestID()
+	f.registerActive(activeKey, c.p.Name, runID, cancel)
+
 	type start struct {
 		schema *arrow.Schema
 		err    error
@@ -428,10 +644,15 @@ func (f *flightServer) query(ctx context.Context, st flightStatement) (*arrow.Sc
 	first := make(chan start, 1)
 	chunks := make(chan flight.StreamChunk)
 	go func() {
-		defer close(chunks)
+		defer func() {
+			f.unregisterActive(activeKey, runID)
+			cancel()
+			close(chunks)
+		}()
 		started := false
-		run := f.s.runQuery(ctx, c.p, ev, queryCall{
+		run := f.s.runQuery(qctx, c.p, ev, queryCall{
 			sql: st.SQL, params: args, database: st.Database, format: "flight",
+			cachedInsp: cached,
 			sink: resultSink{
 				records: func(_ engine.Inspection, maxRows int64, rr array.RecordReader) (int64, int64, error) {
 					started = true
@@ -443,9 +664,9 @@ func (f *flightServer) query(ctx context.Context, st flightStatement) (*arrow.Sc
 						select {
 						case chunks <- flight.StreamChunk{Data: rec}:
 							return nil
-						case <-ctx.Done():
+						case <-qctx.Done():
 							rec.Release()
-							return ctx.Err()
+							return qctx.Err()
 						}
 					})
 					return n, bytes, err
@@ -515,6 +736,9 @@ func (f *flightServer) update(ctx context.Context, st flightStatement) (int64, e
 	if run.err != nil {
 		return 0, flightError(run)
 	}
+	if isDDLStatement(run.insp.StatementType) {
+		f.inspCache.clear()
+	}
 	return count, nil
 }
 
@@ -578,11 +802,12 @@ func (f *flightServer) GetFlightInfoStatement(ctx context.Context, cmd flightsql
 }
 
 func (f *flightServer) DoGetStatement(ctx context.Context, tkt flightsql.StatementQueryTicket) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	st, err := decodeStatement(tkt.GetStatementHandle())
+	handle := tkt.GetStatementHandle()
+	st, err := decodeStatement(handle)
 	if err != nil {
 		return nil, nil, err
 	}
-	return f.query(ctx, st)
+	return f.query(ctx, activeKeyFor(handle, st), st, nil)
 }
 
 func (f *flightServer) DoPutCommandStatementUpdate(ctx context.Context, cmd flightsql.StatementUpdate) (int64, error) {
@@ -649,6 +874,9 @@ func (f *flightServer) describe(ctx context.Context, st flightStatement) (engine
 	if run.err != nil {
 		return d, flightError(run)
 	}
+	if run.insp.Resolved && !isDDLStatement(run.insp.StatementType) {
+		f.inspCache.put(st.SQL, st.Database, run.insp, f.s.Engine.SchemaGen())
+	}
 	return d, nil
 }
 
@@ -664,11 +892,13 @@ func (f *flightServer) GetFlightInfoPreparedStatement(_ context.Context, cmd fli
 }
 
 func (f *flightServer) DoGetPreparedStatement(ctx context.Context, cmd flightsql.PreparedStatementQuery) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	st, err := decodeStatement(cmd.GetPreparedStatementHandle())
+	handle := cmd.GetPreparedStatementHandle()
+	st, err := decodeStatement(handle)
 	if err != nil {
 		return nil, nil, err
 	}
-	return f.query(ctx, st)
+	cached, _ := f.inspCache.get(st.SQL, st.Database, f.s.Engine.SchemaGen())
+	return f.query(ctx, activeKeyFor(handle, st), st, cached)
 }
 
 // DoPutPreparedStatementQuery binds parameters by returning a new handle
@@ -792,10 +1022,15 @@ func (f *flightServer) GetFlightInfoCatalogs(_ context.Context, desc *flight.Fli
 	return info(desc, schema_ref.Catalogs), nil
 }
 
-// DoGetCatalogs lists the attached databases, as GET /v1/databases does.
-func (f *flightServer) DoGetCatalogs(context.Context) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+// DoGetCatalogs lists the attached databases the caller may access, as GET /v1/databases does.
+func (f *flightServer) DoGetCatalogs(ctx context.Context) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	c := callOf(ctx)
+	dbs, code, msg := f.s.listDatabases(ctx, c.p, f.s.event(c.caller, "databases", c.p))
+	if code != http.StatusOK {
+		return nil, nil, status.Error(grpcCode(code), msg)
+	}
 	return batch(schema_ref.Catalogs, func(b *array.RecordBuilder) {
-		for _, d := range f.s.Engine.Databases() {
+		for _, d := range dbs {
 			b.Field(0).(*array.StringBuilder).Append(d.Name)
 		}
 	})

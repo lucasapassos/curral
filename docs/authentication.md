@@ -34,6 +34,26 @@ curral serve ... --oidc-issuer https://sso.example.com/realms/main --oidc-audien
   --oidc-user-claim preferred_username --oidc-roles-claim realm_access.roles
 ```
 
+### Multiple OIDC providers (`--oidc-providers`)
+
+To accept JWTs from more than one identity provider at the same time (for example, Google Workspace for users and GitHub Actions or Kubernetes ServiceAccounts for pipelines), pass `--oidc-providers providers.yaml` instead of `--oidc-issuer`:
+
+```yaml
+providers:
+  - issuer: https://accounts.google.com
+    audience: <CLIENT_ID>.apps.googleusercontent.com
+    user_claim: email
+    require_email_verified: true
+    hosted_domains: [example.com]
+  - issuer: https://token.actions.githubusercontent.com
+    audience: curral
+    user_claim: sub
+    roles_claim: job_workflow_ref
+    role_prefix: "gh:"
+```
+
+Each incoming JWT is dispatched strictly by its `iss` claim to the matching provider and cryptographically verified only against that provider's JWKS, `iss`, `aud`, `exp`, and `nbf`. Unknown issuers are rejected immediately, and `role_prefix` isolates role namespaces between providers.
+
 ### Roles by identity (`identities:`)
 
 Some providers send no roles in the token (Google, for instance). The

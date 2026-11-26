@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"strconv"
+	"time"
 
 	"github.com/lucasapassos/curral/internal/auth"
 	"github.com/lucasapassos/curral/internal/docs"
@@ -56,6 +58,11 @@ type searchResponse struct {
 }
 
 func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
+	start := time.Now()
+	ranker := "bm25"
+	if s.Judge != nil {
+		ranker = "jev"
+	}
 	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.MaxBody))
 	if err != nil {
 		status := http.StatusBadRequest
@@ -63,6 +70,7 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, p *auth.Prin
 		if errors.As(err, &tooLarge) {
 			status = http.StatusRequestEntityTooLarge
 		}
+		s.Metrics.ObserveDocsSearch(ranker, strconv.Itoa(status), time.Since(start))
 		writeError(w, status, "invalid request body: "+err.Error())
 		return
 	}
@@ -70,17 +78,21 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, p *auth.Prin
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&in); err != nil {
+		s.Metrics.ObserveDocsSearch(ranker, strconv.Itoa(http.StatusBadRequest), time.Since(start))
 		writeError(w, http.StatusBadRequest, "invalid search request: "+err.Error())
 		return
 	}
 	switch {
 	case len(docs.Tokenize(in.Q)) == 0:
+		s.Metrics.ObserveDocsSearch(ranker, strconv.Itoa(http.StatusBadRequest), time.Since(start))
 		writeError(w, http.StatusBadRequest, "q is required")
 		return
 	case in.Limit < 0 || in.Limit > maxSearchLimit:
+		s.Metrics.ObserveDocsSearch(ranker, strconv.Itoa(http.StatusBadRequest), time.Since(start))
 		writeError(w, http.StatusBadRequest, "limit must be between 1 and 50")
 		return
 	case in.Fields != "" && in.Fields != "full" && in.Fields != "header":
+		s.Metrics.ObserveDocsSearch(ranker, strconv.Itoa(http.StatusBadRequest), time.Since(start))
 		writeError(w, http.StatusBadRequest, "fields must be full or header")
 		return
 	}
@@ -94,11 +106,13 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, p *auth.Prin
 		f.Schemas, err = nameFilter("schema", in.Schema, in.Schemas)
 	}
 	if err != nil {
+		s.Metrics.ObserveDocsSearch(ranker, strconv.Itoa(http.StatusBadRequest), time.Since(start))
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	a, status, msg := s.docAccess(r, p, in.Access)
 	if status != http.StatusOK {
+		s.Metrics.ObserveDocsSearch(ranker, strconv.Itoa(status), time.Since(start))
 		writeSchemaError(w, status, msg)
 		return
 	}
@@ -115,6 +129,7 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, p *auth.Prin
 				out.Results = append(out.Results, hit(h.Score, false, h.Doc))
 			}
 		}
+		s.Metrics.ObserveDocsSearch(ranker, strconv.Itoa(http.StatusOK), time.Since(start))
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
@@ -131,7 +146,9 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, p *auth.Prin
 	for i, h := range hits {
 		ds[i] = h.Doc
 	}
+	jevStart := time.Now()
 	js := s.Judge.Judge(r.Context(), in.Q, ds)
+	jevDur := time.Since(jevStart)
 
 	// A document the Judge could not rate keeps its BM25 place after the
 	// judged matches rather than failing the search.
@@ -151,6 +168,9 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, p *auth.Prin
 		case j.P >= s.SearchFloor:
 			weak = append(weak, hit(j.P, true, h.Doc))
 		}
+	}
+	if len(hits) > 0 {
+		s.Metrics.ObserveJev(len(hits)-failed, failed, jevDur)
 	}
 	if failed > 1 {
 		s.Log.Warn("document search: judge failed for several documents", "failed", failed, "candidates", len(hits))
@@ -177,5 +197,6 @@ func (s *Server) searchDocs(w http.ResponseWriter, r *http.Request, p *auth.Prin
 	if out.Results == nil {
 		out.Results = []searchHit{}
 	}
+	s.Metrics.ObserveDocsSearch(ranker, strconv.Itoa(http.StatusOK), time.Since(start))
 	writeJSON(w, http.StatusOK, out)
 }

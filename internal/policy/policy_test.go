@@ -84,10 +84,17 @@ func TestLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	l, err := p.Limits(ctx, input([]string{"analyst"}, "SELECT", nil, nil, true))
-	if err != nil || l.Timeout != 30*time.Second || l.MaxRows != 10000 {
+	if err != nil || l.Timeout != 30*time.Second || l.MaxRows != 10000 || l.MaxConcurrency != 2 {
 		t.Fatalf("analyst limits = %+v, %v", l, err)
 	}
-	for _, roles := range [][]string{{"admin"}, {"etl"}} {
+	// Multi-role users keep the strictest limits of their roles (never silently dropped).
+	for _, roles := range [][]string{{"analyst", "poet"}, {"analyst", "etl"}} {
+		ml, err := p.Limits(ctx, input(roles, "SELECT", nil, nil, true))
+		if err != nil || ml.Timeout != 30*time.Second || ml.MaxRows != 10000 || ml.MaxConcurrency != 2 {
+			t.Fatalf("%v limits = %+v, %v", roles, ml, err)
+		}
+	}
+	for _, roles := range [][]string{{"admin"}, {"admin", "analyst"}, {"etl"}} {
 		if l, err := p.Limits(ctx, input(roles, "SELECT", nil, nil, true)); err != nil || l != (Limits{}) {
 			t.Fatalf("%v limits = %+v, %v", roles, l, err)
 		}
@@ -151,7 +158,18 @@ func TestMasks(t *testing.T) {
 	os.WriteFile(f, []byte(`package curral
 import rego.v1
 allow := true
-masks := {"lake.s.pii": {"cpf": "last:2", "nome": "redact", "dn": "null", "email": {"sql": "'x@' || 'y'"}}} if not "pii_reader" in input.roles
+masks := {
+	"lake.s.pii": {
+		"cpf": "last:2",
+		"nome": "redact",
+		"dn": "null",
+		"email": {"sql": "'x@' || 'y'"},
+		"uid": "hash",
+		"contact": "email",
+		"code": "first:3",
+		"empty_prefix": "first:0",
+	},
+} if not "pii_reader" in input.roles
 `), 0o600)
 	p, err := LoadQueries(ctx, []string{f}, Queries{Allow: "data.curral.allow", Masks: "data.curral.masks"})
 	if err != nil {
@@ -162,19 +180,26 @@ masks := {"lake.s.pii": {"cpf": "last:2", "nome": "redact", "dn": "null", "email
 		t.Fatal(err)
 	}
 	want := map[string]string{
-		"cpf": `'***' || right(CAST("cpf" AS VARCHAR), 2)`, "nome": "'***'",
-		"dn": `CASE WHEN false THEN "dn" END`, "email": "'x@' || 'y'",
+		"cpf":          `'***' || right(CAST("cpf" AS VARCHAR), 2)`,
+		"nome":         "'***'",
+		"dn":           `CASE WHEN false THEN "dn" END`,
+		"email":        "'x@' || 'y'",
+		"uid":          `CASE WHEN "uid" IS NULL THEN NULL ELSE sha256(` + MaskSaltPlaceholder + ` || ':' || CAST("uid" AS VARCHAR)) END`,
+		"contact":      `CASE WHEN "contact" IS NULL THEN NULL WHEN strpos(CAST("contact" AS VARCHAR), '@') > 1 THEN left(CAST("contact" AS VARCHAR), 1) || '***@' || split_part(CAST("contact" AS VARCHAR), '@', 2) ELSE '***' END`,
+		"code":         `CASE WHEN "code" IS NULL THEN NULL ELSE left(CAST("code" AS VARCHAR), 3) || '***' END`,
+		"empty_prefix": `CASE WHEN "empty_prefix" IS NULL THEN NULL ELSE left(CAST("empty_prefix" AS VARCHAR), 0) || '***' END`,
 	}
 	for col, w := range want {
 		if m["lake.s.pii"][col] != w {
-			t.Errorf("%s = %q", col, m["lake.s.pii"][col])
+			t.Errorf("%s = %q, want %q", col, m["lake.s.pii"][col], w)
 		}
 	}
 	if m, err := p.Masks(ctx, map[string]any{"roles": []string{"pii_reader"}}); err != nil || m != nil {
 		t.Fatalf("reader: %v %v", m, err)
 	}
 	for _, body := range []string{
-		`masks := {"pii": {"c": "null"}}`, `masks := {"a.b.c": {"c": "hash"}}`, `masks := {"a.b.c": {"c": "last:x"}}`,
+		`masks := {"pii": {"c": "null"}}`, `masks := {"a.b.c": {"c": "bogus"}}`, `masks := {"a.b.c": {"c": "last:x"}}`,
+		`masks := {"a.b.c": {"c": "first:-1"}}`, `masks := {"a.b.c": {"c": "first:x"}}`,
 		`masks := {"a.b.c": {"c": {"sql": ""}}}`, `masks := {"a.b.c": {"c": {"sql": "1", "x": 2}}}`, `masks := {"a.b.c": "x"}`,
 	} {
 		os.WriteFile(f, []byte("package curral\nimport rego.v1\nallow := true\n"+body), 0o600)

@@ -203,7 +203,7 @@ if ($cmd -eq 'login') {
 	if ($envToken -or $envUser) { Say 'warning: CURRAL_TOKEN/CURRAL_USER in this environment take precedence over the file' }
 	# Check what was just saved, not the environment.
 	$envUrl, $envToken, $envUser, $envPassword = '', '', '', ''
-	$cmd = 'status'
+	$cmd = 'capabilities'
 }
 
 # Fill what the environment does not set from $config.
@@ -299,20 +299,27 @@ try {
 			Invoke-Curral @($json, "data-binary = $(Quote-Cfg "@$path")", "url = $(Quote-Cfg "$url/v1/query")") $out $maxrows
 		}
 		'docs' {
-			$q = Get-Query $rest 'table', 'schema', 'q', 'fields'
+			$q = Get-Query $rest 'table', 'tables', 'schema', 'schemas', 'q', 'fields', 'access'
 			Invoke-Curral @("url = $(Quote-Cfg "$url/v1/docs$q")")
 		}
 		'search' {
-			if ($rest.Count -lt 1) { Die 'usage: search [table=X] [schema=Y] [limit=N] [fields=header] "QUESTION"' }
+			if ($rest.Count -lt 1) { Die 'usage: search [table=X|tables=A,B] [schema=Y|schemas=A,B] [limit=N] [fields=header] [access=true] "QUESTION"' }
 			$req = '{"q":' + (Quote-JsonString $rest[-1])
 			foreach ($kv in @(if ($rest.Count -gt 1) { $rest[0..($rest.Count - 2)] })) {
 				$k, $v = $kv -split '=', 2
 				if ($null -ne $v -and $k -cin 'table', 'schema', 'fields') { $req += ',"' + $k + '":' + (Quote-JsonString $v) }
+				elseif ($null -ne $v -and $k -cin 'tables', 'schemas') {
+					$items = @($v -split ',' | Where-Object { $_ -ne '' } | ForEach-Object { Quote-JsonString $_ })
+					$req += ',"' + $k + '":[' + ($items -join ',') + ']'
+				}
+				elseif ($null -ne $v -and $k -ceq 'access' -and $v -cin 'true', 'false') {
+					$req += ',"access":' + $v
+				}
 				elseif ($null -ne $v -and $k -ceq 'limit') {
 					if ($v -notmatch '^[0-9]+$') { Die 'limit= needs an integer' }
 					$req += ',"limit":' + $v
 				}
-				else { Die "invalid option: $kv (use table=, schema=, limit=, fields=header; the question goes last)" }
+				else { Die "invalid option: $kv (use table=, tables=, schema=, schemas=, limit=, fields=header, access=true; the question goes last)" }
 			}
 			$path = Join-Path $tmp 'req'
 			Write-Utf8 $path ($req + '}')

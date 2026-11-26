@@ -1,6 +1,7 @@
 package server
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -1144,5 +1145,136 @@ func TestBinderErrorsBehindPolicy(t *testing.T) {
 	// Admins see every error.
 	if r := do(t, ts, "admin", `{"sql":"SELECT nope FROM salaries"}`); r.status != 400 || !strings.Contains(r.body, "nope") {
 		t.Errorf("admin: %d %s", r.status, r.body)
+	}
+}
+
+func TestDatabaseVisibility(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	ts, aw := newServerWithAudit(t, path)
+	s := lastServer
+
+	// Restrict analyst to logs only (not the default "sales" database).
+	pf := filepath.Join(t.TempDir(), "p.rego")
+	os.WriteFile(pf, []byte(`package curral
+import rego.v1
+default allow := false
+allow if "admin" in input.roles
+allow if {
+	"analyst" in input.roles
+	input.resolved
+	input.statement_type == "SELECT"
+	every t in input.tables { startswith(t, "logs.") }
+}
+`), 0o600)
+	pol, err := policy.Load(context.Background(), "data.curral.allow", []string{pf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetPolicy(pol)
+
+	req, _ := http.NewRequest("GET", ts.URL+"/v1/databases", nil)
+	req.SetBasicAuth("analyst", "analyst-pw")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dbOut struct{ Databases []engine.DatabaseInfo }
+	json.NewDecoder(resp.Body).Decode(&dbOut)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || len(dbOut.Databases) != 1 || dbOut.Databases[0].Name != "logs" {
+		t.Fatalf("analyst /v1/databases: %d %+v", resp.StatusCode, dbOut.Databases)
+	}
+
+	// /v1/schema hides both sales and default_database (which is sales).
+	status, sch := getSchema(t, ts, "analyst", "")
+	if status != 200 || sch.DefaultDatabase != "" || len(sch.Databases) != 1 || sch.Databases[0].Name != "logs" {
+		t.Fatalf("analyst /v1/schema: %d %+v", status, sch)
+	}
+	// Admin still sees both databases and the default_database.
+	status, sch = getSchema(t, ts, "admin", "")
+	if status != 200 || sch.DefaultDatabase != "sales" || len(sch.Databases) != 2 {
+		t.Fatalf("admin /v1/schema: %d %+v", status, sch)
+	}
+
+	aw.Close()
+	var audited bool
+	for _, ev := range readAudit(t, path) {
+		if ev.Event == "databases" && ev.User == "analyst" && ev.Status == 200 && len(ev.Tables) == 1 && ev.Tables[0] == "logs" {
+			audited = true
+		}
+	}
+	if !audited {
+		t.Error("GET /v1/databases not audited")
+	}
+}
+
+func TestHTTPCompression(t *testing.T) {
+	ts := newServer(t)
+	req, _ := http.NewRequest("POST", ts.URL+"/v1/query", strings.NewReader(`{"sql":"SELECT id, amount FROM orders ORDER BY id","format":"csv"}`))
+	req.SetBasicAuth("analyst", "analyst-pw")
+	req.Header.Set("Accept-Encoding", "gzip")
+	// Disable transparent transport decompression so we can assert Content-Encoding.
+	cl := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+	resp, err := cl.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Encoding") != "gzip" || !strings.Contains(resp.Header.Get("Vary"), "Accept-Encoding") {
+		t.Fatalf("headers: %d %v", resp.StatusCode, resp.Header)
+	}
+	gr, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(gr)
+	gr.Close()
+	if err != nil || string(raw) != "id,amount\n1,10.5\n2,20\n" {
+		t.Fatalf("body=%q err=%v", raw, err)
+	}
+	if resp.Trailer.Get("X-Curral-Row-Count") != "2" {
+		t.Fatalf("trailer=%v", resp.Trailer)
+	}
+}
+
+func TestMCPRouteAuth(t *testing.T) {
+	ts, _ := newServerWithAudit(t, "", func(s *Server) { s.MCPEnabled = true })
+	initBody := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
+
+	// Unauthenticated POST /mcp must be rejected with 401.
+	resp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(initBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /mcp: got %d, want 401", resp.StatusCode)
+	}
+
+	// Authenticated POST /mcp succeeds.
+	req, _ := http.NewRequest("POST", ts.URL+"/mcp", strings.NewReader(initBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth("analyst", "analyst-pw")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.Contains(string(b), `"protocolVersion"`) {
+		t.Fatalf("authenticated /mcp: %d %s", resp.StatusCode, b)
+	}
+
+	// Disabled by default (404/405).
+	plain := newServer(t)
+	req, _ = http.NewRequest("POST", plain.URL+"/mcp", strings.NewReader(initBody))
+	req.SetBasicAuth("analyst", "analyst-pw")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("disabled /mcp: %d", resp.StatusCode)
 	}
 }

@@ -80,11 +80,51 @@ denied_table if {
 #   max_concurrency:   queries this user may run at once (over it: 429);
 #                      add "concurrency_group": "role:analyst" to share one
 #                      quota among every analyst instead
-limits := data.roles[role].limits if {
+# When a user has several roles with limits, the strictest value of each field wins.
+role_limits := [data.roles[r].limits | some r in input.roles; data.roles[r].limits]
+
+limits := object.union_n([l |
+	some l in [limit_timeout, limit_max_rows, limit_max_concurrency, limit_concurrency_group]
+]) if {
 	not "admin" in input.roles
-	count(input.roles) == 1
-	role := input.roles[0]
+	count(role_limits) > 0
 }
+
+default limit_timeout := {}
+
+limit_timeout := {"timeout": min(ts) / 1000000000} if {
+	ts := [ns |
+		some l in role_limits
+		l.timeout
+		ns := duration_ns(l.timeout)
+	]
+	count(ts) > 0
+}
+
+default limit_max_rows := {}
+
+limit_max_rows := {"max_rows": min(rs)} if {
+	rs := [l.max_rows | some l in role_limits; l.max_rows > 0]
+	count(rs) > 0
+}
+
+default limit_max_concurrency := {}
+
+limit_max_concurrency := {"max_concurrency": min(cs)} if {
+	cs := [l.max_concurrency | some l in role_limits; l.max_concurrency > 0]
+	count(cs) > 0
+}
+
+default limit_concurrency_group := {}
+
+limit_concurrency_group := {"concurrency_group": g} if {
+	gs := {l.concurrency_group | some l in role_limits; l.concurrency_group != ""}
+	count(gs) == 1
+	some g in gs
+}
+
+duration_ns(v) := time.parse_duration_ns(v) if is_string(v)
+duration_ns(v) := v * 1000000000 if is_number(v)
 
 # Optional column masks, enabled with --policy-masks-query data.curral.masks:
 # {table: {column: mask}}, with mask "null", "redact", "last:N" or {"sql": "..."}.

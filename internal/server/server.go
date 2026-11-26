@@ -30,6 +30,7 @@ import (
 	"github.com/lucasapassos/curral/internal/docs"
 	"github.com/lucasapassos/curral/internal/encode"
 	"github.com/lucasapassos/curral/internal/engine"
+	"github.com/lucasapassos/curral/internal/mcp"
 	"github.com/lucasapassos/curral/internal/metrics"
 	"github.com/lucasapassos/curral/internal/policy"
 	"github.com/lucasapassos/curral/internal/rerank"
@@ -49,8 +50,8 @@ type Server struct {
 	MaxRows int64
 	MaxBody int64
 
-	Metrics *metrics.Metrics // nil disables metrics
-	OIDC    *auth.OIDC       // nil disables bearer JWTs
+	Metrics *metrics.Metrics        // nil disables metrics
+	OIDC    auth.TokenAuthenticator // nil disables bearer JWTs
 
 	// Brute-force protection: failures are counted per client IP and per
 	// claimed user name; nil disables either.
@@ -81,6 +82,14 @@ type Server struct {
 	// written), DocsNamesWarn or DocsNamesStrict: writes resolve them to
 	// qualified catalog names, logging or refusing those that do not.
 	DocsValidateNames string
+	// DocsValidateSQL is DocsSQLOff, DocsSQLWarn or DocsSQLStrict: writes
+	// prepare each context.sqls[].sql against the catalog without executing it.
+	DocsValidateSQL string
+	// MaskSalt is the server secret exposed as curral_mask_salt for the "hash"
+	// column mask preset. Empty refuses queries that use the hash preset.
+	MaskSalt string
+	// MCPEnabled exposes the Streamable HTTP MCP endpoint at POST /mcp.
+	MCPEnabled bool
 	// Judge, when set, decides which documents /v1/docs/search returns and
 	// ranks them; nil ranks by BM25 alone.
 	Judge           rerank.Judge
@@ -96,6 +105,13 @@ type Server struct {
 }
 
 func (s *Server) SetAuth(a *auth.Authenticator) { s.authn.Store(a) }
+
+// SweepAuth evicts expired entries from the active password verification cache.
+func (s *Server) SweepAuth() {
+	if a := s.authn.Load(); a != nil {
+		a.Sweep()
+	}
+}
 
 // SetRowFilters swaps in a validated RLS rule set (nil: none).
 func (s *Server) SetRowFilters(r *rls.Rules) { s.rowFilters.Store(r) }
@@ -207,7 +223,38 @@ func (s *Server) Handler() http.Handler {
 	if s.ServeSkill != SkillOff {
 		s.skillRoutes(mux)
 	}
-	return withRequestID(mux)
+	if s.MCPEnabled {
+		mcpHandler := mcp.NewHandler(withRequestID(mux), mcp.Options{
+			Version:     s.Version,
+			DocsEnabled: s.Docs != nil,
+			MaxBody:     s.MaxBody,
+		})
+		mux.HandleFunc("POST /mcp", s.requireLogin(mcpHandler))
+	}
+	return withRequestID(withCompression(mux))
+}
+
+// requireLogin authenticates the caller (checking brute-force lockouts) before
+// handing the request to next. Used for POST /mcp so unauthenticated requests
+// are rejected before initialize/tools/list, while tools/call still runs full
+// execution-context delegation inside the dispatched /v1/* handler.
+func (s *Server) requireLogin(next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		p, blockedFor, blocked := s.login(s.httpCaller(r), r.Header.Get("Authorization"), nil)
+		switch {
+		case blocked:
+			w.Header().Set("Retry-After", strconv.Itoa(int(blockedFor.Seconds())+1))
+			writeError(w, http.StatusTooManyRequests, errLockedOut)
+		case p == nil:
+			w.Header().Set("WWW-Authenticate", `Basic realm="curral", charset="UTF-8"`)
+			if s.OIDC != nil {
+				w.Header().Add("WWW-Authenticate", `Bearer realm="curral"`)
+			}
+			writeError(w, http.StatusUnauthorized, "invalid credentials")
+		default:
+			next.ServeHTTP(w, r)
+		}
+	}
 }
 
 type ctxKey struct{}
@@ -590,7 +637,11 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 	}
 	format, ok := pickFormat(req.Format, r)
 	if !ok {
-		reject(http.StatusBadRequest, "unsupported format (csv, json, ndjson, arrow)")
+		reject(http.StatusBadRequest, "unsupported format (csv, json, ndjson, arrow, parquet)")
+		return
+	}
+	if (format == encode.Arrow || format == encode.Parquet) && !engine.ArrowAvailable {
+		reject(http.StatusNotImplemented, engine.ErrArrowUnavailable.Error())
 		return
 	}
 
@@ -630,12 +681,20 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request, p *auth.Principal
 		},
 		started: func() bool { return started },
 	}
-	if format == encode.Arrow {
+	if format == encode.Arrow || format == encode.Parquet {
 		sink.records = func(insp engine.Inspection, maxRows int64, rr array.RecordReader) (int64, int64, error) {
 			// Headers go out with the first byte, so a query that fails
 			// before producing data still gets a proper error status.
 			out := &startOnWrite{w: &bytes, start: func() { startStream(insp, maxRows) }}
-			n, err := writeIPC(out, rr, maxRows)
+			var (
+				n   int64
+				err error
+			)
+			if format == encode.Parquet {
+				n, err = engine.WriteParquet(out, rr, maxRows)
+			} else {
+				n, err = writeIPC(out, rr, maxRows)
+			}
 			if started {
 				trailers(n, err)
 			}
@@ -688,8 +747,9 @@ type queryCall struct {
 	// describe, when set, stops the statement right before it would run
 	// and receives its description (engine.Request.Describe). Descriptions
 	// are logged and audited but kept out of the query metrics.
-	describe func(engine.Description) error
-	sink     resultSink
+	describe   func(engine.Description) error
+	cachedInsp *engine.Inspection
+	sink       resultSink
 }
 
 // queryRun is how a statement ended, for the transport to answer with.
@@ -732,9 +792,39 @@ func (s *Server) runQuery(ctx context.Context, p *auth.Principal, ev *audit.Even
 		throttled        bool
 		protectionDenied bool
 		heldGroup        string
+		heldLimit        int64
 		execTimeout      time.Duration
 		timing           engine.Timing
 	)
+	// Enforce the default per-user concurrency quota before entering the
+	// global DuckDB queue, so a burst from one user cannot saturate global
+	// slots or EXPLAIN workers. If the policy later sets a different limit or
+	// concurrency_group, authorize reconciles the held slot.
+	if !q.dryRun && s.MaxConcurrencyPerUser > 0 {
+		group := "user:" + p.Name
+		if !s.groups.tryAcquire(group, s.MaxConcurrencyPerUser) {
+			err := fmt.Errorf("%w (limit %d for %s)", errConcurrency, s.MaxConcurrencyPerUser, group)
+			run.err = err
+			run.status = http.StatusTooManyRequests
+			total := time.Since(start)
+			s.Log.Info(ev.Event, "request_id", ev.RequestID, "user", p.Name, "status", run.status,
+				"format", q.format, "duration", total, "err", err)
+			s.Metrics.Throttled()
+			if q.describe == nil {
+				s.Metrics.ObserveQuery(metrics.Query{
+					Status: strconv.Itoa(run.status), Decision: "error", DecidedBy: "concurrency",
+					Roles: p.Roles, Stages: map[string]time.Duration{metrics.StageTotal: total},
+				})
+			}
+			if s.Audit != nil {
+				ev.Status, ev.Decision, ev.DecidedBy, ev.Error = run.status, "error", "concurrency", oneLine(err.Error())
+				ev.TimingMS = map[string]float64{"total": ms(total)}
+				s.Audit.Record(ev)
+			}
+			return run
+		}
+		heldGroup, heldLimit = group, s.MaxConcurrencyPerUser
+	}
 	// The strictest of the server's, the role's and the request's limits.
 	rowLimit := func() int64 { return minLimit(minLimit(s.MaxRows, run.limits.MaxRows), q.maxRows) }
 	authorize := func(ctx context.Context, i engine.Inspection) error {
@@ -795,11 +885,29 @@ func (s *Server) runQuery(ctx context.Context, p *auth.Principal, ev *audit.Even
 			if group == "" {
 				group = "user:" + p.Name
 			}
-			if !s.groups.tryAcquire(group, max) {
-				throttled = true
-				return fmt.Errorf("%w (limit %d for %s)", errConcurrency, max, group)
+			switch {
+			case heldGroup == "":
+				if !s.groups.tryAcquire(group, max) {
+					throttled = true
+					return fmt.Errorf("%w (limit %d for %s)", errConcurrency, max, group)
+				}
+				heldGroup, heldLimit = group, max
+			case heldGroup == group:
+				if max < heldLimit && !s.groups.withinLimit(group, max) {
+					heldGroup = ""
+					throttled = true
+					return fmt.Errorf("%w (limit %d for %s)", errConcurrency, max, group)
+				}
+				heldLimit = max
+			default:
+				s.groups.release(heldGroup)
+				heldGroup = ""
+				if !s.groups.tryAcquire(group, max) {
+					throttled = true
+					return fmt.Errorf("%w (limit %d for %s)", errConcurrency, max, group)
+				}
+				heldGroup, heldLimit = group, max
 			}
-			heldGroup = group
 		}
 		// Fail closed: nothing executes without room to record it.
 		if s.Audit != nil {
@@ -830,9 +938,10 @@ func (s *Server) runQuery(ctx context.Context, p *auth.Principal, ev *audit.Even
 	}
 
 	err := s.Engine.Query(ctx, engine.Request{
-		EmitArrow: emitArrow, Describe: q.describe,
+		EmitArrow: emitArrow, Describe: q.describe, CachedInspection: q.cachedInsp,
 		SQL: q.sql, Params: q.params, Database: q.database, Timing: &timing, ExecTimeout: &execTimeout,
 		Protect: &run.protect, User: p.Name, Roles: p.Roles, IdentityJSON: identityJSON(p.Identity),
+		MaskSalt: s.MaskSalt,
 	}, authorize, emit)
 	run.err, run.maxRows = err, rowLimit()
 	if q.dryRun {
@@ -951,6 +1060,38 @@ func eachRecord(rr array.RecordReader, maxRows int64, fn func(arrow.RecordBatch)
 		n += rows
 	}
 	return n, rr.Err()
+}
+
+// DryRunForPrincipal evaluates a single dry-run query for principal p without
+// executing it, returning the HTTP status code and JSON body. Used by
+// `curral check --policy-tests`.
+func (s *Server) DryRunForPrincipal(ctx context.Context, p *auth.Principal, sql, database string, maxRows int64) (int, []byte) {
+	ev := s.event(caller{requestID: newRequestID(), addr: "policytest"}, "dry_run", p)
+	s.setSQL(ev, sql)
+	ev.Database = database
+	run := s.runQuery(ctx, p, ev, queryCall{
+		sql: sql, database: database, maxRows: maxRows, dryRun: true, format: "json",
+		sink: resultSink{started: func() bool { return false }},
+	})
+	rec := &bufferResponseWriter{header: http.Header{}}
+	s.finishDryRun(rec, ev, run)
+	if rec.code == 0 {
+		rec.code = http.StatusOK
+	}
+	return rec.code, rec.body
+}
+
+type bufferResponseWriter struct {
+	header http.Header
+	code   int
+	body   []byte
+}
+
+func (b *bufferResponseWriter) Header() http.Header        { return b.header }
+func (b *bufferResponseWriter) WriteHeader(statusCode int) { b.code = statusCode }
+func (b *bufferResponseWriter) Write(p []byte) (int, error) {
+	b.body = append(b.body, p...)
+	return len(p), nil
 }
 
 // finishDryRun answers a dry run with the inspection and the decision. SQL
@@ -1155,8 +1296,213 @@ func convertParams(in []any) ([]any, error) {
 	return out, nil
 }
 
-func (s *Server) databases(w http.ResponseWriter, _ *http.Request, _ *auth.Principal) {
-	writeJSON(w, http.StatusOK, map[string]any{"databases": s.Engine.Databases()})
+func (s *Server) databases(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
+	dbs, status, msg := s.listDatabases(r.Context(), p, s.newEvent(r, "databases", p))
+	if status != http.StatusOK {
+		writeSchemaError(w, status, msg)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"databases": dbs})
+}
+
+// listDatabases returns only the attached databases that p can read at least
+// one object in (or, when a database has no objects yet, that the policy
+// allows p to access). When ev is non-nil the call is audited fail-closed.
+func (s *Server) listDatabases(ctx context.Context, p *auth.Principal, ev *audit.Event) ([]engine.DatabaseInfo, int, string) {
+	if s.Engine == nil {
+		return []engine.DatabaseInfo{}, http.StatusOK, ""
+	}
+	start := time.Now()
+	pol := s.Policy()
+	if ev != nil {
+		ev.PolicySHA256 = pol.SHA256
+	}
+	fail := func(status int, msg, decidedBy string) ([]engine.DatabaseInfo, int, string) {
+		if s.Audit != nil && ev != nil {
+			ev.Decision, ev.DecidedBy, ev.Status, ev.Error = "error", decidedBy, status, msg
+			s.Audit.Record(ev)
+		}
+		return nil, status, msg
+	}
+	release, status, msg, decidedBy := s.acquireListingSlot(ctx, pol, p)
+	if status != http.StatusOK {
+		return fail(status, msg, decidedBy)
+	}
+	defer release()
+
+	var reservation *audit.Reservation
+	if s.Audit != nil && ev != nil {
+		var err error
+		if reservation, err = s.Audit.Reserve(time.Second); err != nil {
+			s.Log.Error("databases refused: audit unavailable", "request_id", ev.RequestID, "err", err)
+			return fail(http.StatusServiceUnavailable, errAudit.Error(), "audit")
+		}
+	}
+
+	hasTables := map[string]bool{}
+	readableDBs := map[string]bool{}
+	var policyE error
+	_, err := s.Engine.Schema(ctx, engine.SchemaFilter{}, func(ctx context.Context, t engine.TableSchema, i engine.Inspection) (bool, error) {
+		dbKey := strings.ToLower(t.Database)
+		hasTables[dbKey] = true
+		if readableDBs[dbKey] {
+			return false, nil
+		}
+		input := schemaPolicyInput(p, t, i)
+		ok, err := pol.Allow(ctx, input)
+		if err == nil && ok {
+			if _, perr := s.protections(ctx, pol, input, i, p); errors.Is(perr, engine.ErrForbidden) {
+				return false, nil
+			} else if perr != nil {
+				err = perr
+			}
+		}
+		if err != nil {
+			policyE = err
+			return false, err
+		}
+		if ok {
+			readableDBs[dbKey] = true
+		}
+		return false, nil
+	})
+	if err != nil {
+		status := statusOf(err, policyE)
+		msg := engine.PublicError(err)
+		if policyE != nil {
+			msg = "policy evaluation failed"
+		}
+		if s.Audit != nil && ev != nil {
+			ev.Decision, ev.DecidedBy = decisionOf(err, false, false, policyE, nil)
+			ev.Status, ev.Error = status, oneLine(err.Error())
+			reservation.Write(ev)
+		}
+		return nil, status, msg
+	}
+	dbs, err := s.filterVisibleDatabases(ctx, pol, p, hasTables, readableDBs)
+	if err != nil {
+		if s.Audit != nil && ev != nil {
+			ev.Decision, ev.DecidedBy, ev.Status, ev.Error = "error", "policy", http.StatusInternalServerError, oneLine(err.Error())
+			reservation.Write(ev)
+		}
+		return nil, http.StatusInternalServerError, "policy evaluation failed"
+	}
+	if s.Audit != nil && ev != nil {
+		names := make([]string, len(dbs))
+		for i, d := range dbs {
+			names[i] = d.Name
+		}
+		ev.Decision, ev.DecidedBy, ev.Status = "allow", "policy", http.StatusOK
+		ev.Tables, ev.Rows = names, int64(len(dbs))
+		ev.TimingMS = map[string]float64{"total": ms(time.Since(start))}
+		reservation.Write(ev)
+	}
+	return dbs, http.StatusOK, ""
+}
+
+// filterVisibleDatabases keeps each attached database that has a readable
+// object for p, or, when the database is empty, that the policy allows p to
+// read or create objects in.
+func (s *Server) filterVisibleDatabases(ctx context.Context, pol *policy.Policy, p *auth.Principal,
+	hasTables, readableDBs map[string]bool,
+) ([]engine.DatabaseInfo, error) {
+	out := []engine.DatabaseInfo{}
+	for _, d := range s.Engine.Databases() {
+		key := strings.ToLower(d.Name)
+		if readableDBs[key] {
+			out = append(out, d)
+			continue
+		}
+		if hasTables[key] {
+			continue
+		}
+		ok, err := s.canAccessEmptyDB(ctx, pol, p, d)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
+func (s *Server) canAccessEmptyDB(ctx context.Context, pol *policy.Policy, p *auth.Principal, d engine.DatabaseInfo) (bool, error) {
+	probe := d.Name + "." + d.Schema + ".__curral_probe__"
+	selIn := map[string]any{
+		"user": p.Name, "roles": p.Roles, "sql": "SELECT * FROM " + probe,
+		"statement_type": "SELECT", "database": d.Name,
+		"tables": []string{probe}, "targets": []string{}, "functions": []string{},
+		"databases": []string{d.Name}, "resolved": true, "hidden_remote_scans": 0,
+	}
+	policyIdentity(selIn, p)
+	if ok, err := pol.Allow(ctx, selIn); err != nil || ok {
+		return ok, err
+	}
+	if delegated(p) || d.ReadOnly {
+		return false, nil
+	}
+	creIn := map[string]any{
+		"user": p.Name, "roles": p.Roles, "sql": "CREATE TABLE " + probe + "(id INT)",
+		"statement_type": "CREATE", "database": d.Name,
+		"tables": []string{}, "targets": []string{probe}, "functions": []string{},
+		"databases": []string{d.Name}, "resolved": true, "hidden_remote_scans": 0,
+	}
+	policyIdentity(creIn, p)
+	return pol.Allow(ctx, creIn)
+}
+
+func schemaPolicyInput(p *auth.Principal, t engine.TableSchema, i engine.Inspection) map[string]any {
+	input := map[string]any{
+		"user":                p.Name,
+		"roles":               p.Roles,
+		"sql":                 "SELECT * FROM " + t.Qualified(),
+		"statement_type":      i.StatementType,
+		"database":            i.Database,
+		"tables":              i.Tables,
+		"targets":             i.Targets,
+		"functions":           i.Functions,
+		"databases":           i.Databases,
+		"resolved":            i.Resolved,
+		"hidden_remote_scans": i.HiddenRemoteScans,
+	}
+	policyIdentity(input, p)
+	return input
+}
+
+// acquireListingSlot enforces per-user / policy concurrency limits on
+// metadata listings (/v1/schema, /v1/databases, docs_scope). Fails closed if
+// policy limits evaluation errors.
+func (s *Server) acquireListingSlot(ctx context.Context, pol *policy.Policy, p *auth.Principal) (func(), int, string, string) {
+	max := s.MaxConcurrencyPerUser
+	group := "user:" + p.Name
+	if pol != nil {
+		in := map[string]any{
+			"user": p.Name, "roles": p.Roles, "statement_type": "SELECT",
+			"tables": []string{}, "targets": []string{}, "functions": []string{},
+			"databases": []string{}, "resolved": true,
+		}
+		policyIdentity(in, p)
+		lim, err := pol.Limits(ctx, in)
+		if err != nil {
+			s.Log.Error("listing policy limits failed", "user", p.Name, "err", err)
+			return nil, http.StatusInternalServerError, "policy evaluation failed", "policy"
+		}
+		if lim.MaxConcurrency > 0 {
+			max = lim.MaxConcurrency
+		}
+		if lim.ConcurrencyGroup != "" {
+			group = lim.ConcurrencyGroup
+		}
+	}
+	if max <= 0 {
+		return func() {}, http.StatusOK, "", ""
+	}
+	if !s.groups.tryAcquire(group, max) {
+		s.Metrics.Throttled()
+		return nil, http.StatusTooManyRequests, fmt.Sprintf("%v (limit %d for %s)", errConcurrency, max, group), "concurrency"
+	}
+	return func() { s.groups.release(group) }, http.StatusOK, "", ""
 }
 
 // schemaResponse lists what the caller may query, for clients (and AI
@@ -1173,12 +1519,14 @@ type schemaResponse struct {
 // are about it; under --docs-scope schema that needs the caller's scope,
 // which an unfiltered listing is, so it is listed once.
 func (s *Server) schema(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
+	start := time.Now()
 	q := r.URL.Query()
 	f := engine.SchemaFilter{Database: q.Get("database"), Schema: q.Get("schema"), Table: q.Get("table")}
 	var all []string
 	var match func(engine.TableSchema) bool
-	whole := s.Docs != nil && s.docsScope() == DocsScopeSchema && f == (engine.SchemaFilter{})
-	if whole {
+	unfiltered := f == (engine.SchemaFilter{})
+	whole := s.Docs != nil && s.docsScope() == DocsScopeSchema && unfiltered
+	if unfiltered {
 		match = func(t engine.TableSchema) bool { all = append(all, t.Qualified()); return true }
 	}
 	tables, status, msg := s.listSchema(r.Context(), p, s.newEvent(r, "schema", p), f, match)
@@ -1190,11 +1538,45 @@ func (s *Server) schema(w http.ResponseWriter, r *http.Request, p *auth.Principa
 		status, msg = s.countDocs(r, p, tables, scope)
 	}
 	if status != http.StatusOK {
+		s.Metrics.ObserveSchema(strconv.Itoa(status), time.Since(start))
 		writeSchemaError(w, status, msg)
 		return
 	}
+	var dbs []engine.DatabaseInfo
+	if unfiltered {
+		hasTables := map[string]bool{}
+		for _, qn := range all {
+			hasTables[strings.ToLower(strings.SplitN(qn, ".", 2)[0])] = true
+		}
+		readableDBs := map[string]bool{}
+		for _, t := range tables {
+			readableDBs[strings.ToLower(t.Database)] = true
+		}
+		var err error
+		dbs, err = s.filterVisibleDatabases(r.Context(), s.Policy(), p, hasTables, readableDBs)
+		if err != nil {
+			s.Metrics.ObserveSchema(strconv.Itoa(http.StatusInternalServerError), time.Since(start))
+			writeSchemaError(w, http.StatusInternalServerError, "policy evaluation failed")
+			return
+		}
+	} else {
+		dbs, status, msg = s.listDatabases(r.Context(), p, nil)
+		if status != http.StatusOK {
+			s.Metrics.ObserveSchema(strconv.Itoa(status), time.Since(start))
+			writeSchemaError(w, status, msg)
+			return
+		}
+	}
+	defDB := ""
+	for _, d := range dbs {
+		if strings.EqualFold(d.Name, s.Engine.Default()) {
+			defDB = s.Engine.Default()
+			break
+		}
+	}
+	s.Metrics.ObserveSchema(strconv.Itoa(http.StatusOK), time.Since(start))
 	writeJSON(w, http.StatusOK, schemaResponse{
-		DefaultDatabase: s.Engine.Default(), Databases: s.Engine.Databases(), Tables: tables,
+		DefaultDatabase: defDB, Databases: dbs, Tables: tables,
 	})
 }
 
@@ -1218,14 +1600,11 @@ func (s *Server) listSchema(ctx context.Context, p *auth.Principal, ev *audit.Ev
 		}
 		return nil, status, msg
 	}
-	if max := s.MaxConcurrencyPerUser; max > 0 {
-		group := "user:" + p.Name
-		if !s.groups.tryAcquire(group, max) {
-			s.Metrics.Throttled()
-			return fail(http.StatusTooManyRequests, fmt.Sprintf("%v (limit %d for %s)", errConcurrency, max, group), "concurrency")
-		}
-		defer s.groups.release(group)
+	release, slotStatus, slotMsg, slotBy := s.acquireListingSlot(ctx, pol, p)
+	if slotStatus != http.StatusOK {
+		return fail(slotStatus, slotMsg, slotBy)
 	}
+	defer release()
 	// Fail closed, as for queries: nothing is listed without room to record it.
 	var reservation *audit.Reservation
 	if s.Audit != nil {

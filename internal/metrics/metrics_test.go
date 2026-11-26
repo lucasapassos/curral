@@ -18,8 +18,8 @@ func TestScrapeTimeSources(t *testing.T) {
 	healthy := true
 	m := New(Sources{
 		Load: func() (int, int, int) { return 3, 7, 8 },
-		CacheStats: func(db string) (int64, int64, bool) {
-			return 40, 2, db == "lake"
+		CacheStats: func(db string) (int64, int64, int64, bool) {
+			return 40, 2, 1, db == "lake"
 		},
 		CachedDBs:  []string{"lake"},
 		AuditStats: func() (int64, int64, bool) { return 100, 1, healthy },
@@ -29,6 +29,7 @@ func TestScrapeTimeSources(t *testing.T) {
 		"curral_queries_running 3", "curral_queries_waiting 7", "curral_query_slots 8",
 		`curral_catalog_cache_requests_total{database="lake",result="hit"} 40`,
 		`curral_catalog_cache_requests_total{database="lake",result="miss"} 2`,
+		`curral_catalog_cache_requests_total{database="lake",result="passthrough"} 1`,
 		"curral_audit_events_written_total 100", "curral_audit_events_dropped_total 1",
 		"curral_audit_healthy 1",
 	} {

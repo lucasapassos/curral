@@ -160,6 +160,7 @@ What to look for in the response:
 - **`"row_filtered": true` on a table:** you see only part of the rows.
   Totals and counts reflect only that subset. Tell the user when you
   report numbers from that table.
+- **`"docs": N` on a table:** how many semantic documents describe it (omitted when 0). Use this to skip listing `/v1/docs` for tables that have none.
 - **Missing table:** you have no access, or it does not exist; the
   listing (and `schema table=name`, which then returns `"tables": []`)
   does not tell which. `dry-run "SELECT 1 FROM name"` does: `deny` with
@@ -175,11 +176,16 @@ reads the data (as you see it: filtered and masked). `information_schema`,
 
 ### 1b. Read the semantic documents for those tables
 
-If the server keeps semantic documents (`GET /v1/docs` answers 200; 404
-means the feature is off, and the script says so: go on with the schema
-alone), search them with the user's question before writing SQL: `POST /v1/docs/search` with `{"q": "<the question>"}` (add
-`"table"` or `"schema"` when you already know them). Results come best
-first, whole. With `"ranker": "jev"`, check each result's `judged` flag:
+Check `GET /v1/capabilities` (`scripts/curral.sh capabilities`) to see
+`docs.enabled`, `docs.scope` (`all` or `schema`) and `docs.ranker` (`jev`
+or `bm25`) without probing `/v1/docs`. When enabled, search them with the
+user's question before writing SQL: `POST /v1/docs/search` with
+`{"q": "<the question>"}` (narrow with `"table"`/`"tables"` or
+`"schema"`/`"schemas"` when you already know them). Results come best
+first, whole, with `matched` showing which question terms hit which fields
+and (under `docs.scope: "schema"`, or with `access=true`) `accessible_tables`
+and `inaccessible_tables` showing which referenced tables you can query.
+With `"ranker": "jev"`, check each result's `judged` flag:
 `true` means Jev evaluated it; `false` means evaluation failed or timed out
 and the result uses BM25. `"below_threshold": true` means no evaluated
 document reached the relevance threshold, so treat evaluated results as
@@ -343,11 +349,14 @@ scripts/curral.sh doc-delete -e '"<etag>"' ID
 Pass the ETag from your last read with `-e` (`If-Match`): a 412 means
 someone changed the document in the meantime, so read it again and redo
 your change on top. Some care, because documents outlive the conversation:
-- **Every authenticated user reads every document**, whatever tables they
-  may query. So write nothing you would not show to all of them: no values
-  you saw (masked or not), no personal data, and no description of other
-  roles' row filters or masks beyond "analysts see a subset". A document's
-  existence never implies access to its tables, for you or for readers.
+- **Visibility depends on `--docs-scope`.** Under the default (`all`), every
+  authenticated user reads every document, whatever tables they may query;
+  under `schema`, a document naming tables or schemas is shown only to
+  callers who may query at least one of them (documents naming none reach
+  everyone). Either way, write nothing you would not show to readers of
+  those tables: no row values (masked or not), no personal data, and no
+  description of other roles' row filters or masks beyond "analysts see a
+  subset". A document's existence never implies access to all of its tables.
 - **Only verified facts.** Put in sample SQL that you ran successfully and
   descriptions you checked against `/v1/schema` or the data. If you cannot
   read the table, say so instead of writing a document from guesses.

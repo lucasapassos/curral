@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/lucasapassos/curral/internal/auth"
 	"github.com/lucasapassos/curral/internal/policy"
+	"github.com/lucasapassos/curral/internal/rls"
 )
 
 // startFlight serves Flight SQL for a new test server and returns its
@@ -325,6 +327,34 @@ func TestFlightMetadata(t *testing.T) {
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("catalogs %v %v", rows, err)
 	}
+
+	// Catalogs with no readable tables are hidden from GetCatalogs and SetSessionOptions.
+	pf := filepath.Join(t.TempDir(), "only_logs.rego")
+	os.WriteFile(pf, []byte(`package curral
+import rego.v1
+default allow := false
+allow if {
+	"analyst" in input.roles
+	input.resolved
+	input.statement_type == "SELECT"
+	every t in input.tables { startswith(t, "logs.") }
+}
+`), 0o600)
+	pol, err := policy.Load(context.Background(), "data.curral.allow", []string{pf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastServer.SetPolicy(pol)
+	info, err = cl.GetCatalogs(analyst)
+	rows, _, err = fetch(analyst, cl, info, err)
+	if err != nil || len(rows) != 1 || rows[0][0] != "logs" {
+		t.Fatalf("restricted catalogs: %v %v", rows, err)
+	}
+	opts, _ := flight.NewSessionOptionValues(map[string]any{"catalog": "sales"})
+	res, err := cl.SetSessionOptions(analyst, &flight.SetSessionOptionsRequest{SessionOptions: opts})
+	if err != nil || res.Errors["catalog"].GetValue() != flight.SetSessionOptionsResultErrorInvalidValue {
+		t.Fatalf("hidden catalog must be rejected: %v %v", res, err)
+	}
 }
 
 func TestFlightRowLimit(t *testing.T) {
@@ -343,4 +373,135 @@ func TestFlightRowLimit(t *testing.T) {
 	if err != nil || len(rows) != 1500 {
 		t.Fatalf("rows=%d err=%v", len(rows), err)
 	}
+}
+
+func TestFlightCancel(t *testing.T) {
+	addr, _ := startFlight(t)
+	cl := flightClient(t, addr)
+	analyst := flightLogin(t, cl, "analyst")
+	etl := flightLogin(t, cl, "etl")
+
+	// A slow query that cannot be constant-folded by DuckDB's optimizer.
+	info, err := cl.Execute(analyst, "SELECT sum(hash(range)) FROM range(200000000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, _, ferr := fetch(analyst, cl, info, nil)
+		errCh <- ferr
+	}()
+
+	// Wait until DoGet registers the active query; verify another user cannot cancel it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		res, cerr := cl.CancelFlightInfo(etl, &flight.CancelFlightInfoRequest{Info: info})
+		if status.Code(cerr) == codes.PermissionDenied {
+			break
+		}
+		if cerr != nil {
+			t.Fatalf("unexpected error from etl cancel: %v", cerr)
+		}
+		if res.GetStatus() != flight.CancelStatusNotCancellable {
+			t.Fatalf("etl must not cancel analyst query, got status=%v", res.GetStatus())
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for query to become active")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Ensure the query is still running after etl's rejected cancel attempt.
+	select {
+	case ferr := <-errCh:
+		t.Fatalf("query terminated prematurely after unauthorized cancel: %v", ferr)
+	default:
+	}
+
+	// Owning user cancels the query.
+	res, err := cl.CancelFlightInfo(analyst, &flight.CancelFlightInfoRequest{Info: info})
+	if err != nil {
+		t.Fatalf("analyst cancel: %v", err)
+	}
+	if res.GetStatus() != flight.CancelStatusCancelled {
+		t.Fatalf("cancel status = %v, want %v", res.GetStatus(), flight.CancelStatusCancelled)
+	}
+
+	// The stream terminates with Canceled.
+	select {
+	case ferr := <-errCh:
+		wantCode(t, ferr, codes.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for canceled query to terminate")
+	}
+
+	// Canceling again after completion reports NotCancellable.
+	res, err = cl.CancelFlightInfo(analyst, &flight.CancelFlightInfoRequest{Info: info})
+	if err != nil {
+		t.Fatalf("second cancel: %v", err)
+	}
+	if res.GetStatus() != flight.CancelStatusNotCancellable {
+		t.Fatalf("second cancel status = %v, want %v", res.GetStatus(), flight.CancelStatusNotCancellable)
+	}
+}
+
+func TestFlightPreparedCache(t *testing.T) {
+	addr, _ := startFlight(t)
+	cl := flightClient(t, addr)
+	analyst := flightLogin(t, cl, "analyst")
+
+	// Prepare populates the inspection cache.
+	ps, err := cl.Prepare(analyst, "SELECT id, amount FROM orders WHERE id >= $1 ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind := func(v int32) {
+		b := array.NewRecordBuilder(memory.DefaultAllocator, ps.ParameterSchema())
+		b.Field(0).(*array.Int32Builder).Append(v)
+		ps.SetParameters(b.NewRecordBatch())
+		b.Release()
+	}
+
+	// 1. Execute with cached inspection -> returns both rows.
+	bind(1)
+	info, err := ps.Execute(analyst)
+	rows, _, err := fetch(analyst, cl, info, err)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("first exec: rows=%v err=%v", rows, err)
+	}
+
+	// 2. Add RLS rule after prepare -> execution MUST still apply RLS.
+	rlsFile := filepath.Join(t.TempDir(), "rls.yaml")
+	if err := os.WriteFile(rlsFile, []byte("tables:\n  sales.main.orders:\n    rules:\n      - roles: [analyst]\n        where: \"id = 2\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rules, err := rls.Load(rlsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastServer.SetRowFilters(rules)
+
+	bind(1)
+	info, err = ps.Execute(analyst)
+	rows, _, err = fetch(analyst, cl, info, err)
+	if err != nil || len(rows) != 1 || rows[0][0] != "2" {
+		t.Fatalf("rls exec: rows=%v err=%v", rows, err)
+	}
+
+	// 3. Restrict policy after prepare -> execution MUST still re-evaluate OPA policy.
+	pf := filepath.Join(t.TempDir(), "deny.rego")
+	if err := os.WriteFile(pf, []byte("package curral\nimport rego.v1\ndefault allow := false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pol, err := policy.Load(context.Background(), "data.curral.allow", []string{pf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastServer.SetPolicy(pol)
+
+	bind(1)
+	info, err = ps.Execute(analyst)
+	_, _, err = fetch(analyst, cl, info, err)
+	wantCode(t, err, codes.PermissionDenied)
 }
